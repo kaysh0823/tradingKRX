@@ -1,0 +1,61 @@
+---
+description: KRX 정보데이터시스템 데이터 자동 수집 규칙 (수동 CSV 다운로드 대체)
+globs: ["**/*.py"]
+alwaysApply: false
+---
+
+# KRX 데이터 수집 규칙
+
+## 금지 사항
+- **pykrx 라이브러리 사용 금지.** 영업일 판별 포함 모든 로직에서 pykrx를 쓰지 않는다.
+- 수동 다운로드 CSV 파일 경로(`data_XXXX_YYYYMMDD.csv`) 하드코딩 금지.
+
+## 로그인 필수 (미로그인 시 OTP 응답이 'LOGOUT', 다운로드 0 bytes)
+`30. ETF/32. ETF_PDF_v1.0.py`의 `krx_login()` 검증된 구현을 그대로 재사용한다.
+
+- 로그인 페이지 GET (JSESSIONID 발급): `https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd`
+  → 이어서 `https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc` GET
+- 로그인 POST: `https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd`
+  - payload: `{'mbrNm': '', 'telNo': '', 'di': '', 'certType': '', 'mbrId': <ID>, 'pw': <PW>}`
+  - 응답 JSON `_error_code`: `CD001`=성공, `CD011`=중복로그인(→ `skipDup='Y'` 추가 후 재전송), `CD010`=비밀번호 변경 필요
+- ID/PW는 환경변수 `KRX_ID`, `KRX_PW`에서 읽는다. 코드에 하드코딩 금지.
+- 로그인한 `requests.Session`을 이후 모든 OTP/다운로드 요청에 사용한다.
+
+## KRX CSV 다운로드 방식 (OTP 2단계)
+requests로 아래 2단계 POST 호출. Referer 헤더 필수(없으면 403).
+
+**호스트는 반드시 `data.krx.co.kr` (`.go.kr` 아님 — DNS 해석 실패함)**
+
+1. OTP 발급: `http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd`
+   - data: `{'locale': 'ko_KR', 'name': 'fileDown', 'csvxls_isNo': 'false', 'url': <bld>, ...화면별 파라미터}`
+2. CSV 다운로드: `http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd`
+   - data: `{'code': <1단계 응답 텍스트>}`
+
+공통 헤더:
+```python
+headers = {
+    'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+}
+```
+
+## 화면별 bld 코드와 파라미터
+| 데이터 | bld (`url` 파라미터) | 추가 파라미터 |
+|---|---|---|
+| 업종분류 현황 KOSPI (구 data_1943) | `dbms/MDC/STAT/standard/MDCSTAT03901` | `mktId=STK, trdDd=YYYYMMDD, money=1` |
+| 업종분류 현황 KOSDAQ (구 data_2036) | `dbms/MDC/STAT/standard/MDCSTAT03901` | `mktId=KSQ, trdDd=YYYYMMDD, money=1` |
+| PER/PBR/배당수익률 전종목 (구 data_2107) | `dbms/MDC/STAT/standard/MDCSTAT03501` | `searchType=1, mktId=ALL, trdDd=YYYYMMDD` |
+| ETF 전종목 시세 (구 data_2142) | `dbms/MDC/STAT/standard/MDCSTAT04301` | `trdDd=YYYYMMDD, share=1, money=1` |
+
+## 데이터 처리 규칙
+- 응답 bytes는 `pd.read_csv(io.BytesIO(content), encoding='EUC-KR')`로 읽는다 (ETF는 기존 코드대로 `cp949`, `dtype=str`).
+- 다운로드 함수는 하나로 공통화: `get_krx_csv(bld, params)` 형태, 실패 시 3회 재시도, 호출 간 `time.sleep(1)`.
+- 응답이 비정상적으로 짧으면(휴장일 등) 실패로 처리한다.
+
+## 영업일(biz_day) 판별 — pykrx 없이
+- 15시 이전 실행 시 전일부터 시작, 이후는 당일부터 시작.
+- 해당 날짜로 업종분류(KOSPI) 다운로드를 시도해 데이터 행이 0이거나 종가가 전부 비어 있으면 하루씩 뒤로 이동하며 최대 10일 탐색.
+
+## 기존 코드 보존
+- 다운로드 이후의 전처리, 컬럼 선택, 종목구분 분류, MySQL 적재(upsert) 로직은 기존 그대로 유지한다.
+- 최종 결과물의 컬럼/타입이 기존 수동 CSV 방식과 동일해야 한다.
