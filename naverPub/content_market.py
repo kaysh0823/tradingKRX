@@ -1,0 +1,599 @@
+"""
+시장 스냅샷:
+1) 에너지배율 순위 (거래대금 상위50 → 3일 에너지배율 내림차순)
+2) 신고가/신저가 (최장 달성 구간만) + 구간대비(%)
+3) Talent 순위 Top50 (시총 5,000억↑)
+4) RS 상위50
+"""
+from __future__ import annotations
+
+import logging
+from datetime import date
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from db import engine
+
+log = logging.getLogger("naverPub.content_market")
+
+ENERGY_COLORS = {
+    ">=3": "#c62828",
+    ">=1.5": "#f57f17",
+    ">=0.7": "#2e7d32",
+    ">=0.3": "#1565c0",
+    "else": "#9e9e9e",
+}
+
+TALENT_UP = 0.10
+TALENT_MCAP_MIN = 500_000_000_000  # 시총 5,000억원 이상
+MCAP_COL = "시총(조원)"
+TALENT_UD_COLS = ("20일 내 상승/하락", "50일 내 상승/하락", "120일 내 상승/하락")
+
+
+def energy_ratio_font_color(er: float) -> str:
+    if not np.isfinite(er):
+        return ENERGY_COLORS["else"]
+    if er >= 3.0:
+        return ENERGY_COLORS[">=3"]
+    if er >= 1.5:
+        return ENERGY_COLORS[">=1.5"]
+    if er >= 0.7:
+        return ENERGY_COLORS[">=0.7"]
+    if er >= 0.3:
+        return ENERGY_COLORS[">=0.3"]
+    return ENERGY_COLORS["else"]
+
+
+def _latest_date(eng) -> Optional[date]:
+    df = pd.read_sql("SELECT MAX(date) AS d FROM ohlcv", eng)
+    if df.empty or pd.isna(df.iloc[0]["d"]):
+        return None
+    return pd.to_datetime(df.iloc[0]["d"]).date()
+
+
+def _trading_dates(eng, end: date, n: int) -> list[date]:
+    df = pd.read_sql(
+        "SELECT DISTINCT date FROM ohlcv WHERE date <= %s ORDER BY date DESC LIMIT %s",
+        eng,
+        params=(end, n),
+    )
+    if df.empty:
+        return []
+    return sorted(pd.to_datetime(df["date"]).dt.date.tolist())
+
+
+def diagnose_source_data(as_of: date) -> dict:
+    """콘텐츠 생성 전 기준일 소스 현황 (로그/점검용)."""
+    eng = engine()
+    out: dict = {"as_of": str(as_of)}
+
+    def _scalar(sql: str, params=()):
+        df = pd.read_sql(sql, eng, params=params)
+        if df.empty:
+            return 0
+        return int(df.iloc[0, 0] or 0)
+
+    out["ohlcv_rows"] = _scalar("SELECT COUNT(*) AS c FROM ohlcv WHERE date=%s", (as_of,))
+    out["tv_nn"] = _scalar(
+        "SELECT COUNT(*) AS c FROM ohlcv WHERE date=%s AND trading_value IS NOT NULL",
+        (as_of,),
+    )
+    out["mcap_nn"] = _scalar(
+        "SELECT COUNT(*) AS c FROM ohlcv WHERE date=%s AND mcap IS NOT NULL",
+        (as_of,),
+    )
+    out["market_nn"] = _scalar(
+        "SELECT COUNT(*) AS c FROM ohlcv WHERE date=%s AND market IN ('KOSPI','KOSDAQ')",
+        (as_of,),
+    )
+    out["rs_rows"] = _scalar("SELECT COUNT(*) AS c FROM rs WHERE date=%s", (as_of,))
+    out["etf_pdf_rows"] = _scalar("SELECT COUNT(*) AS c FROM etf_pdf WHERE date=%s", (as_of,))
+    out["etf_sector_null"] = _scalar(
+        """
+        SELECT COUNT(*) AS c FROM etf_pdf
+        WHERE date=%s AND (sector IS NULL OR sector='')
+        """,
+        (as_of,),
+    )
+    log.info(
+        "소스진단 %s | ohlcv=%s tv_nn=%s mcap_nn=%s market_nn=%s rs=%s etf_pdf=%s sector_null=%s",
+        as_of,
+        out["ohlcv_rows"],
+        out["tv_nn"],
+        out["mcap_nn"],
+        out["market_nn"],
+        out["rs_rows"],
+        out["etf_pdf_rows"],
+        out["etf_sector_null"],
+    )
+    return out
+
+
+def _load_ohlcv_range(
+    eng,
+    load_start: date,
+    end: date,
+    cols: str,
+    prefer_listed: bool = True,
+) -> pd.DataFrame:
+    """
+    prefer_listed=True면 KOSPI/KOSDAQ 우선.
+    이관 데이터처럼 market이 전부 NULL이면 필터 없이 로드 (신고가 등).
+    """
+    sql_listed = f"""
+        SELECT {cols} FROM ohlcv
+        WHERE date >= %s AND date <= %s
+          AND market IN ('KOSPI','KOSDAQ')
+    """
+    df = pd.read_sql(sql_listed, eng, params=(load_start, end))
+    if not df.empty or not prefer_listed:
+        return df
+    return pd.read_sql(
+        f"SELECT {cols} FROM ohlcv WHERE date >= %s AND date <= %s",
+        eng,
+        params=(load_start, end),
+    )
+
+
+def _apply_day_chg(day0: pd.DataFrame, prev: pd.DataFrame) -> pd.Series:
+    """
+    당일상승률(%):
+    1) KRX 등락률(chg_pct)이 있고 전일종가 대비 부호·규모가 일치하면 그대로
+    2) 아니면 (당일종가/전일종가 - 1) * 100
+    """
+    m = day0.merge(
+        prev.rename(columns={"close": "prev_close"})[["ticker", "prev_close"]],
+        on="ticker",
+        how="left",
+    )
+    calc = np.where(
+        m["prev_close"].notna() & (m["prev_close"] > 0) & m["close"].notna(),
+        (m["close"] / m["prev_close"] - 1.0) * 100.0,
+        np.nan,
+    )
+    raw = pd.to_numeric(m["chg_pct"], errors="coerce")
+    # 과거 파서 버그로 부호가 빠진 경우 → 계산값 우선
+    use_raw = (
+        raw.notna()
+        & np.isfinite(calc)
+        & (np.sign(raw.fillna(0)) == np.sign(pd.Series(calc).fillna(0)))
+        & (np.abs(raw - calc) < 0.15)
+    )
+    # 전일 없어 계산 불가하면 raw 사용
+    use_raw = use_raw | (raw.notna() & ~np.isfinite(calc))
+    out = np.where(use_raw, raw, calc)
+    return pd.Series(out, index=day0.index)
+
+
+def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.DataFrame:
+    """
+    당일 거래대금 상위 top_tv → 3일 에너지배율 내림차순.
+    에너지배율 = (거래대금 시장내 비중) / (시총 시장내 비중)
+    3일 = 3거래일 거래대금 합 기준.
+    """
+    eng = engine()
+    as_of = as_of or _latest_date(eng)
+    if as_of is None:
+        return pd.DataFrame()
+    days = _trading_dates(eng, as_of, 3)
+    if len(days) < 1:
+        return pd.DataFrame()
+    d0 = days[-1]
+    load_start = days[0]
+    # 전일종가용으로 하루 더
+    prev_days = _trading_dates(eng, as_of, 4)
+    prev_d = prev_days[-2] if len(prev_days) >= 2 else None
+
+    df = _load_ohlcv_range(
+        eng,
+        load_start if prev_d is None else min(load_start, prev_d),
+        d0,
+        "ticker, date, name, market, close, chg_pct, trading_value, mcap",
+    )
+    if df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    for c in ("close", "chg_pct", "trading_value", "mcap"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "market" not in df.columns:
+        df["market"] = "ALL"
+    df["market"] = df["market"].fillna("ALL").replace("", "ALL")
+
+    day0 = df[df["date"] == d0].copy()
+    if day0.empty:
+        return pd.DataFrame()
+
+    if prev_d is not None:
+        prev = df[df["date"] == prev_d][["ticker", "close"]].copy()
+        day0["당일상승률"] = _apply_day_chg(day0, prev).values
+    else:
+        day0["당일상승률"] = day0["chg_pct"]
+
+    # 시장별 당일 합
+    mkt_tv = day0.groupby("market")["trading_value"].transform("sum")
+    mkt_mcap = day0.groupby("market")["mcap"].transform("sum")
+    day0["tv_pct"] = np.where(mkt_tv > 0, day0["trading_value"] / mkt_tv * 100.0, np.nan)
+    day0["mcap_pct"] = np.where(
+        (mkt_mcap > 0) & day0["mcap"].notna(),
+        day0["mcap"] / mkt_mcap * 100.0,
+        np.nan,
+    )
+    day0["energy_1d"] = np.where(
+        day0["mcap_pct"] > 0,
+        day0["tv_pct"] / day0["mcap_pct"],
+        np.nan,
+    )
+    day0["tv_rank"] = (
+        day0.groupby("market")["trading_value"].rank(ascending=False, method="min").astype(int)
+    )
+
+    # 3일 거래대금
+    tv3 = (
+        df[df["date"].isin(days)]
+        .groupby(["ticker", "market"], as_index=False)["trading_value"]
+        .sum()
+        .rename(columns={"trading_value": "tv_3d"})
+    )
+    mkt_tv3 = (
+        df[df["date"].isin(days)].groupby("market")["trading_value"].sum().rename("mkt_tv_3d")
+    )
+    day0 = day0.merge(tv3, on=["ticker", "market"], how="left")
+    day0 = day0.merge(mkt_tv3, on="market", how="left")
+    day0["tv_3d_pct"] = np.where(
+        day0["mkt_tv_3d"] > 0, day0["tv_3d"] / day0["mkt_tv_3d"] * 100.0, np.nan
+    )
+    day0["energy_3d"] = np.where(
+        day0["mcap_pct"] > 0,
+        day0["tv_3d_pct"] / day0["mcap_pct"],
+        np.nan,
+    )
+
+    top = day0.nlargest(top_tv, "trading_value").copy()
+    top = top.sort_values("energy_3d", ascending=False, na_position="last").reset_index(drop=True)
+    top.insert(0, "순위", range(1, len(top) + 1))
+    top["거래대금(억)"] = (top["trading_value"] / 1e8).round(1)
+    top["거래대금순위"] = top["tv_rank"].astype(int)
+    top["시총(조원)"] = (top["mcap"] / 1e12).round(2)
+    out = top.rename(
+        columns={
+            "ticker": "티커",
+            "name": "종목명",
+            "close": "현재가",
+            "energy_1d": "당일에너지배율",
+            "energy_3d": "3일에너지배율",
+        }
+    )
+    cols = [
+        "순위",
+        "티커",
+        "종목명",
+        "현재가",
+        "당일상승률",
+        "거래대금(억)",
+        "거래대금순위",
+        "당일에너지배율",
+        "3일에너지배율",
+        "시총(조원)",
+    ]
+    return out[cols]
+
+
+def build_high_low(as_of: Optional[date] = None) -> pd.DataFrame:
+    """하위 호환: 신고가+신저가 합본 (정렬: 신고가 우선)."""
+    hi = build_new_highs(as_of)
+    lo = build_new_lows(as_of)
+    if hi.empty and lo.empty:
+        return pd.DataFrame()
+    return pd.concat([hi, lo], ignore_index=True)
+
+
+def _build_high_or_low(as_of: Optional[date], want_high: bool) -> pd.DataFrame:
+    """
+    want_high=True → 신고가, False → 신저가.
+    최장 달성 구간만 표시 + 구간대비(%).
+    """
+    eng = engine()
+    as_of = as_of or _latest_date(eng)
+    if as_of is None:
+        return pd.DataFrame()
+    days = _trading_dates(eng, as_of, 260)
+    if len(days) < 50:
+        return pd.DataFrame()
+    load_start = days[0]
+    df = _load_ohlcv_range(
+        eng,
+        load_start,
+        as_of,
+        "ticker, date, name, high, low, close, chg_pct, trading_value, mcap",
+        prefer_listed=True,
+    )
+    if df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    for c in ("high", "low", "close", "chg_pct", "trading_value", "mcap"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    prev_d = days[-2] if len(days) >= 2 else None
+    prev_map = {}
+    if prev_d is not None:
+        prev_map = df[df["date"] == prev_d].set_index("ticker")["close"].to_dict()
+
+    rows = []
+    windows = [250, 120, 50]
+    for tk, g in df.groupby("ticker"):
+        g = g.sort_values("date")
+        if g["date"].iloc[-1] != as_of:
+            continue
+        cur_h = g["high"].iloc[-1]
+        cur_l = g["low"].iloc[-1]
+        cur_c = g["close"].iloc[-1]
+        if not np.isfinite(cur_h) or not np.isfinite(cur_l) or not np.isfinite(cur_c):
+            continue
+
+        label = None
+        win = None
+        if want_high:
+            for w in windows:
+                hist = g.iloc[:-1].tail(w)
+                if len(hist) < w:
+                    continue
+                if cur_h > hist["high"].max():
+                    label = f"{w}일 신고가"
+                    win = w
+                    break
+        else:
+            for w in windows:
+                hist = g.iloc[:-1].tail(w)
+                if len(hist) < w:
+                    continue
+                if cur_l < hist["low"].min():
+                    label = f"{w}일 신저가"
+                    win = w
+                    break
+        if label is None or win is None:
+            continue
+
+        period = g.tail(win)
+        if want_high:
+            base = float(period["low"].min())
+            period_ret = (cur_c / base - 1.0) * 100.0 if base > 0 else np.nan
+        else:
+            base = float(period["high"].max())
+            period_ret = (cur_c / base - 1.0) * 100.0 if base > 0 else np.nan
+
+        prev_c = prev_map.get(tk)
+        if prev_c and prev_c > 0:
+            day_chg = (cur_c / float(prev_c) - 1.0) * 100.0
+        else:
+            day_chg = g["chg_pct"].iloc[-1]
+        if day_chg is not None and np.isfinite(day_chg):
+            day_chg = round(float(day_chg), 2)
+
+        last = g.iloc[-1]
+        mcap = last.get("mcap")
+        mcap_jo = (
+            round(float(mcap) / 1e12, 2)
+            if mcap is not None and np.isfinite(float(mcap or np.nan))
+            else np.nan
+        )
+        rows.append(
+            {
+                "티커": tk,
+                "종목명": last["name"],
+                "현재가": last["close"],
+                "당일상승률": day_chg,
+                "거래대금(억)": round(float(last["trading_value"] or 0) / 1e8, 1),
+                "달성구간": label,
+                "구간대비(%)": round(float(period_ret), 2) if np.isfinite(period_ret) else np.nan,
+                "시총(조원)": mcap_jo,
+                "_win": float(win),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out = out.sort_values("_win", ascending=False).drop(columns=["_win"]).reset_index(drop=True)
+    return out
+
+
+def build_new_highs(as_of: Optional[date] = None) -> pd.DataFrame:
+    return _build_high_or_low(as_of, want_high=True)
+
+
+def build_new_lows(as_of: Optional[date] = None) -> pd.DataFrame:
+    return _build_high_or_low(as_of, want_high=False)
+
+
+def _daily_ret_flags(close: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """일간 등락률 기준 +10%↑ / -10%↓ 여부."""
+    cl = pd.to_numeric(close, errors="coerce")
+    prev = cl.shift(1)
+    ret = (cl / prev) - 1.0
+    valid = prev.notna() & (prev > 0) & cl.notna()
+    up = (ret >= TALENT_UP) & valid
+    down = (ret <= -TALENT_UP) & valid
+    return up, down
+
+
+def build_rs_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataFrame:
+    """RS(rs_20~200 산술평균) 상위 top_n. talent 컬럼 없음."""
+    eng = engine()
+    as_of = as_of or _latest_date(eng)
+    if as_of is None:
+        return pd.DataFrame()
+    rs = pd.read_sql(
+        """
+        SELECT r.ticker, r.rs_20, r.rs_50, r.rs_120, r.rs_200,
+               o.name, o.close, o.mcap
+        FROM rs r
+        LEFT JOIN ohlcv o ON o.ticker=r.ticker AND o.date=r.date
+        WHERE r.date = %s
+        """,
+        eng,
+        params=(as_of,),
+    )
+    if rs.empty:
+        return pd.DataFrame()
+    for c in ("rs_20", "rs_50", "rs_120", "rs_200", "close", "mcap"):
+        rs[c] = pd.to_numeric(rs[c], errors="coerce")
+    rs["rs_avg"] = rs[["rs_20", "rs_50", "rs_120", "rs_200"]].mean(axis=1)
+    rs = rs.sort_values("rs_avg", ascending=False).head(top_n).reset_index(drop=True)
+    rs[MCAP_COL] = (rs["mcap"] / 1e12).round(2)
+    rs.insert(0, "순위", range(1, len(rs) + 1))
+    out = rs.rename(
+        columns={
+            "ticker": "티커",
+            "name": "종목명",
+            "close": "현재가",
+        }
+    )
+    cols = ["순위", "티커", "종목명", "현재가", "rs_20", "rs_50", "rs_120", "rs_200", MCAP_COL]
+    return out[cols]
+
+
+def build_talent_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataFrame:
+    """
+    Talent 순위 Top50.
+    대상: 시총 >= 5,000억원.
+    talent 지수 = (n20/20)*0.5 + (n50/50)*0.3 + (n120/120)*0.2  (상승일수만)
+    표시: N일 내 상승/하락 = "상승일수/하락일수" (+10% / -10%).
+    """
+    eng = engine()
+    as_of = as_of or _latest_date(eng)
+    if as_of is None:
+        return pd.DataFrame()
+
+    # 시총 필터
+    day0 = pd.read_sql(
+        """
+        SELECT ticker, name, close, chg_pct, mcap
+        FROM ohlcv
+        WHERE date = %s AND mcap >= %s
+          AND market IN ('KOSPI','KOSDAQ')
+        """,
+        eng,
+        params=(as_of, TALENT_MCAP_MIN),
+    )
+    if day0.empty:
+        # market NULL 이관분 폴백
+        day0 = pd.read_sql(
+            """
+            SELECT ticker, name, close, chg_pct, mcap
+            FROM ohlcv
+            WHERE date = %s AND mcap >= %s
+            """,
+            eng,
+            params=(as_of, TALENT_MCAP_MIN),
+        )
+    if day0.empty:
+        return pd.DataFrame()
+
+    for c in ("close", "chg_pct", "mcap"):
+        day0[c] = pd.to_numeric(day0[c], errors="coerce")
+    tickers = [str(t) for t in day0["ticker"].tolist()]
+
+    dates = _trading_dates(eng, as_of, 130)
+    if len(dates) < 20:
+        return pd.DataFrame()
+    load_start = dates[0]
+
+    frames = []
+    for i in range(0, len(tickers), 400):
+        chunk = tickers[i : i + 400]
+        ph = ",".join(["%s"] * len(chunk))
+        frames.append(
+            pd.read_sql(
+                f"""
+                SELECT ticker, date, close FROM ohlcv
+                WHERE date >= %s AND date <= %s AND ticker IN ({ph})
+                """,
+                eng,
+                params=(load_start, as_of, *chunk),
+            )
+        )
+    hist = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if hist.empty:
+        return pd.DataFrame()
+    hist["date"] = pd.to_datetime(hist["date"]).dt.date
+    hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
+    hist["ticker"] = hist["ticker"].astype(str)
+
+    # 전일종가 기반 당일상승률
+    prev_d = dates[-2] if len(dates) >= 2 else None
+    prev_map = {}
+    if prev_d is not None:
+        prev_map = (
+            hist[hist["date"] == prev_d].set_index("ticker")["close"].to_dict()
+        )
+
+    c20, c50, c120 = TALENT_UD_COLS
+    rows = []
+    for tk, g in hist.groupby("ticker"):
+        g = g.sort_values("date")
+        if g["date"].iloc[-1] != as_of:
+            continue
+        up, down = _daily_ret_flags(g["close"])
+        n20 = int(up.tail(20).sum()) if len(up) >= 1 else 0
+        n50 = int(up.tail(50).sum()) if len(up) >= 1 else 0
+        n120 = int(up.tail(120).sum()) if len(up) >= 1 else 0
+        d20 = int(down.tail(20).sum()) if len(down) >= 1 else 0
+        d50 = int(down.tail(50).sum()) if len(down) >= 1 else 0
+        d120 = int(down.tail(120).sum()) if len(down) >= 1 else 0
+        # 기간 부족 시 분모는 고정 20/50/120 (스펙 그대로) — 상승일수만
+        idx = (n20 / 20.0) * 0.5 + (n50 / 50.0) * 0.3 + (n120 / 120.0) * 0.2
+        rows.append(
+            {
+                "ticker": tk,
+                "talent 지수": round(float(idx), 3),
+                c20: f"{n20}/{d20}",
+                c50: f"{n50}/{d50}",
+                c120: f"{n120}/{d120}",
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+
+    tal = pd.DataFrame(rows)
+    day0 = day0.copy()
+    day0["ticker"] = day0["ticker"].astype(str)
+    m = day0.merge(tal, on="ticker", how="inner")
+    if m.empty:
+        return pd.DataFrame()
+
+    # 당일상승률
+    def _chg_row(r):
+        prev = prev_map.get(r["ticker"])
+        if prev and prev > 0 and pd.notna(r["close"]):
+            return round((float(r["close"]) / float(prev) - 1.0) * 100.0, 2)
+        return r["chg_pct"]
+
+    m["당일상승률"] = m.apply(_chg_row, axis=1)
+    m[MCAP_COL] = (m["mcap"] / 1e12).round(2)
+    m = m.sort_values("talent 지수", ascending=False).head(top_n).reset_index(drop=True)
+    m.insert(0, "순위", range(1, len(m) + 1))
+    out = m.rename(columns={"ticker": "티커", "name": "종목명", "close": "현재가"})
+    cols = [
+        "순위",
+        "티커",
+        "종목명",
+        "현재가",
+        "당일상승률",
+        "talent 지수",
+        c20,
+        c50,
+        c120,
+        MCAP_COL,
+    ]
+    return out[cols]
+
+
+def build_all_market(as_of: Optional[date] = None) -> dict[str, pd.DataFrame]:
+    return {
+        "energy": build_energy_rank(as_of),
+        "high": build_new_highs(as_of),
+        "low": build_new_lows(as_of),
+        "talent": build_talent_rank(as_of),
+        "rs": build_rs_rank(as_of),
+    }

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run naverPub weekdays 16:00 KST
+
+[Timer]
+OnCalendar=Mon..Fri 16:00:00
+Persistent=true
+Unit=naverpub.service
+
+[Install]
+WantedBy=timers.target
