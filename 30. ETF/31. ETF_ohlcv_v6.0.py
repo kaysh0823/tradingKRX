@@ -14,12 +14,13 @@ import re
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import traceback
 import time
 import os
 import sys
 import webbrowser
+import threading
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import seaborn as sns
@@ -41,6 +42,13 @@ try:
 except ImportError:
     PYKRX_AVAILABLE = False
     print("⚠️ pykrx 라이브러리가 설치되지 않았습니다. pip install pykrx로 설치해주세요.")
+
+# pykrx는 스레드 비안전 + 네트워크 타임아웃 없음 → 동시 호출 시 행 발생
+_PYKRX_LOCK = threading.Lock()
+_PYKRX_TIMEOUT_SEC = 60
+_FETCH_RESULT_TIMEOUT_SEC = 300  # 종목당 수집 상한 (pykrx+네이버)
+_FETCH_BATCH_SIZE = 48
+_FETCH_MAX_WORKERS = 6
 
 
 # 서버 설정 (KRX_ohlcv_v2.1.py 참조)
@@ -516,8 +524,15 @@ def get_etf_ohlcv_from_pykrx(ticker, start_date=None, end_date=None):
             if isinstance(start_date, str) and len(start_date) == 10:  # YYYY-MM-DD 형식
                 start_date = start_date.replace('-', '')
         
-        # pykrx를 사용하여 OHLCV 데이터 가져오기
-        df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
+        # pykrx: 락으로 직렬화 + 타임아웃 (미설정 시 워커가 영구 대기할 수 있음)
+        with _PYKRX_LOCK:
+            with ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(stock.get_market_ohlcv_by_date, start_date, end_date, ticker)
+                try:
+                    df = _fut.result(timeout=_PYKRX_TIMEOUT_SEC)
+                except FuturesTimeoutError:
+                    print(f"  ⚠️ pykrx 타임아웃({_PYKRX_TIMEOUT_SEC}s): {ticker}")
+                    return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
         
         if df.empty:
             return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
@@ -803,6 +818,10 @@ def collect_etf_ohlcv_data(max_etf=None, max_pages_per_etf=None):
         etf_list = etf_list.head(max_etf)
     
     print(f"총 {len(etf_list)}개 ETF의 OHLCV 데이터 수집 시작")
+    print(
+        f"  (병렬 workers={_FETCH_MAX_WORKERS}, batch={_FETCH_BATCH_SIZE}, "
+        f"pykrx timeout={_PYKRX_TIMEOUT_SEC}s)"
+    )
     
     error_list = []
     success_count = 0
@@ -813,38 +832,51 @@ def collect_etf_ohlcv_data(max_etf=None, max_pages_per_etf=None):
         for _, row in etf_list.iterrows()
     ]
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_map = {
-            executor.submit(_fetch_etf_ohlcv_worker, ticker, max_pages_per_etf): (ticker, etf_name)
-            for ticker, etf_name in tasks
-        }
+    pbar = tqdm(total=len(tasks), desc="ETF OHLCV 수집")
+    try:
+        for batch_start in range(0, len(tasks), _FETCH_BATCH_SIZE):
+            batch = tasks[batch_start:batch_start + _FETCH_BATCH_SIZE]
+            with ThreadPoolExecutor(max_workers=_FETCH_MAX_WORKERS) as executor:
+                future_map = {
+                    executor.submit(_fetch_etf_ohlcv_worker, ticker, max_pages_per_etf): (ticker, etf_name)
+                    for ticker, etf_name in batch
+                }
 
-        for fut in tqdm(as_completed(future_map), total=len(future_map), desc="ETF OHLCV 수집"):
-            ticker, etf_name = future_map[fut]
-            try:
-                _ticker, ohlcv_df = fut.result()
-                if not ohlcv_df.empty:
-                    # DB 저장은 메인 스레드에서 순차 수행 (커넥션 스레드 안전)
-                    save_result = save_etf_ohlcv_by_ticker(ticker, ohlcv_df)
+                for fut in as_completed(future_map):
+                    ticker, etf_name = future_map[fut]
+                    try:
+                        _ticker, ohlcv_df = fut.result(timeout=_FETCH_RESULT_TIMEOUT_SEC)
+                        if not ohlcv_df.empty:
+                            # DB 저장은 메인 스레드에서 순차 수행 (커넥션 스레드 안전)
+                            save_result = save_etf_ohlcv_by_ticker(ticker, ohlcv_df)
 
-                    if save_result['success']:
-                        success_count += 1
-                        total_records += save_result['records_saved']
-                    else:
+                            if save_result['success']:
+                                success_count += 1
+                                total_records += save_result['records_saved']
+                            else:
+                                error_list.append(ticker)
+                                if len(error_list) <= 5:
+                                    print(f"  ⚠️ {ticker} ({etf_name}): 저장 실패 - {save_result['error']}")
+                        else:
+                            error_list.append(ticker)
+                            if len(error_list) <= 5:
+                                print(f"  ⚠️ {ticker} ({etf_name}): 데이터 없음")
+
+                    except FuturesTimeoutError:
+                        error_list.append(ticker)
+                        print(
+                            f"  ⚠️ {ticker} ({etf_name}): 수집 타임아웃"
+                            f"({_FETCH_RESULT_TIMEOUT_SEC}s) — 스킵"
+                        )
+                    except Exception as e:
                         error_list.append(ticker)
                         if len(error_list) <= 5:
-                            print(f"  ⚠️ {ticker} ({etf_name}): 저장 실패 - {save_result['error']}")
-                else:
-                    error_list.append(ticker)
-                    if len(error_list) <= 5:
-                        print(f"  ⚠️ {ticker} ({etf_name}): 데이터 없음")
-
-            except Exception as e:
-                error_list.append(ticker)
-                if len(error_list) <= 5:
-                    print(f"  ⚠️ {ticker} ({etf_name}) 수집 오류: {e}")
-                    print(traceback.format_exc())
-                continue
+                            print(f"  ⚠️ {ticker} ({etf_name}) 수집 오류: {e}")
+                            print(traceback.format_exc())
+                    finally:
+                        pbar.update(1)
+    finally:
+        pbar.close()
     
     print(f"\n✓ ETF OHLCV 데이터 수집 완료")
     print(f"  - 성공: {success_count}개 ETF")
@@ -890,33 +922,44 @@ def retry_failed_etf_ohlcv(error_list, max_pages_per_etf=None):
     success_count = 0
     total_records = 0
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_map = {
-            executor.submit(
-                _fetch_etf_ohlcv_worker, ticker, max_pages_per_etf, 3
-            ): ticker
-            for ticker in error_list
-        }
+    tickers = [str(t) for t in error_list]
+    pbar = tqdm(total=len(tickers), desc="실패 ETF 재수집")
+    try:
+        for batch_start in range(0, len(tickers), _FETCH_BATCH_SIZE):
+            batch = tickers[batch_start:batch_start + _FETCH_BATCH_SIZE]
+            with ThreadPoolExecutor(max_workers=_FETCH_MAX_WORKERS) as executor:
+                future_map = {
+                    executor.submit(
+                        _fetch_etf_ohlcv_worker, ticker, max_pages_per_etf, 3
+                    ): ticker
+                    for ticker in batch
+                }
 
-        for fut in tqdm(as_completed(future_map), total=len(future_map), desc="실패 ETF 재수집"):
-            ticker = future_map[fut]
-            try:
-                _ticker, ohlcv_df = fut.result()
-                if not ohlcv_df.empty:
-                    save_result = save_etf_ohlcv_by_ticker(ticker, ohlcv_df)
+                for fut in as_completed(future_map):
+                    ticker = future_map[fut]
+                    try:
+                        _ticker, ohlcv_df = fut.result(timeout=_FETCH_RESULT_TIMEOUT_SEC)
+                        if not ohlcv_df.empty:
+                            save_result = save_etf_ohlcv_by_ticker(ticker, ohlcv_df)
 
-                    if save_result['success']:
-                        success_count += 1
-                        total_records += save_result['records_saved']
-                    else:
+                            if save_result['success']:
+                                success_count += 1
+                                total_records += save_result['records_saved']
+                            else:
+                                error_list_retry.append(ticker)
+                        else:
+                            error_list_retry.append(ticker)
+
+                    except FuturesTimeoutError:
                         error_list_retry.append(ticker)
-                else:
-                    error_list_retry.append(ticker)
-
-            except Exception as e:
-                error_list_retry.append(ticker)
-                print(f"  ⚠️ {ticker} 재수집 오류: {e}")
-                continue
+                        print(f"  ⚠️ {ticker}: 재수집 타임아웃({_FETCH_RESULT_TIMEOUT_SEC}s) — 스킵")
+                    except Exception as e:
+                        error_list_retry.append(ticker)
+                        print(f"  ⚠️ {ticker} 재수집 오류: {e}")
+                    finally:
+                        pbar.update(1)
+    finally:
+        pbar.close()
     
     print(f"\n✓ 실패 ETF 재수집 완료")
     print(f"  - 성공: {success_count}개 ETF")
@@ -4429,13 +4472,6 @@ SECTOR_MOMENTUM_DAILY_RANK_SECTOR_ETFS: dict[str, str] = {
     '463250': 'TIGER K방산&우주',
     '462010': 'TIGER 2차전지소재Fn',
     '469070': 'RISE AI&로봇',
-    '494670': 'TIGER 조선TOP10',
-    '0080G0': 'KODEX 방산TOP10',
-    '449450': 'PLUS K방산',
-    '471990': 'KODEX AI반도체핵심장비',
-    '463250': 'TIGER K방산&우주',
-    '462010': 'TIGER 2차전지소재Fn',
-    '469070': 'RISE AI&로봇',
     '471760': 'TIGER AI반도체핵심공정',
     '091170': 'KODEX 은행',
     '421320': 'PLUS 우주항공',
@@ -4491,11 +4527,6 @@ SECTOR_MOMENTUM_DAILY_RANK_Actives_ETFS: dict[str, str] = {
     '494220': 'UNICORN SK하이닉스밸류체인액티브',
     '442260': '마이티 다이나믹퀀트액티브',
     '395750': 'PLUS ESG가치주액티브',
-    '495060': 'TIME 코리아밸류업액티브',
-    '364690': 'KODEX 혁신기술테마액티브',
-    '495230': 'KoAct 코리아밸류업액티브',
-    '494220': 'UNICORN SK하이닉스밸류체인액티브',
-    '395750': 'PLUS ESG가치주액티브',
     '433250': 'UNICORN R&D 액티브',
     '401470': 'KODEX 메타버스액티브',
     '448570': 'FOCUS AI코리아액티브',
@@ -4504,9 +4535,6 @@ SECTOR_MOMENTUM_DAILY_RANK_Actives_ETFS: dict[str, str] = {
     '445290': 'KODEX 로봇액티브',
     '395760': 'PLUS ESG성장주액티브',
     '385520': 'KODEX 자율주행액티브',
-    '401470': 'KODEX 메타버스액티브',
-    '448570': 'FOCUS AI코리아액티브',
-    '365040': 'TIGER AI코리아그로스액티브',
     '413930': 'WON AI ESG액티브',
     '385590': 'ACE ESG액티브',
     '476850': 'KoAct 배당성장액티브',
@@ -4528,11 +4556,6 @@ SECTOR_MOMENTUM_DAILY_RANK_Actives_ETFS: dict[str, str] = {
     '472720': 'TRUSTON 주주가치액티브',
     '404120': 'TIME K신재생에너지액티브',
     '447430': 'ACE 주주환원가치주액티브',
-    '441800': 'TIME Korea플러스배당액티브',
-    '387280': 'TIGER 퓨처모빌리티액티브',
-    '422260': 'VITA MZ소비액티브',
-    '373490': 'KODEX 코리아혁신성장액티브',
-    '472720': 'TRUSTON 주주가치액티브',
     '457930': 'BNK 미래전략기술액티브',
     '410870': 'TIME K컬처액티브',
     '438740': 'MIDAS 중소형액티브',
@@ -4558,13 +4581,6 @@ SECTOR_MOMENTUM_DAILY_RANK_Passives_ETFS: dict[str, str] = {
     '395270': 'HANARO Fn K-반도체',
     '395160': 'KODEX AI반도체TOP2플러스',
     '487750': 'BNK 온디바이스AI',
-    '140700': 'KODEX 보험',
-    '367740': 'HANARO Fn5G산업',
-    '0105D0': 'SOL 한국AI소프트웨어',
-    '475300': 'SOL 반도체전공정',
-    '381560': 'HANARO Fn전기&수소차',
-    '091160': 'KODEX 반도체',
-    '400970': 'TIGER Fn메타버스',
     '140700': 'KODEX 보험',
     '367740': 'HANARO Fn5G산업',
     '0105D0': 'SOL 한국AI소프트웨어',
@@ -4645,13 +4661,6 @@ SECTOR_MOMENTUM_DAILY_RANK_Passives_ETFS: dict[str, str] = {
     '305720': 'KODEX 2차전지산업',
     '364980': 'TIGER 2차전지TOP10',
     '305540': 'TIGER 2차전지테마',
-    '433500': 'ACE 원자력TOP10',
-    '434730': 'HANARO 원자력iSelect',
-    '0101N0': 'RISE AI전력인프라',
-    '0098F0': 'KODEX 원자력SMR',
-    '465330': 'RISE 2차전지TOP10',
-    '0117V0': 'TIGER 코리아AI전력기기TOP3플러스',
-    '491820': 'HANARO 전력설비투자',
     '433500': 'ACE 원자력TOP10',
     '434730': 'HANARO 원자력iSelect',
     '0101N0': 'RISE AI전력인프라',

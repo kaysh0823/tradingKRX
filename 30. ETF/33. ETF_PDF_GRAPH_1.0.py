@@ -202,7 +202,7 @@ def build_snapshot_wide(
     for name, _ in SNAPSHOT_DEFS:
         wide[f"_miss_{name}"] = wide[name].isna()
 
-    # 비교용: 결측=0 (이탈→하락, 신규→상승)
+    # 비교용: 결측=0 (이탈→비중축소, 신규→비중확대)
     for cur, prev in CHAIN_COMPARE:
         # 스냅샷 자체가 없으면(날짜 데이터 부족) 해당 비교는 NaN 유지
         if snaps.get(cur) is None or snaps.get(prev) is None:
@@ -254,7 +254,7 @@ def build_snapshot_wide(
 # 그라데이션 / 셀 렌더
 # ─────────────────────────────────────────────────────────────
 def _delta_bg(delta: float | None, max_pp: float = GRAD_MAX_PP) -> str:
-    """상승=초록, 하락=빨강, |Δ|에 비례한 배경."""
+    """비중확대=초록, 비중축소=빨강, |Δ|에 비례한 배경."""
     if delta is None or (isinstance(delta, float) and np.isnan(delta)):
         return ""
     mag = min(abs(float(delta)) / max_pp, 1.0)
@@ -341,7 +341,7 @@ def render_etf_weight_table(wide: pd.DataFrame, snaps: dict) -> str:
         + "</thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
-        + "<p class='hint'>셀 색: 직전 시점 대비 상승=초록 / 하락=빨강 (농도=|변화|). "
+        + "<p class='hint'>셀 색: 직전 시점 대비 비중확대=초록 / 비중축소=빨강 (농도=|변화|). "
         "괄호=직전 대비 pp 변화. "
         "과거에만 있고 당일에 없으면 <strong>이탈</strong>(당일 비중 0)으로 표시·집계합니다. "
         "DB최근←3일전, 3일전←일주일전, 일주일전←2주일전.</p>"
@@ -385,7 +385,7 @@ def _rank_table_html(
 ) -> str:
     """
     direction: None=값 내림차순(비중),
-               'up'=상승(양수) 큰 순, 'down'=하락(음수) 절대값 큰 순
+               'up'=비중확대(양수) 큰 순, 'down'=비중축소(음수) 절대값 큰 순
     """
     if frame.empty or value_col not in frame.columns:
         return f"<div class='rank-card'><h3>{html.escape(title)}</h3><p class='muted'>데이터 없음</p></div>"
@@ -480,12 +480,12 @@ def render_summary_section(universe: pd.DataFrame) -> str:
     ):
         cards.append(
             _rank_table_html(
-                universe, col, f"{label} · 상승 TOP{SUMMARY_TOP_N}", as_delta=True, direction="up"
+                universe, col, f"{label} · 비중확대 TOP{SUMMARY_TOP_N}", as_delta=True, direction="up"
             )
         )
         cards.append(
             _rank_table_html(
-                universe, col, f"{label} · 하락 TOP{SUMMARY_TOP_N}", as_delta=True, direction="down"
+                universe, col, f"{label} · 비중축소 TOP{SUMMARY_TOP_N}", as_delta=True, direction="down"
             )
         )
 
@@ -493,8 +493,8 @@ def render_summary_section(universe: pd.DataFrame) -> str:
         "<section class='summary-block' id='summary'>"
         "<h2>전체 요약 순위</h2>"
         "<p class='meta'>모든 ETF 구성종목을 합쳐 순위를 매깁니다. "
-        "변화는 <strong>상승</strong>·<strong>하락</strong>을 각각 따로 집계합니다 "
-        "(값 = DB최근 − 과거, pp; 미편입은 0으로 처리 → 이탈은 하락, 신규는 상승). "
+        "변화는 <strong>비중확대</strong>·<strong>비중축소</strong>를 각각 따로 집계합니다 "
+        "(값 = DB최근 − 과거, pp; 미편입은 0으로 처리 → 이탈은 비중축소, 신규는 비중확대). "
         "비중 상위(제외)는 삼성전자·SK하이닉스를 빼고 집계합니다.</p>"
         "<div class='rank-grid'>"
         + "".join(cards)
