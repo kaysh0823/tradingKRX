@@ -15,11 +15,13 @@ from content_market import energy_ratio_font_color
 
 log = logging.getLogger("naverPub.render")
 
-_TEXT_COLS = {"종목명", "달성구간", "티커"}
+_TEXT_COLS = {"종목명", "달성구간", "티커", "신고가여부"}
 _DEFAULT_INT_COLS = {"순위", "거래대금순위", "현재가"}
 _NARROW_COLS = {"순위", "티커"}
 MCAP_COL = "시총(조원)"
-TALENT_UD_COLS = {"20일 내 상승/하락", "50일 내 상승/하락", "120일 내 상승/하락"}
+TALENT_UD_COLS = {"20일 ↑/↓", "50일 ↑/↓", "120일 ↑/↓"}
+# 구 컬럼명 호환
+TALENT_UD_COLS |= {"20일 내 상승/하락", "50일 내 상승/하락", "120일 내 상승/하락"}
 _DATE_COL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 CHG_UP = "#d32f2f"
@@ -40,7 +42,8 @@ body {{
 }}
 #capture {{
   display: inline-block;
-  max-width: 960px;
+  width: fit-content;
+  max-width: none;
   background: #ffffff;
 }}
 .title {{
@@ -60,11 +63,15 @@ body {{
 table.snap {{
   border-collapse: collapse;
   border-spacing: 0;
-  width: auto;
-  max-width: 960px;
+  width: max-content;
+  max-width: none;
+  table-layout: auto;
   font-size: 13px;
   border-top: 2px solid {HEADER_BG};
   border-bottom: 2px solid {HEADER_BG};
+}}
+table.snap.compact {{
+  font-size: 12px;
 }}
 table.snap th,
 table.snap td {{
@@ -73,6 +80,10 @@ table.snap td {{
   border-bottom: 1px solid #e3e8ef;
   vertical-align: middle;
   white-space: nowrap;
+}}
+table.snap.compact th,
+table.snap.compact td {{
+  padding: 4px 5px;
 }}
 table.snap thead th {{
   background: {HEADER_BG};
@@ -83,14 +94,23 @@ table.snap thead th {{
   border-bottom: none;
   text-align: center;
 }}
+table.snap.compact thead th {{
+  font-size: 11px;
+  padding: 5px 4px;
+}}
 table.snap tbody tr:nth-child(odd) td {{ background-color: #ffffff; }}
 table.snap tbody tr:nth-child(even) td {{ background-color: #f7f9fc; }}
 table.snap tbody tr:last-child td {{ border-bottom: none; }}
 td.num, th.num {{ text-align: right; }}
 td.txt, th.txt {{ text-align: left; }}
 td.ctr, th.ctr {{ text-align: center; }}
-td.narrow, th.narrow {{ width: 1%; white-space: nowrap; }}
-td.name {{ white-space: normal; max-width: 240px; }}
+td.narrow, th.narrow {{ width: 1%; white-space: nowrap; padding-left: 5px; padding-right: 5px; }}
+td.ud, th.ud {{ width: 1%; white-space: nowrap; padding-left: 3px; padding-right: 3px; }}
+td.name {{ white-space: nowrap; max-width: 200px; }}
+table.snap.compact td.name {{ max-width: 140px; }}
+td.mcap, th.mcap {{ padding-left: 8px; padding-right: 10px; }}
+table.snap.compact td.mcap,
+table.snap.compact th.mcap {{ padding-left: 6px; padding-right: 8px; }}
 span.name-fit {{ white-space: nowrap; line-height: 1.2; }}
 span.name-fit.fs12 {{ font-size: 12px; }}
 span.name-fit.fs11 {{ font-size: 11px; }}
@@ -110,10 +130,14 @@ span.tag-out {{
   margin-left: 5px;
   vertical-align: middle;
 }}
-span.ud-up {{ color: {CHG_UP}; font-size: 12px; }}
-span.ud-dn {{ color: {CHG_DOWN}; font-size: 12px; }}
-span.ud-sep {{ color: #9e9e9e; font-size: 12px; margin: 0 1px; }}
-span.ud-em {{ font-size: 14px; font-weight: 700; }}
+span.ud-up {{ color: {CHG_UP}; font-size: 11px; }}
+span.ud-dn {{ color: {CHG_DOWN}; font-size: 11px; }}
+span.ud-sep {{ color: #9e9e9e; font-size: 11px; margin: 0 1px; }}
+span.ud-em {{ font-size: 12px; font-weight: 700; }}
+table.snap.compact span.ud-up,
+table.snap.compact span.ud-dn,
+table.snap.compact span.ud-sep {{ font-size: 10px; }}
+table.snap.compact span.ud-em {{ font-size: 11px; font-weight: 700; }}
 .footnote {{
   font-size: 11px;
   color: #616161;
@@ -200,7 +224,7 @@ def _fmt_cell(v, *, kind: str = "auto", digits: int = 2) -> str:
 
 
 def _col_align_class(name: str) -> str:
-    if name == "달성구간" or name in TALENT_UD_COLS:
+    if name in ("달성구간", "신고가여부") or name in TALENT_UD_COLS:
         return "ctr"
     if name in _TEXT_COLS:
         return "txt"
@@ -211,8 +235,12 @@ def _col_extra_class(name: str) -> str:
     parts = []
     if name in _NARROW_COLS:
         parts.append("narrow")
+    if name in TALENT_UD_COLS:
+        parts.append("ud")
     if name == "종목명":
         parts.append("name")
+    if name == MCAP_COL or name == "시총(조원)":
+        parts.append("mcap")
     return " ".join(parts)
 
 
@@ -260,6 +288,8 @@ def _build_table_document(
     if raw is None or display is None or raw.empty:
         body = f'<div id="capture"><div class="title">{title_esc}</div><p class="empty">데이터 없음</p></div>'
     else:
+        compact = bool(set(display.columns) & TALENT_UD_COLS)
+        tbl_cls = "snap compact" if compact else "snap"
         ths = []
         for c in display.columns:
             cls = f"{_col_align_class(c)} {_col_extra_class(c)}".strip()
@@ -290,13 +320,19 @@ def _build_table_document(
                 style = f' style="{";".join(style_parts)}"' if style_parts else ""
                 if col in TALENT_UD_COLS:
                     cell = _talent_ud_html(raw_v)
+                elif col == "종목명":
+                    name_raw = str(display.iloc[rr][col])
+                    name = html.escape(name_raw)
+                    fs = _name_font_class(str(raw_v) if raw_v is not None else name_raw)
+                    fit_cls = f"name-fit {fs}".strip() if fs else "name-fit"
+                    cell = f'<span class="{fit_cls}">{name}</span>'
                 else:
                     cell = html.escape(str(display.iloc[rr][col]))
                 tds.append(f'<td class="{cls}"{style}>{cell}</td>')
             rows_html.append("<tr>" + "".join(tds) + "</tr>")
         body = (
             f'<div id="capture"><div class="title">{title_esc}</div>'
-            f'<table class="snap"><thead><tr>{"".join(ths)}</tr></thead>'
+            f'<table class="{tbl_cls}"><thead><tr>{"".join(ths)}</tr></thead>'
             f'<tbody>{"".join(rows_html)}</tbody></table></div>'
         )
     return (
@@ -417,10 +453,12 @@ def dataframe_to_png(
     energy_font_cols: Optional[set[str]] = None,
     float_digits: Optional[dict[str, int]] = None,
     col_widths: Optional[list[float]] = None,
+    gradient_fixed_range: Optional[dict[str, tuple[float, float]]] = None,
 ) -> Path:
     """
     HTML 표 → Playwright 요소 스크린샷(PNG).
     page가 있으면 재사용, 없으면 단발 브라우저 기동.
+    gradient_fixed_range: 컬럼별 (vmin, vmax) 고정 — 예: 주가위치 (0,1).
     """
     _ = col_widths  # HTML 자동 레이아웃 사용
     out_path = Path(out_path)
@@ -433,6 +471,7 @@ def dataframe_to_png(
     gradient_cols = {k: (GRAD_LIGHT, GRAD_DARK) for k in raw_grad}
     energy_font_cols = set(energy_font_cols or set())
     float_digits = dict(float_digits or {})
+    gradient_fixed_range = dict(gradient_fixed_range or {})
 
     raw = None
     display = None
@@ -457,6 +496,11 @@ def dataframe_to_png(
                 "1주 전 대비",
                 "2주 전 대비",
                 "talent 지수",
+                "주가위치",
+                "picking점수",
+                "에너지배율",
+                "RS",
+                "talent",
             ):
                 kind = "float"
             else:
@@ -464,6 +508,9 @@ def dataframe_to_png(
             display[c] = [_fmt_cell(v, kind=kind, digits=digits) for v in raw[c].tolist()]
         for c in gradient_cols:
             if c not in raw.columns:
+                continue
+            if c in gradient_fixed_range:
+                grad_range[c] = gradient_fixed_range[c]
                 continue
             s = pd.to_numeric(raw[c], errors="coerce")
             if s.notna().any():
@@ -480,8 +527,29 @@ def dataframe_to_png(
     )
 
     def _shot(pg) -> None:
+        # 매 캡처마다 기본 뷰포트로 리셋 — 이전 표의 확장 폭이 다음 표에 전이되지 않게
+        base_w, base_h = 1200, 2400
+        pg.set_viewport_size({"width": base_w, "height": base_h})
         pg.set_content(doc, wait_until="load")
-        pg.locator("#capture").screenshot(path=str(out_path), type="png")
+        loc = pg.locator("#capture")
+        dims = pg.evaluate(
+            """() => {
+              const el = document.querySelector('#capture');
+              if (!el) return {w: 800, h: 600};
+              const rect = el.getBoundingClientRect();
+              const w = Math.ceil(Math.max(el.scrollWidth, el.offsetWidth, rect.width));
+              const h = Math.ceil(Math.max(el.scrollHeight, el.offsetHeight, rect.height));
+              return {w, h};
+            }"""
+        )
+        need_w = int(dims.get("w") or base_w) + 48
+        need_h = int(dims.get("h") or 600) + 48
+        # 비정상적으로 큰 측정값 방지 (표 콘텐츠 기준 상한)
+        need_w = min(need_w, 2200)
+        need_h = min(max(need_h, base_h), 8000)
+        if need_w > base_w or need_h > base_h:
+            pg.set_viewport_size({"width": max(base_w, need_w), "height": max(base_h, need_h)})
+        loc.screenshot(path=str(out_path), type="png")
 
     if page is not None:
         _shot(page)
@@ -489,11 +557,11 @@ def dataframe_to_png(
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = _launch_chromium(p)
             try:
                 ctx = browser.new_context(
                     device_scale_factor=2,
-                    viewport={"width": 1400, "height": 900},
+                    viewport={"width": 1200, "height": 900},
                 )
                 pg = ctx.new_page()
                 _shot(pg)
@@ -581,61 +649,81 @@ def _fmt_num(v, digits=2) -> str:
         return "-"
 
 
-def narrative_energy(df: pd.DataFrame, as_of: str) -> str:
+def narrative_energy(df: pd.DataFrame, as_of: str, market: str = "") -> str:
+    label = f"{market} " if market else ""
     if df is None or df.empty:
-        return f"{as_of} 기준 에너지배율 상위 종목 데이터가 없습니다."
+        return f"{as_of} 기준 {label}에너지배율 상위 종목 데이터가 없습니다."
     top = df.iloc[0]
     name = top.get("종목명", top.get("티커", ""))
     er3 = _fmt_num(top.get("3일에너지배율"))
     er1 = _fmt_num(top.get("당일에너지배율"))
     return (
-        f"{as_of} 거래대금 상위 종목 중 3일 에너지배율 1위는 {name}입니다. "
+        f"{as_of} {label}거래대금 상위 종목 중 3일 에너지배율 1위는 {name}입니다. "
         f"3일 배율 {er3}, 당일 배율 {er1}로 시총 대비 자금 유입이 두드러집니다. "
         f"에너지배율은 거래대금 시장비중을 시총 시장비중으로 나눈 값입니다. "
         f"시총 단위는 조(원)입니다."
     )
 
 
-def narrative_highs(df: pd.DataFrame, as_of: str) -> str:
+def narrative_highs(df: pd.DataFrame, as_of: str, market: str = "") -> str:
+    label = f"{market} " if market else ""
     if df is None or df.empty:
-        return f"{as_of} 기준 신고가 달성 종목이 없습니다."
+        return f"{as_of} 기준 {label}신고가 달성 종목이 없습니다."
     return (
-        f"{as_of} 기준 최장 구간 신고가 {len(df)}종입니다. "
+        f"{as_of} 기준 {label}최장 구간 신고가 {len(df)}종입니다. "
         f"구간대비(%)는 해당 구간 최저가 대비 상승률입니다."
     )
 
 
-def narrative_lows(df: pd.DataFrame, as_of: str) -> str:
+def narrative_lows(df: pd.DataFrame, as_of: str, market: str = "") -> str:
+    label = f"{market} " if market else ""
     if df is None or df.empty:
-        return f"{as_of} 기준 신저가 달성 종목이 없습니다."
+        return f"{as_of} 기준 {label}신저가 달성 종목이 없습니다."
     return (
-        f"{as_of} 기준 최장 구간 신저가 {len(df)}종입니다. "
+        f"{as_of} 기준 {label}최장 구간 신저가 {len(df)}종입니다. "
         f"구간대비(%)는 해당 구간 최고가 대비 하락률입니다."
     )
 
 
-def narrative_rs(df: pd.DataFrame, as_of: str) -> str:
+def narrative_rs(df: pd.DataFrame, as_of: str, market: str = "") -> str:
+    label = f"{market} " if market else ""
     if df is None or df.empty:
-        return f"{as_of} 기준 RS 순위 데이터가 없습니다."
+        return f"{as_of} 기준 {label}RS 순위 데이터가 없습니다."
     top = df.iloc[0]
     name = top.get("종목명", "")
     return (
-        f"{as_of} RS(상대강도) 1위는 {name}입니다. "
+        f"{as_of} {label}RS(상대강도) 1위는 {name}입니다. "
+        f"시총 5,000억원 이상·해당 시장 내 백분위 기준이며, "
         f"RS는 rs_20·50·120·200 백분위 평균입니다."
     )
 
 
-def narrative_talent(df: pd.DataFrame, as_of: str) -> str:
+def narrative_talent(df: pd.DataFrame, as_of: str, market: str = "") -> str:
+    label = f"{market} " if market else ""
     if df is None or df.empty:
-        return f"{as_of} 기준 Talent 순위 데이터가 없습니다."
+        return f"{as_of} 기준 {label}Talent 순위 데이터가 없습니다."
     top = df.iloc[0]
     name = top.get("종목명", "")
     idx = _fmt_num(top.get("talent 지수"), digits=3)
     return (
-        f"{as_of} Talent 지수 1위는 {name}(지수 {idx})입니다. "
-        f"시총 5,000억원 이상 종목 대상이며, "
+        f"{as_of} {label}Talent 지수 1위는 {name}(지수 {idx})입니다. "
+        f"시총 5,000억원 이상·해당 시장 내 순위이며, "
         f"지수 = (20일상승일수/20)×0.5 + (50일/50)×0.3 + (120일/120)×0.2 "
         f"(상승일 = 일간 등락률 +10% 이상)입니다."
+    )
+
+
+def narrative_price_pos(df: pd.DataFrame, as_of: str, market: str = "") -> str:
+    label = f"{market} " if market else ""
+    if df is None or df.empty:
+        return f"{as_of} 기준 {label}주가위치 순위 데이터가 없습니다."
+    top = df.iloc[0]
+    name = top.get("종목명", "")
+    pos = _fmt_num(top.get("주가위치"), digits=2)
+    return (
+        f"{as_of} {label}주가위치 1위는 {name}(위치 {pos})입니다. "
+        f"시총 5,000억원 이상·120거래일 고가·저가 기준이며, "
+        f"주가위치 = (현재가−최저)/(최고−최저) 입니다."
     )
 
 
@@ -723,13 +811,368 @@ def export_tables_csv(out_dir: Path, sheets: dict[str, pd.DataFrame]) -> list[Pa
     return paths
 
 
-def _write_body(out_dir: Path, md_parts: list[str], html_parts: list[str]) -> tuple[Path, Path]:
-    html_parts = list(html_parts) + ["</body></html>"]
-    md_path = out_dir / "body.md"
-    html_path = out_dir / "body.html"
+def _write_doc(
+    out_dir: Path,
+    md_parts: list[str],
+    html_parts: list[str],
+    stem: str,
+) -> tuple[Path, Path]:
+    """md는 항상 기록. html_parts가 있으면 구형 조립 HTML, 없으면 md만."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    md_path = out_dir / f"{stem}.md"
+    html_path = out_dir / f"{stem}.html"
     md_path.write_text("\n".join(md_parts), encoding="utf-8")
-    html_path.write_text("\n".join(html_parts), encoding="utf-8")
+    if html_parts is not None:
+        html_path.write_text("\n".join(list(html_parts) + ["</body></html>"]), encoding="utf-8")
     return md_path, html_path
+
+
+def _write_md_only(out_dir: Path, md_parts: list[str], stem: str) -> Path:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    md_path = out_dir / f"{stem}.md"
+    md_path.write_text("\n".join(md_parts), encoding="utf-8")
+    return md_path
+
+
+def _weight_rank_lines_html(df: Optional[pd.DataFrame], n: int = 3) -> str:
+    """비중 확대/축소 metric: 1~3위 줄 HTML (raw placeholder)."""
+    if df is None or df.empty:
+        return '<div class="metric-ranks"><div class="r1">-</div></div>'
+    lines = []
+    for i, (_, r) in enumerate(df.head(n).iterrows()):
+        name = html.escape(str(r.get("종목명") or "-").strip() or "-")
+        etf = html.escape(str(r.get("ETF") or "").strip() or "-")
+        chg = _fmt_num(r.get("전일 대비"))
+        cls = "r1" if i == 0 else "r23"
+        lines.append(
+            f'<div class="{cls}">'
+            f'<span class="rk-name">{name}</span>'
+            f'<span class="rk-sep"> · </span>'
+            f'<span class="rk-meta">{etf} · {chg}%p</span>'
+            f"</div>"
+        )
+    return '<div class="metric-ranks">' + "".join(lines) + "</div>"
+
+
+def _as_of_short(as_of: str) -> str:
+    s = str(as_of).replace("-", "").replace(".", "")[:8]
+    if len(s) == 8 and s.isdigit():
+        return f"{s[4:6]}-{s[6:8]}"
+    return str(as_of)
+
+
+def _top_name(df: Optional[pd.DataFrame], col: str = "종목명") -> str:
+    if df is None or df.empty:
+        return "-"
+    v = df.iloc[0].get(col, "")
+    return str(v).strip() if v is not None and str(v).strip() else "-"
+
+
+def _count_day_stocks(as_of: str) -> int:
+    try:
+        from db import engine
+
+        ymd = _ymd(as_of)
+        d = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+        df = pd.read_sql(
+            "SELECT COUNT(*) AS c FROM ohlcv WHERE date = %s",
+            engine(),
+            params=(d,),
+        )
+        return int(df.iloc[0]["c"] or 0)
+    except Exception:
+        return 0
+
+
+REPORT_VIEWPORT_W = 1180  # 디자인 --max와 동일
+FULL_PNG_JPEG_BYTES = 20 * 1024 * 1024
+CHROMIUM_LAUNCH_ARGS = ["--disable-dev-shm-usage", "--no-sandbox"]
+SCREENSHOT_TIMEOUT_MS = 120_000
+STITCH_BG = (7, 17, 31)  # --bg #07111f
+
+
+def _launch_chromium(playwright):
+    return playwright.chromium.launch(headless=True, args=list(CHROMIUM_LAUNCH_ARGS))
+
+
+def _png_to_jpeg_if_large(png_path: Path, max_bytes: int = FULL_PNG_JPEG_BYTES) -> Optional[Path]:
+    """풀페이지 PNG가 크면 PIL로 JPEG 생성 (재캡처 없이)."""
+    png_path = Path(png_path)
+    if not png_path.is_file() or png_path.stat().st_size <= max_bytes:
+        return None
+    try:
+        from PIL import Image
+
+        Image.MAX_IMAGE_PIXELS = max(getattr(Image, "MAX_IMAGE_PIXELS", 0) or 0, 300_000_000)
+        jpeg_path = png_path.with_name(png_path.stem + ".jpg")
+        with Image.open(png_path) as im:
+            rgb = im.convert("RGB")
+            rgb.save(jpeg_path, "JPEG", quality=90, optimize=True)
+        log.info(
+            "풀페이지 JPEG: %s (%.1f MB, PNG>20MB)",
+            jpeg_path.name,
+            jpeg_path.stat().st_size / (1024 * 1024),
+        )
+        return jpeg_path
+    except Exception as e:
+        log.warning("PNG→JPEG 변환 실패: %s", e)
+        return None
+
+
+def _stitch_section_pngs(section_paths: list[Path], out_path: Path) -> Path:
+    """섹션 PNG를 세로로 이어붙여 통이미지 생성."""
+    from PIL import Image
+
+    # 긴 리포트 스티치용 (기본 제한 ~89MP 초과 가능)
+    Image.MAX_IMAGE_PIXELS = max(getattr(Image, "MAX_IMAGE_PIXELS", 0) or 0, 300_000_000)
+
+    out_path = Path(out_path)
+    imgs = []
+    try:
+        for p in section_paths:
+            if not Path(p).is_file():
+                continue
+            imgs.append(Image.open(p).convert("RGB"))
+        if not imgs:
+            raise RuntimeError("이어붙일 섹션 이미지 없음")
+        width = max(im.width for im in imgs)
+        height = sum(im.height for im in imgs)
+        canvas = Image.new("RGB", (width, height), STITCH_BG)
+        y = 0
+        for im in imgs:
+            x = (width - im.width) // 2
+            canvas.paste(im, (x, y))
+            y += im.height
+        canvas.save(out_path, "PNG", optimize=True)
+        log.info(
+            "풀페이지 스티치 fallback: %s (%d섹션, %.1f MB)",
+            out_path.name,
+            len(imgs),
+            out_path.stat().st_size / (1024 * 1024),
+        )
+        return out_path
+    finally:
+        for im in imgs:
+            try:
+                im.close()
+            except Exception:
+                pass
+
+
+def capture_html_report(html_path: Path, stem: str) -> dict:
+    """
+    완성 HTML을 Playwright로 열어 풀페이지·섹션 PNG 저장.
+    - {stem}_full.png (풀페이지)
+    - {stem}_sec01.png … (각 <section>)
+    - 풀페이지 PNG > 20MB이면 {stem}_full.jpg (quality=90)도 저장
+    - full_page 실패 시 섹션 PNG 세로 스티치로 fallback
+    articles/텔레그램에는 포함하지 않음.
+    """
+    from playwright.sync_api import sync_playwright
+
+    html_path = Path(html_path).resolve()
+    out_dir = html_path.parent
+    if not html_path.is_file():
+        log.warning("캡처 대상 HTML 없음: %s", html_path)
+        return {"full": None, "sections": [], "jpeg": None}
+
+    # 이전 캡처 정리
+    for old in out_dir.glob(f"{stem}_full.*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    for old in out_dir.glob(f"{stem}_sec*.png"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    full_png = out_dir / f"{stem}_full.png"
+    section_paths: list[Path] = []
+    jpeg_path: Optional[Path] = None
+    uri = html_path.as_uri()
+
+    with sync_playwright() as p:
+        browser = _launch_chromium(p)
+        try:
+            ctx = browser.new_context(
+                viewport={"width": REPORT_VIEWPORT_W, "height": 900},
+                device_scale_factor=2,
+            )
+            page = ctx.new_page()
+            page.goto(uri, wait_until="networkidle", timeout=SCREENSHOT_TIMEOUT_MS)
+            # 이미지 로드 완료 대기
+            page.wait_for_function(
+                """() => Array.from(document.images).every(
+                    img => img.complete && (img.naturalWidth > 0 || !img.src)
+                )""",
+                timeout=SCREENSHOT_TIMEOUT_MS,
+            )
+            page.wait_for_timeout(400)
+
+            # sticky/fixed가 full_page 캡처 중 중간에 박히는 것 방지
+            page.add_style_tag(
+                content=(
+                    ".topbar{position:static !important;top:auto !important}"
+                    "*{scroll-behavior:auto !important}"
+                )
+            )
+            page.evaluate(
+                """() => {
+                  document.querySelectorAll('*').forEach(el => {
+                    const pos = getComputedStyle(el).position;
+                    if (pos === 'sticky' || pos === 'fixed') {
+                      el.style.setProperty('position', 'static', 'important');
+                      el.style.setProperty('top', 'auto', 'important');
+                      el.style.setProperty('bottom', 'auto', 'important');
+                    }
+                  });
+                }"""
+            )
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(100)
+
+            full_ok = False
+            try:
+                page.screenshot(
+                    path=str(full_png),
+                    full_page=True,
+                    type="png",
+                    timeout=SCREENSHOT_TIMEOUT_MS,
+                )
+                full_ok = full_png.is_file() and full_png.stat().st_size > 0
+                if full_ok:
+                    log.info(
+                        "풀페이지 캡처: %s (%.1f MB)",
+                        full_png.name,
+                        full_png.stat().st_size / (1024 * 1024),
+                    )
+            except Exception as e:
+                log.warning("풀페이지 캡처 실패(%s): %s — 섹션 스티치 fallback", stem, e)
+                full_ok = False
+                try:
+                    if full_png.is_file():
+                        full_png.unlink()
+                except OSError:
+                    pass
+
+            sections = page.locator("section")
+            n = sections.count()
+            for i in range(n):
+                sec = sections.nth(i)
+                try:
+                    sec.scroll_into_view_if_needed(timeout=SCREENSHOT_TIMEOUT_MS)
+                    page.wait_for_timeout(80)
+                    sp = out_dir / f"{stem}_sec{i + 1:02d}.png"
+                    sec.screenshot(path=str(sp), type="png", timeout=SCREENSHOT_TIMEOUT_MS)
+                    section_paths.append(sp)
+                except Exception as e:
+                    log.warning("%s 섹션 %d 캡처 실패: %s", stem, i + 1, e)
+
+            if not full_ok:
+                if section_paths:
+                    try:
+                        _stitch_section_pngs(section_paths, full_png)
+                        full_ok = full_png.is_file()
+                    except Exception as e:
+                        log.warning("%s 섹션 스티치 실패: %s", stem, e)
+                else:
+                    log.warning("%s 풀페이지·섹션 모두 실패", stem)
+
+            if full_ok:
+                jpeg_path = _png_to_jpeg_if_large(full_png)
+
+            ctx.close()
+        finally:
+            browser.close()
+
+    log.info(
+        "리포트 캡처 완료 %s: full=%s sections=%d jpeg=%s",
+        stem,
+        full_png.name if full_png.is_file() else None,
+        len(section_paths),
+        jpeg_path.name if jpeg_path else None,
+    )
+    return {
+        "full": full_png if full_png.is_file() else None,
+        "sections": section_paths,
+        "jpeg": jpeg_path,
+    }
+
+
+def build_etf_cross_rankings(by_etf: list[dict], top_n: int = 30) -> dict[str, pd.DataFrame]:
+    """전 ETF 합산: 보유 상위 / 비중 확대 / 비중 축소."""
+    from content_etf import CHG_PREV
+
+    rows = []
+    for item in by_etf or []:
+        df = item.get("df")
+        if df is None or df.empty:
+            continue
+        col_cur = item.get("col_cur")
+        etf_name = item.get("etf_name") or item.get("etf_ticker") or ""
+        etf_ticker = item.get("etf_ticker") or ""
+        for _, r in df.iterrows():
+            w = r.get(col_cur) if col_cur else None
+            chg = r.get(CHG_PREV)
+            try:
+                w_f = float(w) if w is not None and pd.notna(w) else np.nan
+            except (TypeError, ValueError):
+                w_f = np.nan
+            try:
+                c_f = float(chg) if chg is not None and pd.notna(chg) else np.nan
+            except (TypeError, ValueError):
+                c_f = np.nan
+            rows.append(
+                {
+                    "ETF": etf_name,
+                    "ETF코드": etf_ticker,
+                    "종목명": r.get("종목명", ""),
+                    "티커": r.get("티커", ""),
+                    "비중(%)": w_f,
+                    "전일 대비": c_f,
+                    "상태": r.get("_status", "") or "",
+                }
+            )
+    empty = {
+        "holdings": pd.DataFrame(),
+        "weight_up": pd.DataFrame(),
+        "weight_down": pd.DataFrame(),
+    }
+    if not rows:
+        return empty
+    all_df = pd.DataFrame(rows)
+    hold = (
+        all_df.dropna(subset=["비중(%)"])
+        .sort_values("비중(%)", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+    hold.insert(0, "순위", range(1, len(hold) + 1))
+    up = (
+        all_df.dropna(subset=["전일 대비"])
+        .sort_values("전일 대비", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+    up.insert(0, "순위", range(1, len(up) + 1))
+    down = (
+        all_df.dropna(subset=["전일 대비"])
+        .sort_values("전일 대비", ascending=True)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+    down.insert(0, "순위", range(1, len(down) + 1))
+    return {"holdings": hold, "weight_up": up, "weight_down": down}
+
+
+def day_root(as_of: str) -> Path:
+    """outputs/YYYYMMDD/"""
+    return OUTPUTS_DIR / _ymd(as_of)
 
 
 def _html_header(title: str) -> list[str]:
@@ -746,14 +1189,17 @@ def _html_header(title: str) -> list[str]:
 
 def render_daily_snapshot(
     as_of: str,
-    market: dict[str, pd.DataFrame],
+    market: dict,
     out_dir: Optional[Path] = None,
 ) -> dict:
-    """데일리 스냅샷 전용: outputs/daily_snapshot_{YYYYMMDD}/"""
+    """시장 스냅샷: 지표별(코스피→코스닥) PNG + market.md/html."""
     from playwright.sync_api import sync_playwright
 
+    from content_market import MARKET_LABELS, MARKETS, MCAP_COL as MCAP, PRICE_POS_COL
+    from design_html import chart_card, date_iso, date_kr, write_design_html
+
     ymd = _ymd(as_of)
-    out_dir = Path(out_dir or (OUTPUTS_DIR / f"daily_snapshot_{ymd}"))
+    out_dir = Path(out_dir or (day_root(as_of) / "tickers"))
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("0*.png"):
         try:
@@ -762,107 +1208,233 @@ def render_daily_snapshot(
             pass
 
     articles = []
-    title = f"데일리 스냅샷 {as_of}"
-    html_parts = _html_header(title)
+    title = f"시장 스냅샷 {as_of}"
     md_parts = [f"# {title}\n"]
     sheets: dict[str, pd.DataFrame] = {}
     soft = (GRAD_LIGHT, GRAD_DARK)
+    section_html: list[str] = []
+    energy_tops: dict[str, tuple[str, str]] = {}
+
+    if any(k in market for k in ("energy", "high", "rs")):
+        market = {"KOSPI": market, "KOSDAQ": {}}
+
+    # 지표별 섹션 정의: (prefix, key, md_title, html_h2, caption, tag, kicker, accent, render_opts)
+    metrics_spec = [
+        {
+            "id": "energy",
+            "prefix": "01_energy",
+            "key": "energy",
+            "title": "에너지배율",
+            "desc": "시장별 거래대금 상위 50 → 3일 에너지배율 순입니다.",
+            "caption": "거래대금 상위50 → 3일 에너지배율 · 시장내 비중",
+            "tag": "Flow",
+            "kicker": "Section 01",
+            "accent": "var(--blue)",
+        },
+        {
+            "id": "rs",
+            "prefix": "02_rs",
+            "key": "rs",
+            "title": "RS Top50",
+            "desc": "시총 5,000억 이상, 시장 내 상대강도 상위 50종입니다.",
+            "caption": "시총 5,000억↑ · 시장내 rs_20·50·120·200 백분위 평균",
+            "tag": "RS",
+            "kicker": "Section 02",
+            "accent": "var(--violet)",
+        },
+        {
+            "id": "pos",
+            "prefix": "03_pos",
+            "key": "pos",
+            "title": "주가위치 Top50",
+            "desc": "120거래일 고가·저가 대비 현재가 위치(0~1) 상위 50종입니다.",
+            "caption": "(현재가−120일최저)/(120일최고−최저) · 시총 5,000억↑",
+            "tag": "Position",
+            "kicker": "Section 03",
+            "accent": "var(--cyan)",
+        },
+        {
+            "id": "talent",
+            "prefix": "04_talent",
+            "key": "talent",
+            "title": "Talent Top50",
+            "desc": "시총 5,000억 이상 Talent 지수 상위 50종입니다.",
+            "caption": "시총 5,000억↑ · 시장내 순위 · +10% 상승일 가중",
+            "tag": "Talent",
+            "kicker": "Section 04",
+            "accent": "var(--orange)",
+        },
+        {
+            "id": "high",
+            "prefix": "05_high",
+            "key": "high",
+            "title": "신고가",
+            "desc": "시장별 최장 구간 신고가 달성 종목입니다.",
+            "caption": "최장 구간 신고가 · 구간 최저가 대비",
+            "tag": "High",
+            "kicker": "Section 05",
+            "accent": "var(--blue)",
+        },
+        {
+            "id": "low",
+            "prefix": "06_low",
+            "key": "low",
+            "title": "신저가",
+            "desc": "시장별 최장 구간 신저가 달성 종목입니다.",
+            "caption": "최장 구간 신저가 · 구간 최고가 대비",
+            "tag": "Low",
+            "kicker": "Section 06",
+            "accent": "var(--danger)",
+        },
+    ]
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = _launch_chromium(p)
         try:
-            ctx = browser.new_context(device_scale_factor=2, viewport={"width": 1400, "height": 2400})
+            ctx = browser.new_context(device_scale_factor=2, viewport={"width": 1200, "height": 2400})
             page = ctx.new_page()
 
-            energy = market.get("energy")
-            png = dataframe_to_png(
-                energy,
-                out_dir / "01_energy.png",
-                f"에너지배율 순위 ({as_of})",
-                page=page,
-                int_cols={"순위", "거래대금순위", "현재가"},
-                chg_font_cols={"당일상승률"},
-                gradient_cols={"거래대금(억)": soft, MCAP_COL: soft},
-                energy_font_cols={"당일에너지배율", "3일에너지배율"},
-            )
-            text = narrative_energy(energy, as_of)
-            md_parts.append(f"## 에너지배율 순위\n\n{text}\n\n![에너지배율]({png.name})\n")
-            html_parts.append(f"<h2>에너지배율 순위</h2><p>{html.escape(text)}</p><p><img src='{png.name}'/></p>")
-            articles.append({"key": "01_energy", "title": "에너지배율 순위", "png": png, "text": text, "df": energy})
-            sheets["에너지배율"] = energy if energy is not None else pd.DataFrame()
+            for spec in metrics_spec:
+                md_parts.append(f"## {spec['title']}\n")
+                cards: list[str] = []
+                for mi, mkt in enumerate(MARKETS):
+                    mkt_l = mkt.lower()
+                    label = MARKET_LABELS.get(mkt, mkt)
+                    block = market.get(mkt) or {}
+                    df = block.get(spec["key"])
+                    png_name = f"{spec['prefix']}_{mkt_l}.png"
+                    num = f"{mi + 1:02d}"
+                    num_style = (
+                        ""
+                        if mkt == "KOSPI"
+                        else "background:rgba(80,227,194,.12);border-color:rgba(80,227,194,.18)"
+                    )
 
-            highs = market.get("high")
-            png = dataframe_to_png(
-                highs,
-                out_dir / "02_high.png",
-                f"신고가 ({as_of})",
-                page=page,
-                int_cols={"현재가"},
-                chg_font_cols={"당일상승률", "구간대비(%)"},
-                gradient_cols={MCAP_COL: soft},
-            )
-            text = narrative_highs(highs, as_of)
-            md_parts.append(f"## 신고가\n\n{text}\n\n![신고가]({png.name})\n")
-            html_parts.append(f"<h2>신고가</h2><p>{html.escape(text)}</p><p><img src='{png.name}'/></p>")
-            articles.append({"key": "02_high", "title": "신고가", "png": png, "text": text, "df": highs})
-            sheets["신고가"] = highs if highs is not None else pd.DataFrame()
+                    kw: dict = {
+                        "page": page,
+                        "int_cols": {"순위", "현재가"},
+                        "chg_font_cols": {"당일상승률"},
+                        "gradient_cols": {MCAP: soft},
+                    }
+                    if spec["key"] == "energy":
+                        kw["int_cols"] = {"순위", "거래대금순위", "현재가"}
+                        kw["gradient_cols"] = {"거래대금(억)": soft, MCAP: soft}
+                        kw["energy_font_cols"] = {"당일에너지배율", "3일에너지배율"}
+                        text = narrative_energy(df, as_of, market=label)
+                        card_title = f"{label} 에너지배율"
+                    elif spec["key"] == "rs":
+                        text = narrative_rs(df, as_of, market=label)
+                        card_title = f"{label} RS Top50"
+                    elif spec["key"] == "pos":
+                        kw["gradient_cols"] = {PRICE_POS_COL: soft, MCAP: soft}
+                        kw["float_digits"] = {PRICE_POS_COL: 2}
+                        kw["gradient_fixed_range"] = {PRICE_POS_COL: (0.0, 1.0)}
+                        text = narrative_price_pos(df, as_of, market=label)
+                        card_title = f"{label} 주가위치 Top50"
+                    elif spec["key"] == "talent":
+                        kw["gradient_cols"] = {"talent 지수": soft, MCAP: soft}
+                        kw["float_digits"] = {"talent 지수": 3}
+                        text = narrative_talent(df, as_of, market=label)
+                        card_title = f"{label} Talent Top50"
+                    elif spec["key"] == "high":
+                        kw["chg_font_cols"] = {"당일상승률", "구간대비(%)"}
+                        text = narrative_highs(df, as_of, market=label)
+                        card_title = f"{label} 신고가"
+                        kw["int_cols"] = {"현재가"}
+                    else:  # low
+                        kw["chg_font_cols"] = {"당일상승률", "구간대비(%)"}
+                        text = narrative_lows(df, as_of, market=label)
+                        card_title = f"{label} 신저가"
+                        kw["int_cols"] = {"현재가"}
 
-            lows = market.get("low")
-            png = dataframe_to_png(
-                lows,
-                out_dir / "03_low.png",
-                f"신저가 ({as_of})",
-                page=page,
-                int_cols={"현재가"},
-                chg_font_cols={"당일상승률", "구간대비(%)"},
-                gradient_cols={MCAP_COL: soft},
-            )
-            text = narrative_lows(lows, as_of)
-            md_parts.append(f"## 신저가\n\n{text}\n\n![신저가]({png.name})\n")
-            html_parts.append(f"<h2>신저가</h2><p>{html.escape(text)}</p><p><img src='{png.name}'/></p>")
-            articles.append({"key": "03_low", "title": "신저가", "png": png, "text": text, "df": lows})
-            sheets["신저가"] = lows if lows is not None else pd.DataFrame()
+                    caption = spec["caption"]
+                    if spec["key"] in ("high", "low"):
+                        caption = f"{0 if df is None else len(df)}종 · {spec['caption']}"
 
-            talent = market.get("talent")
-            png = dataframe_to_png(
-                talent,
-                out_dir / "04_talent.png",
-                f"Talent 순위 Top50 ({as_of})",
-                page=page,
-                int_cols={"순위", "현재가"},
-                chg_font_cols={"당일상승률"},
-                gradient_cols={"talent 지수": soft, MCAP_COL: soft},
-                float_digits={"talent 지수": 3},
-            )
-            text = narrative_talent(talent, as_of)
-            md_parts.append(f"## Talent 순위\n\n{text}\n\n![Talent]({png.name})\n")
-            html_parts.append(f"<h2>Talent 순위 Top50</h2><p>{html.escape(text)}</p><p><img src='{png.name}'/></p>")
-            articles.append({"key": "04_talent", "title": "Talent 순위 Top50", "png": png, "text": text, "df": talent})
-            sheets["Talent"] = talent if talent is not None else pd.DataFrame()
+                    png = dataframe_to_png(
+                        df,
+                        out_dir / png_name,
+                        f"{card_title} ({as_of})",
+                        **kw,
+                    )
+                    md_parts.append(
+                        f"### {label}\n\n{text}\n\n![{card_title}]({png.name})\n"
+                    )
+                    articles.append(
+                        {
+                            "key": f"{spec['prefix']}_{mkt_l}",
+                            "title": card_title,
+                            "png": png,
+                            "text": text,
+                            "df": df,
+                        }
+                    )
+                    sheets[f"{spec['title']}_{label}"] = (
+                        df if df is not None else pd.DataFrame()
+                    )
+                    if spec["key"] == "energy":
+                        energy_tops[mkt] = (
+                            _top_name(df),
+                            _fmt_num(df.iloc[0].get("3일에너지배율"))
+                            if df is not None and not df.empty
+                            else "-",
+                        )
+                    cards.append(
+                        chart_card(
+                            num,
+                            card_title,
+                            caption,
+                            png.name,
+                            tag=f"{label} · {spec['tag']}",
+                            wide=True,
+                            number_style=num_style,
+                            narrative=text,
+                        )
+                    )
 
-            rs = market.get("rs")
-            png = dataframe_to_png(
-                rs,
-                out_dir / "05_rs.png",
-                f"RS 순위 Top50 ({as_of})",
-                page=page,
-                int_cols={"순위", "현재가"},
-                gradient_cols={MCAP_COL: soft},
-            )
-            text = narrative_rs(rs, as_of)
-            md_parts.append(f"## RS 순위\n\n{text}\n\n![RS]({png.name})\n")
-            html_parts.append(f"<h2>RS 순위 Top50</h2><p>{html.escape(text)}</p><p><img src='{png.name}'/></p>")
-            articles.append({"key": "05_rs", "title": "RS 순위 Top50", "png": png, "text": text, "df": rs})
-            sheets["RS"] = rs if rs is not None else pd.DataFrame()
+                section_html.append(
+                    f'<section class="section" id="{spec["id"]}">'
+                    f'<div class="section-head"><div>'
+                    f'<div class="section-kicker" style="color:{spec["accent"]}">{spec["kicker"]}</div>'
+                    f'<h2>{html.escape(spec["title"])}</h2>'
+                    f'<p class="section-desc">{html.escape(spec["desc"])}</p>'
+                    f"</div>"
+                    f'<div class="market-badge" style="color:{spec["accent"]}">'
+                    f'<i></i>KOSPI → KOSDAQ</div></div>'
+                    f'<div class="chart-grid stack">{"".join(cards)}</div>'
+                    f"</section>"
+                )
 
             ctx.close()
         finally:
             browser.close()
 
-    md_path, html_path = _write_body(out_dir, md_parts, html_parts)
-    xlsx = export_tables_xlsx(out_dir / f"daily_snapshot_{ymd}.xlsx", sheets)
+    md_path = _write_md_only(out_dir, md_parts, "market")
+    ek, ev = energy_tops.get("KOSPI", ("-", "-"))
+    dk, dv = energy_tops.get("KOSDAQ", ("-", "-"))
+    html_path = write_design_html(
+        "market_design.html",
+        out_dir / "market.html",
+        {
+            "DATE": date_iso(as_of),
+            "DATE_KR": date_kr(as_of),
+            "AS_OF_SHORT": _as_of_short(as_of),
+            "TOTAL_STOCKS": f"{_count_day_stocks(as_of):,}",
+            "ENERGY_TOP_KOSPI": ek,
+            "ENERGY_TOP_VAL_KOSPI": ev,
+            "ENERGY_TOP_KOSDAQ": dk,
+            "ENERGY_TOP_VAL_KOSDAQ": dv,
+            "MARKET_SECTIONS_HTML": "\n".join(section_html),
+        },
+    )
+    try:
+        capture = capture_html_report(html_path, "market")
+    except Exception as e:
+        log.warning("market 풀페이지 캡처 실패: %s", e)
+        capture = {"full": None, "sections": [], "jpeg": None}
+    xlsx = export_tables_xlsx(out_dir / f"tickers_{ymd}.xlsx", sheets)
     csvs = export_tables_csv(out_dir, sheets)
-    log.info("데일리 스냅샷 출력: %s (xlsx=%s csv=%d)", out_dir, xlsx.name, len(csvs))
+    log.info("tickers 출력: %s (md=%s xlsx=%s csv=%d)", out_dir, md_path.name, xlsx.name, len(csvs))
     return {
         "out_dir": out_dir,
         "md": md_path,
@@ -870,7 +1442,8 @@ def render_daily_snapshot(
         "xlsx": xlsx,
         "csv": csvs,
         "articles": articles,
-        "kind": "daily_snapshot",
+        "capture": capture,
+        "kind": "tickers",
     }
 
 
@@ -879,11 +1452,13 @@ def render_active_etf_pdf(
     etf: dict,
     out_dir: Optional[Path] = None,
 ) -> dict:
-    """액티브 ETF PDF 전용: outputs/active_etf_pdf_{YYYYMMDD}/"""
+    """액티브 ETF PDF: outputs/YYYYMMDD/etfs/ (PNG + etf.md / 디자인 etf.html)."""
     from playwright.sync_api import sync_playwright
 
+    from design_html import chart_card, date_iso, date_kr, write_design_html
+
     ymd = _ymd(as_of)
-    out_dir = Path(out_dir or (OUTPUTS_DIR / f"active_etf_pdf_{ymd}"))
+    out_dir = Path(out_dir or (day_root(as_of) / "etfs"))
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("0*.png"):
         try:
@@ -893,18 +1468,13 @@ def render_active_etf_pdf(
 
     articles = []
     title = f"액티브 ETF PDF {as_of}"
-    html_parts = _html_header(title)
     md_parts = [f"# {title}\n"]
     sheets: dict[str, pd.DataFrame] = {}
 
     note = etf.get("note")
     if note:
         md_parts.append(f"> **{note}** — 편입/편출 판정을 생략했습니다.\n")
-        html_parts.append(
-            f"<p class='warn'>{html.escape(str(note))} — 편입/편출 판정 생략</p>"
-        )
 
-    # 스냅샷 날짜 안내
     if etf.get("date_cur"):
         md_parts.append(
             f"스냅샷: 당일 `{etf.get('date_cur')}` / 전일 `{etf.get('date_prev')}` / "
@@ -912,16 +1482,55 @@ def render_active_etf_pdf(
         )
 
     by_etf = etf.get("by_etf") or []
+    rankings = build_etf_cross_rankings(by_etf, top_n=30)
+    soft = (GRAD_LIGHT, GRAD_DARK)
+    pdf_cards: list[str] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = _launch_chromium(p)
         try:
-            ctx = browser.new_context(device_scale_factor=2, viewport={"width": 1400, "height": 2400})
+            ctx = browser.new_context(device_scale_factor=2, viewport={"width": 1200, "height": 2400})
             page = ctx.new_page()
+
+            hold = rankings["holdings"]
+            dataframe_to_png(
+                hold[["순위", "ETF", "종목명", "티커", "비중(%)", "전일 대비"]]
+                if not hold.empty
+                else hold,
+                out_dir / "00_top_holdings.png",
+                f"보유 비중 Top ({as_of})",
+                page=page,
+                int_cols={"순위"},
+                chg_font_cols={"전일 대비"},
+                gradient_cols={"비중(%)": soft},
+            )
+            up = rankings["weight_up"]
+            dataframe_to_png(
+                up[["순위", "ETF", "종목명", "티커", "비중(%)", "전일 대비", "상태"]]
+                if not up.empty
+                else up,
+                out_dir / "00_weight_up.png",
+                f"비중 확대 Top ({as_of})",
+                page=page,
+                int_cols={"순위"},
+                chg_font_cols={"전일 대비"},
+                gradient_cols={"비중(%)": soft},
+            )
+            down = rankings["weight_down"]
+            dataframe_to_png(
+                down[["순위", "ETF", "종목명", "티커", "비중(%)", "전일 대비", "상태"]]
+                if not down.empty
+                else down,
+                out_dir / "00_weight_down.png",
+                f"비중 축소 Top ({as_of})",
+                page=page,
+                int_cols={"순위"},
+                chg_font_cols={"전일 대비"},
+                gradient_cols={"비중(%)": soft},
+            )
 
             if not by_etf:
                 md_parts.append("액티브 ETF PDF 데이터가 없습니다.\n")
-                html_parts.append("<p>액티브 ETF PDF 데이터가 없습니다.</p>")
             else:
                 for i, item in enumerate(by_etf, start=1):
                     key = f"{i:02d}_etf_{item['etf_ticker']}"
@@ -939,23 +1548,66 @@ def render_active_etf_pdf(
                     )
                     text = narrative_etf_pdf(item, as_of)
                     md_parts.append(f"### {etitle}\n\n{text}\n\n![{etitle}]({png.name})\n")
-                    html_parts.append(
-                        f"<h3>{html.escape(etitle)}</h3><p>{html.escape(text)}</p>"
-                        f"<p><img src='{png.name}'/></p>"
-                    )
                     articles.append(
                         {"key": key, "title": etitle, "png": png, "text": text, "df": item["df"]}
                     )
                     sheets[f"{item['etf_ticker']}_{item['etf_name'][:20]}"] = _etf_sheet_df(item["df"])
+                    pdf_cards.append(
+                        chart_card(
+                            number=f"{i:02d}",
+                            title=etitle,
+                            caption=text[:120] + ("…" if len(text) > 120 else ""),
+                            src=png.name,
+                            tag="PDF",
+                            wide=True,
+                            number_style=(
+                                "background:rgba(167,139,250,.12);border-color:rgba(167,139,250,.18)"
+                                if i % 2 == 0
+                                else ""
+                            ),
+                        )
+                    )
 
             ctx.close()
         finally:
             browser.close()
 
-    md_path, html_path = _write_body(out_dir, md_parts, html_parts)
-    xlsx = export_tables_xlsx(out_dir / f"active_etf_pdf_{ymd}.xlsx", sheets)
+    md_path = _write_md_only(out_dir, md_parts, "etf")
+
+    up_top = _top_name(rankings["weight_up"])
+    down_top = _top_name(rankings["weight_down"])
+    up_ranks = _weight_rank_lines_html(rankings["weight_up"], 3)
+    down_ranks = _weight_rank_lines_html(rankings["weight_down"], 3)
+
+    html_path = write_design_html(
+        "etf_design.html",
+        out_dir / "etf.html",
+        {
+            "DATE": date_iso(as_of),
+            "DATE_KR": date_kr(as_of),
+            "AS_OF_SHORT": _as_of_short(as_of),
+            "ETF_COUNT": str(len(by_etf)),
+            "WEIGHT_UP_TOP": up_top,
+            "WEIGHT_DOWN_TOP": down_top,
+            "WEIGHT_UP_RANKS_HTML": up_ranks,
+            "WEIGHT_DOWN_RANKS_HTML": down_ranks,
+            "DATE_CUR": str(etf.get("date_cur") or "-"),
+            "DATE_PREV": str(etf.get("date_prev") or "-"),
+            "DATE_W1": str(etf.get("date_w1") or "-"),
+            "DATE_W2": str(etf.get("date_w2") or "-"),
+            "ETF_PDF_CARDS_HTML": "\n".join(pdf_cards)
+            if pdf_cards
+            else '<p class="section-desc">ETF PDF 데이터가 없습니다.</p>',
+        },
+    )
+    try:
+        capture = capture_html_report(html_path, "etf")
+    except Exception as e:
+        log.warning("etf 풀페이지 캡처 실패: %s", e)
+        capture = {"full": None, "sections": [], "jpeg": None}
+    xlsx = export_tables_xlsx(out_dir / f"etfs_{ymd}.xlsx", sheets)
     csvs = export_tables_csv(out_dir, sheets)
-    log.info("액티브 ETF PDF 출력: %s (xlsx=%s csv=%d)", out_dir, xlsx.name, len(csvs))
+    log.info("etfs 출력: %s (md=%s xlsx=%s csv=%d)", out_dir, md_path.name, xlsx.name, len(csvs))
     return {
         "out_dir": out_dir,
         "md": md_path,
@@ -963,8 +1615,225 @@ def render_active_etf_pdf(
         "xlsx": xlsx,
         "csv": csvs,
         "articles": articles,
-        "kind": "active_etf_pdf",
+        "capture": capture,
+        "kind": "etfs",
     }
+
+
+def render_picking(
+    as_of: str,
+    market: dict,
+    out_dir: Optional[Path] = None,
+) -> dict:
+    """Picking Top50 + 스크리닝 차트: outputs/YYYYMMDD/pick/"""
+    from content_picking import PICK_COLS, build_picking_rank
+    from datetime import datetime as _dt
+    from design_html import chart_card, date_iso, date_kr, write_design_html
+    from playwright.sync_api import sync_playwright
+    from screening import build_screening_charts
+
+    ymd = _ymd(as_of)
+    as_of_d = _dt.strptime(ymd, "%Y%m%d").date()
+    out_dir = Path(out_dir) if out_dir else day_root(as_of) / "pick"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df = build_picking_rank(as_of=None, market=market)
+    soft = (GRAD_LIGHT, GRAD_DARK)
+    md_parts = [f"# Picking Top50 ({as_of})\n"]
+    articles: list[dict] = []
+    sheets: dict[str, pd.DataFrame] = {}
+
+    if df is None or df.empty:
+        text = f"{as_of} 기준 Picking 후보가 없습니다. (네 지표 Top50 교집합이 비어 있음)"
+        md_parts.append(text + "\n")
+        png_name = "01_picking.png"
+        with sync_playwright() as p:
+            browser = _launch_chromium(p)
+            try:
+                ctx = browser.new_context(
+                    device_scale_factor=2, viewport={"width": 1200, "height": 2400}
+                )
+                page = ctx.new_page()
+                dataframe_to_png(
+                    pd.DataFrame(columns=PICK_COLS),
+                    out_dir / png_name,
+                    f"Picking Top50 ({as_of})",
+                    page=page,
+                )
+                ctx.close()
+            finally:
+                browser.close()
+        pick_card = chart_card(
+            number="01",
+            title="Picking Top50",
+            caption="데이터 없음",
+            src=png_name,
+            tag="Pick",
+            wide=True,
+            narrative=text,
+        )
+        top_name, top_score, count = "-", "-", "0"
+    else:
+        text = narrative_picking(df, as_of)
+        md_parts.append(text + "\n")
+        png_name = "01_picking.png"
+        float_digits = {
+            "picking점수": 1,
+            "에너지배율": 2,
+            "RS": 2,
+            "주가위치": 2,
+            "talent": 3,
+        }
+        with sync_playwright() as p:
+            browser = _launch_chromium(p)
+            try:
+                ctx = browser.new_context(
+                    device_scale_factor=2, viewport={"width": 1200, "height": 2400}
+                )
+                page = ctx.new_page()
+                dataframe_to_png(
+                    df,
+                    out_dir / png_name,
+                    f"Picking Top50 ({as_of})",
+                    page=page,
+                    int_cols={"순위", "현재가"},
+                    gradient_cols={"picking점수": soft},
+                    energy_font_cols={"에너지배율"},
+                    float_digits=float_digits,
+                )
+                ctx.close()
+            finally:
+                browser.close()
+        md_parts.append(f"![Picking Top50]({png_name})\n")
+        articles.append({"title": f"Picking Top50 ({as_of})", "text": text, "png": out_dir / png_name})
+        sheets["Picking"] = df.copy()
+        pick_card = chart_card(
+            number="01",
+            title="Picking Top50",
+            caption="에너지·RS·주가위치·Talent 점수 합산",
+            src=png_name,
+            tag="Pick",
+            wide=True,
+            narrative=text,
+            number_style="background:rgba(167,139,250,.12);border-color:rgba(167,139,250,.18)",
+        )
+        top_name = str(df.iloc[0].get("종목명") or "-")
+        top_score = _fmt_num(df.iloc[0].get("picking점수"), digits=1)
+        count = str(len(df))
+
+    # --- 스크리닝 차트 (패턴 ≥3) ---
+    md_parts.append("\n## 스크리닝 통과 차트\n")
+    try:
+        screen = build_screening_charts(as_of_d, out_dir, pick_df=df, min_patterns=3)
+    except Exception as e:
+        log.exception("pick 스크리닝 차트 실패: %s", e)
+        screen = {
+            "candidates": pd.DataFrame(),
+            "chart_paths": [],
+            "articles": [],
+            "pass_count": 0,
+            "error": str(e),
+        }
+
+    pass_n = int(screen.get("pass_count") or 0)
+    log.info("스크리닝 통과 종목 수: %d", pass_n)
+    screen_cards: list[str] = []
+    if pass_n <= 0:
+        empty_msg = "해당 종목 없음"
+        md_parts.append(f"{empty_msg}\n")
+        screen_cards.append(f'<p class="section-desc">{html.escape(empty_msg)}</p>')
+    else:
+        cands = screen.get("candidates")
+        if cands is not None and not cands.empty:
+            sheets["Screening"] = cands.copy()
+        for i, art in enumerate(screen.get("articles") or [], start=1):
+            png = Path(art["png"])
+            title = art.get("title") or png.stem
+            caption = art.get("text") or ""
+            md_parts.append(f"### {title}\n\n{caption}\n\n![{title}]({png.name})\n")
+            articles.append(art)
+            screen_cards.append(
+                chart_card(
+                    number=f"{i:02d}",
+                    title=title,
+                    caption=caption[:140] + ("…" if len(caption) > 140 else ""),
+                    src=png.name,
+                    tag="Screen",
+                    wide=True,
+                    number_style="background:rgba(80,227,194,.12);border-color:rgba(80,227,194,.18)",
+                )
+            )
+
+    md_path = _write_md_only(out_dir, md_parts, "pick")
+    html_path = write_design_html(
+        "picking_design.html",
+        out_dir / "pick.html",
+        {
+            "DATE": date_iso(as_of),
+            "DATE_KR": date_kr(as_of),
+            "AS_OF_SHORT": _as_of_short(as_of),
+            "PICK_COUNT": count,
+            "PICK_TOP": top_name,
+            "PICK_TOP_SCORE": top_score,
+            "PICK_CARD_HTML": pick_card,
+            "SCREEN_COUNT": str(pass_n),
+            "SCREEN_CHARTS_HTML": "\n".join(screen_cards),
+        },
+    )
+    try:
+        capture = capture_html_report(html_path, "pick")
+    except Exception as e:
+        log.warning("pick 풀페이지 캡처 실패: %s", e)
+        capture = {"full": None, "sections": [], "jpeg": None}
+
+    xlsx = export_tables_xlsx(out_dir / f"pick_{ymd}.xlsx", sheets or {"Picking": pd.DataFrame()})
+    csvs = export_tables_csv(out_dir, sheets or {"Picking": pd.DataFrame()})
+    log.info(
+        "pick 출력: %s (md=%s xlsx=%s csv=%d screen=%d)",
+        out_dir,
+        md_path.name,
+        xlsx.name,
+        len(csvs),
+        pass_n,
+    )
+    return {
+        "out_dir": out_dir,
+        "md": md_path,
+        "html": html_path,
+        "xlsx": xlsx,
+        "csv": csvs,
+        "articles": articles,
+        "capture": capture,
+        "kind": "pick",
+        "df": df,
+        "screen": screen,
+    }
+
+
+def narrative_picking(df: pd.DataFrame, as_of: str) -> str:
+    if df is None or df.empty:
+        return f"{as_of} 기준 Picking 데이터가 없습니다."
+    top = df.iloc[0]
+    name = top.get("종목명", top.get("티커", ""))
+    score = _fmt_num(top.get("picking점수"), digits=1)
+    high = top.get("신고가여부") or "-"
+    parts = []
+    for col, label, dig in (
+        ("에너지배율", "3일에너지", 2),
+        ("RS", "RS120", 2),
+        ("주가위치", "주가위치", 2),
+        ("talent", "talent", 3),
+    ):
+        v = top.get(col)
+        if v is not None and pd.notna(v):
+            parts.append(f"{label} {_fmt_num(v, digits=dig)}")
+    detail = ", ".join(parts) if parts else "지표 원값 없음"
+    nh = f", 신고가 {high}" if high and high != "-" else ""
+    return (
+        f"{as_of} Picking 1위는 {name}({score}점). "
+        f"원값: {detail}{nh}. "
+        f"picking점수는 네 지표 Top50 순위 환산(1위 250~50위 200) 합산입니다."
+    )
 
 
 def render_bundle(
@@ -973,16 +1842,24 @@ def render_bundle(
     etf: dict,
     out_dir: Optional[Path] = None,
 ) -> dict:
-    """데일리+ETF를 각각 독립 폴더로 생성 (단독 실행 함수의 조합)."""
-    root = Path(out_dir) if out_dir else OUTPUTS_DIR
-    ymd = _ymd(as_of)
-    daily = render_daily_snapshot(as_of, market, root / f"daily_snapshot_{ymd}")
-    etf_bundle = render_active_etf_pdf(as_of, etf, root / f"active_etf_pdf_{ymd}")
+    """outputs/YYYYMMDD/{tickers,etfs,martket,pick}/"""
+    from content_volatility import render_market_volatility
+    from datetime import datetime as _dt
+
+    root = Path(out_dir) if out_dir else day_root(as_of)
+    tickers = render_daily_snapshot(as_of, market, root / "tickers")
+    as_of_d = _dt.strptime(_ymd(as_of), "%Y%m%d").date()
+    vol = render_market_volatility(as_of_d, root / "martket")
+    pick = render_picking(as_of, market, root / "pick")
+    etfs = render_active_etf_pdf(as_of, etf, root / "etfs")
     return {
         "out_dir": root,
-        "daily": daily,
-        "etf": etf_bundle,
-        "articles": (daily.get("articles") or []) + (etf_bundle.get("articles") or []),
-        "md": daily.get("md"),
-        "html": daily.get("html"),
+        "tickers": tickers,
+        "martket": vol,
+        "pick": pick,
+        "etfs": etfs,
+        "articles": (tickers.get("articles") or [])
+        + (vol.get("articles") or [])
+        + (pick.get("articles") or [])
+        + (etfs.get("articles") or []),
     }

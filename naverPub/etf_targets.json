@@ -7,6 +7,8 @@
   {"sector": "마켓", "ticker": "364690", "name": "KODEX 혁신기술테마액티브"},
   {"sector": "마켓", "ticker": "0172Y0", "name": "ACE K수출핵심TOP10산업액티브"},
   {"sector": "마켓", "ticker": "0074K0", "name": "KoAct K수출핵심기업TOP30액티브"},
+  {"sector": "마켓", "ticker": "487130", "name": "KoAct AI인프라액티브"},
+  {"sector": "마켓", "ticker": "0205S0", "name": "TIGER 코스닥AI액티브"},
   {"sector": "반도체", "ticker": "494220", "name": "UNICORN SK하이닉스밸류체인액티브"},
   {"sector": "반도체", "ticker": "474590", "name": "WON 반도체밸류체인액티브"},
   {"sector": "반도체", "ticker": "388420", "name": "RISE 비메모리반도체액티브"},
@@ -21,5 +23,7 @@
   {"sector": "바이오", "ticker": "0168K0", "name": "TIGER 기술이전바이오액티브"},
   {"sector": "바이오", "ticker": "463050", "name": "TIME K바이오액티브"},
   {"sector": "코스닥", "ticker": "0162Y0", "name": "TIME 코스닥액티브"},
-  {"sector": "코스닥", "ticker": "0163Y0", "name": "KoAct 코스닥액티브"}
+  {"sector": "코스닥", "ticker": "0163Y0", "name": "KoAct 코스닥액티브"},
+  {"sector": "코스닥", "ticker": "0204S0", "name": "TIGER 코스닥액티브"},
+  {"sector": "코스닥", "ticker": "0166N0", "name": "PLUS 코스닥150액티브"}
 ]

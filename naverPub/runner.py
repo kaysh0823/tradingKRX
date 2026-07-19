@@ -23,9 +23,10 @@ if str(ROOT) not in sys.path:
 from collect_daily import collect_daily
 from content_etf import build_all_etf
 from content_market import build_all_market, diagnose_source_data
+from content_volatility import render_market_volatility
 from db import ensure_schema
-from notify import notify_bundle
-from render import render_active_etf_pdf, render_daily_snapshot
+from notify import notify_bundle, notify_day_outputs
+from render import day_root, render_active_etf_pdf, render_daily_snapshot, render_picking
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,13 +132,29 @@ def main(argv: list[str] | None = None) -> int:
 
     articles = []
     out_paths = []
+    root = day_root(as_of_dash)
+    pick_result: dict = {}
     try:
         if do_daily:
-            daily = render_daily_snapshot(as_of_dash, market)
-            articles.extend(daily.get("articles") or [])
-            out_paths.append(str(daily["out_dir"]))
+            tickers = render_daily_snapshot(as_of_dash, market, root / "tickers")
+            articles.extend(tickers.get("articles") or [])
+            out_paths.append(str(tickers["out_dir"]))
+            try:
+                vol = render_market_volatility(as_of_date, root / "martket")
+                articles.extend(vol.get("articles") or [])
+                out_paths.append(str(vol.get("out_dir") or (root / "martket")))
+            except Exception as e:
+                log.exception("마켓 변동성 실패")
+                errors.append(f"martket: {e}")
+            try:
+                pick_result = render_picking(as_of_dash, market, root / "pick")
+                articles.extend(pick_result.get("articles") or [])
+                out_paths.append(str(pick_result["out_dir"]))
+            except Exception as e:
+                log.exception("Picking 실패")
+                errors.append(f"pick: {e}")
         if do_etf:
-            etf_b = render_active_etf_pdf(as_of_dash, etf)
+            etf_b = render_active_etf_pdf(as_of_dash, etf, root / "etfs")
             articles.extend(etf_b.get("articles") or [])
             out_paths.append(str(etf_b["out_dir"]))
     except Exception as e:
@@ -147,17 +164,39 @@ def main(argv: list[str] | None = None) -> int:
             notify_bundle([], f"naverPub 렌더 실패 ({biz_day}): {e}", errors)
         return 1
 
+    screen_pass = None
+    try:
+        scr = (pick_result or {}).get("screen") or {}
+        if "pass_count" in scr:
+            screen_pass = int(scr.get("pass_count") or 0)
+    except Exception:
+        screen_pass = None
+
+    from notify import count_sec_pngs
+
+    sec_counts = count_sec_pngs(root)
     summary = (
         f"naverPub {as_of_dash} 완료\n"
-        f"출력: {', '.join(out_paths)}\n"
-        f"섹션: {len(articles)}"
+        f"출력 루트: {root}\n"
+        f"폴더: {', '.join(out_paths)}\n"
+        f"스크리닝 통과: {screen_pass if screen_pass is not None else '-'}\n"
+        f"_sec: tickers={sec_counts.get('tickers', 0)} "
+        f"martket={sec_counts.get('martket', 0)} "
+        f"pick={sec_counts.get('pick', 0)} "
+        f"etfs={sec_counts.get('etfs', 0)}"
     )
     log.info(summary)
     if errors:
         log.warning("부분 실패: %s", errors)
 
     if not args.skip_notify:
-        notify_bundle(articles, summary, errors or None)
+        notify_day_outputs(
+            root,
+            as_of_dash,
+            summary=summary,
+            screen_pass=screen_pass,
+            errors=errors or None,
+        )
 
     return 1 if (errors and not articles) else 0
 

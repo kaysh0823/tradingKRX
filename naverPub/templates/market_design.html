@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="{{DATE}} 데일리 마켓 스냅샷" />
+  <title>데일리 마켓 스냅샷 | {{DATE}}</title>
+  <style>
+{{BASE_CSS}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">MS</div>
+        <span>Market Snapshot Daily</span>
+      </div>
+      <nav class="nav" aria-label="페이지 목차">
+        <a href="#overview">Overview</a>
+        <a href="#energy">에너지</a>
+        <a href="#rs">RS</a>
+        <a href="#pos">주가위치</a>
+        <a href="#talent">Talent</a>
+        <a href="#high">신고가</a>
+        <a href="#low">신저가</a>
+        <a href="#methodology">Methodology</a>
+      </nav>
+    </header>
+    <section class="hero" id="overview">
+      <div class="hero-grid">
+        <div>
+          <div class="eyebrow">Daily Market Intelligence</div>
+          <h1>데일리 마켓<br />스냅샷</h1>
+          <div class="hero-date">{{DATE_KR}} · KOSPI / KOSDAQ</div>
+          <p class="hero-summary">
+            지표별로 코스피·코스닥을 나란히 비교합니다.
+            에너지배율, RS, 주가위치, Talent, 신고가·신저가를 시장 내 기준으로 점검합니다.
+          </p>
+        </div>
+        <aside class="hero-note">
+          <strong>읽는 순서</strong>
+          <p>
+            ① 에너지배율 → ② RS → ③ 주가위치 → ④ Talent → ⑤ 신고가 → ⑥ 신저가.
+            각 지표 안에서 코스피 다음 코스닥 순입니다.
+          </p>
+        </aside>
+      </div>
+    </section>
+    <section class="metrics" aria-label="핵심 지표">
+      <article class="metric a">
+        <div class="metric-label">기준일</div>
+        <div class="metric-value">{{AS_OF_SHORT}}</div>
+        <div class="metric-meta">스냅샷 기준</div>
+      </article>
+      <article class="metric b">
+        <div class="metric-label">분석 종목 수</div>
+        <div class="metric-value">{{TOTAL_STOCKS}}</div>
+        <div class="metric-meta">당일 OHLCV 적재</div>
+      </article>
+      <article class="metric c">
+        <div class="metric-label">코스피 에너지 1위</div>
+        <div class="metric-value">{{ENERGY_TOP_KOSPI}}</div>
+        <div class="metric-meta">3일 배율 {{ENERGY_TOP_VAL_KOSPI}}</div>
+      </article>
+      <article class="metric d">
+        <div class="metric-label">코스닥 에너지 1위</div>
+        <div class="metric-value">{{ENERGY_TOP_KOSDAQ}}</div>
+        <div class="metric-meta">3일 배율 {{ENERGY_TOP_VAL_KOSDAQ}}</div>
+      </article>
+    </section>
+{{MARKET_SECTIONS_HTML}}
+    <section class="method" id="methodology">
+      <div class="section-kicker">Methodology</div>
+      <h2 style="font-size:30px">분석 기준</h2>
+      <div class="method-grid">
+        <div class="method-item">
+          <b>에너지배율</b>
+          <span>시장별 당일 거래대금 상위 50종. (거래대금 시장비중)÷(시총 시장비중). 3일·당일 배율.</span>
+        </div>
+        <div class="method-item">
+          <b>RS</b>
+          <span>시총 5,000억 이상. 시장 내 rs_20·50·120·200 백분위 평균으로 순위.</span>
+        </div>
+        <div class="method-item">
+          <b>주가위치</b>
+          <span>시총 5,000억 이상. (현재가−120일최저)/(120일최고−최저). 고가·저가 기준, 0~1.</span>
+        </div>
+        <div class="method-item">
+          <b>Talent</b>
+          <span>시총 5,000억 이상. +10% 이상 상승일 비중을 20·50·120일에 0.5·0.3·0.2 가중.</span>
+        </div>
+        <div class="method-item">
+          <b>신고가</b>
+          <span>시장별 최장 구간 신고가. 구간대비(%)는 구간 최저가 대비 상승률.</span>
+        </div>
+        <div class="method-item">
+          <b>신저가</b>
+          <span>시장별 최장 구간 신저가. 구간대비(%)는 구간 최고가 대비 하락률.</span>
+        </div>
+      </div>
+    </section>
+    <footer>
+      <span>Market Snapshot Daily · {{DATE}}</span>
+      <span>본 자료는 정보 제공 목적이며 투자 판단의 최종 책임은 투자자에게 있습니다.</span>
+    </footer>
+  </main>
+  <script>
+    function showFallback(img) {
+      img.style.display = 'none';
+      const fallback = img.nextElementSibling;
+      if (fallback) fallback.style.display = 'grid';
+    }
+  </script>
+</body>
+</html>

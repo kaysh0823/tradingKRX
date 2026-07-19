@@ -30,6 +30,9 @@ SCHEMA_SQL = [
     CREATE TABLE IF NOT EXISTS index_ohlcv (
         ticker VARCHAR(12) NOT NULL COMMENT '1001=KOSPI, 2001=KOSDAQ',
         date DATE NOT NULL,
+        open DOUBLE NULL,
+        high DOUBLE NULL,
+        low DOUBLE NULL,
         close DOUBLE NULL,
         PRIMARY KEY (ticker, date),
         INDEX idx_index_date (date)
@@ -113,6 +116,15 @@ def ensure_schema(con=None) -> None:
                     "ALTER TABLE etf_pdf "
                     "ADD COLUMN sector VARCHAR(40) NULL COMMENT 'ETF 섹터 그룹' "
                     "AFTER etf_name"
+                )
+            # index_ohlcv OHLC 확장 (기존 close-only 테이블 호환)
+            cur.execute("SHOW COLUMNS FROM index_ohlcv LIKE 'open'")
+            if cur.fetchone() is None:
+                cur.execute(
+                    "ALTER TABLE index_ohlcv "
+                    "ADD COLUMN open DOUBLE NULL AFTER date, "
+                    "ADD COLUMN high DOUBLE NULL AFTER open, "
+                    "ADD COLUMN low DOUBLE NULL AFTER high"
                 )
         con.commit()
     finally:

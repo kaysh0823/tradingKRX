@@ -1,9 +1,7 @@
 """
-시장 스냅샷:
-1) 에너지배율 순위 (거래대금 상위50 → 3일 에너지배율 내림차순)
-2) 신고가/신저가 (최장 달성 구간만) + 구간대비(%)
-3) Talent 순위 Top50 (시총 5,000억↑)
-4) RS 상위50
+시장 스냅샷 (지표별 · 코스피→코스닥):
+1) 에너지배율  2) RS Top50  3) 주가위치 Top50
+4) Talent Top50  5) 신고가  6) 신저가
 """
 from __future__ import annotations
 
@@ -29,7 +27,11 @@ ENERGY_COLORS = {
 TALENT_UP = 0.10
 TALENT_MCAP_MIN = 500_000_000_000  # 시총 5,000억원 이상
 MCAP_COL = "시총(조원)"
-TALENT_UD_COLS = ("20일 내 상승/하락", "50일 내 상승/하락", "120일 내 상승/하락")
+TALENT_UD_COLS = ("20일 ↑/↓", "50일 ↑/↓", "120일 ↑/↓")
+MARKETS = ("KOSPI", "KOSDAQ")
+MARKET_LABELS = {"KOSPI": "코스피", "KOSDAQ": "코스닥"}
+PRICE_POS_WINDOW = 120
+PRICE_POS_COL = "주가위치"
 
 
 def energy_ratio_font_color(er: float) -> str:
@@ -167,11 +169,15 @@ def _apply_day_chg(day0: pd.DataFrame, prev: pd.DataFrame) -> pd.Series:
     return pd.Series(out, index=day0.index)
 
 
-def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.DataFrame:
+def build_energy_rank(
+    as_of: Optional[date] = None,
+    top_tv: int = 50,
+    market: Optional[str] = None,
+) -> pd.DataFrame:
     """
-    당일 거래대금 상위 top_tv → 3일 에너지배율 내림차순.
+    해당 시장 당일 거래대금 상위 top_tv → 3일 에너지배율 내림차순.
     에너지배율 = (거래대금 시장내 비중) / (시총 시장내 비중)
-    3일 = 3거래일 거래대금 합 기준.
+    market 미지정 시 KOSPI+KOSDAQ 합산(하위 호환, 비권장).
     """
     eng = engine()
     as_of = as_of or _latest_date(eng)
@@ -182,7 +188,6 @@ def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.Data
         return pd.DataFrame()
     d0 = days[-1]
     load_start = days[0]
-    # 전일종가용으로 하루 더
     prev_days = _trading_dates(eng, as_of, 4)
     prev_d = prev_days[-2] if len(prev_days) >= 2 else None
 
@@ -200,6 +205,10 @@ def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.Data
     if "market" not in df.columns:
         df["market"] = "ALL"
     df["market"] = df["market"].fillna("ALL").replace("", "ALL")
+    if market:
+        df = df[df["market"] == market]
+        if df.empty:
+            return pd.DataFrame()
 
     day0 = df[df["date"] == d0].copy()
     if day0.empty:
@@ -211,7 +220,6 @@ def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.Data
     else:
         day0["당일상승률"] = day0["chg_pct"]
 
-    # 시장별 당일 합
     mkt_tv = day0.groupby("market")["trading_value"].transform("sum")
     mkt_mcap = day0.groupby("market")["mcap"].transform("sum")
     day0["tv_pct"] = np.where(mkt_tv > 0, day0["trading_value"] / mkt_tv * 100.0, np.nan)
@@ -229,7 +237,6 @@ def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.Data
         day0.groupby("market")["trading_value"].rank(ascending=False, method="min").astype(int)
     )
 
-    # 3일 거래대금
     tv3 = (
         df[df["date"].isin(days)]
         .groupby(["ticker", "market"], as_index=False)["trading_value"]
@@ -250,6 +257,7 @@ def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.Data
         np.nan,
     )
 
+    # 시장 내 거래대금 상위 → 3일 에너지배율 순
     top = day0.nlargest(top_tv, "trading_value").copy()
     top = top.sort_values("energy_3d", ascending=False, na_position="last").reset_index(drop=True)
     top.insert(0, "순위", range(1, len(top) + 1))
@@ -280,19 +288,23 @@ def build_energy_rank(as_of: Optional[date] = None, top_tv: int = 50) -> pd.Data
     return out[cols]
 
 
-def build_high_low(as_of: Optional[date] = None) -> pd.DataFrame:
+def build_high_low(as_of: Optional[date] = None, market: Optional[str] = None) -> pd.DataFrame:
     """하위 호환: 신고가+신저가 합본 (정렬: 신고가 우선)."""
-    hi = build_new_highs(as_of)
-    lo = build_new_lows(as_of)
+    hi = build_new_highs(as_of, market=market)
+    lo = build_new_lows(as_of, market=market)
     if hi.empty and lo.empty:
         return pd.DataFrame()
     return pd.concat([hi, lo], ignore_index=True)
 
 
-def _build_high_or_low(as_of: Optional[date], want_high: bool) -> pd.DataFrame:
+def _build_high_or_low(
+    as_of: Optional[date],
+    want_high: bool,
+    market: Optional[str] = None,
+) -> pd.DataFrame:
     """
     want_high=True → 신고가, False → 신저가.
-    최장 달성 구간만 표시 + 구간대비(%).
+    최장 달성 구간만 표시 + 구간대비(%). market 지정 시 해당 시장만.
     """
     eng = engine()
     as_of = as_of or _latest_date(eng)
@@ -306,7 +318,7 @@ def _build_high_or_low(as_of: Optional[date], want_high: bool) -> pd.DataFrame:
         eng,
         load_start,
         as_of,
-        "ticker, date, name, high, low, close, chg_pct, trading_value, mcap",
+        "ticker, date, name, market, high, low, close, chg_pct, trading_value, mcap",
         prefer_listed=True,
     )
     if df.empty:
@@ -314,6 +326,10 @@ def _build_high_or_low(as_of: Optional[date], want_high: bool) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"]).dt.date
     for c in ("high", "low", "close", "chg_pct", "trading_value", "mcap"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    if market and "market" in df.columns:
+        df = df[df["market"] == market]
+        if df.empty:
+            return pd.DataFrame()
 
     prev_d = days[-2] if len(days) >= 2 else None
     prev_map = {}
@@ -398,12 +414,12 @@ def _build_high_or_low(as_of: Optional[date], want_high: bool) -> pd.DataFrame:
     return out
 
 
-def build_new_highs(as_of: Optional[date] = None) -> pd.DataFrame:
-    return _build_high_or_low(as_of, want_high=True)
+def build_new_highs(as_of: Optional[date] = None, market: Optional[str] = None) -> pd.DataFrame:
+    return _build_high_or_low(as_of, want_high=True, market=market)
 
 
-def build_new_lows(as_of: Optional[date] = None) -> pd.DataFrame:
-    return _build_high_or_low(as_of, want_high=False)
+def build_new_lows(as_of: Optional[date] = None, market: Optional[str] = None) -> pd.DataFrame:
+    return _build_high_or_low(as_of, want_high=False, market=market)
 
 
 def _daily_ret_flags(close: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -417,23 +433,46 @@ def _daily_ret_flags(close: pd.Series) -> tuple[pd.Series, pd.Series]:
     return up, down
 
 
-def build_rs_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataFrame:
-    """RS(rs_20~200 산술평균) 상위 top_n. talent 컬럼 없음."""
+def build_rs_rank(
+    as_of: Optional[date] = None,
+    top_n: int = 50,
+    market: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    RS(rs_20~200 산술평균) 상위 top_n. 시총 >= 5,000억원.
+    market 지정 시 해당 시장만 (백분위는 수집 단계에서 시장내 산출).
+    """
     eng = engine()
     as_of = as_of or _latest_date(eng)
     if as_of is None:
         return pd.DataFrame()
-    rs = pd.read_sql(
-        """
-        SELECT r.ticker, r.rs_20, r.rs_50, r.rs_120, r.rs_200,
-               o.name, o.close, o.mcap
-        FROM rs r
-        LEFT JOIN ohlcv o ON o.ticker=r.ticker AND o.date=r.date
-        WHERE r.date = %s
-        """,
-        eng,
-        params=(as_of,),
-    )
+    if market:
+        rs = pd.read_sql(
+            """
+            SELECT r.ticker, r.rs_20, r.rs_50, r.rs_120, r.rs_200,
+                   o.name, o.close, o.mcap, o.market
+            FROM rs r
+            LEFT JOIN ohlcv o ON o.ticker=r.ticker AND o.date=r.date
+            WHERE r.date = %s
+              AND o.mcap >= %s
+              AND o.market = %s
+            """,
+            eng,
+            params=(as_of, TALENT_MCAP_MIN, market),
+        )
+    else:
+        rs = pd.read_sql(
+            """
+            SELECT r.ticker, r.rs_20, r.rs_50, r.rs_120, r.rs_200,
+                   o.name, o.close, o.mcap
+            FROM rs r
+            LEFT JOIN ohlcv o ON o.ticker=r.ticker AND o.date=r.date
+            WHERE r.date = %s
+              AND o.mcap >= %s
+            """,
+            eng,
+            params=(as_of, TALENT_MCAP_MIN),
+        )
     if rs.empty:
         return pd.DataFrame()
     for c in ("rs_20", "rs_50", "rs_120", "rs_200", "close", "mcap"):
@@ -453,40 +492,52 @@ def build_rs_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataFrame
     return out[cols]
 
 
-def build_talent_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataFrame:
+def build_talent_rank(
+    as_of: Optional[date] = None,
+    top_n: int = 50,
+    market: Optional[str] = None,
+) -> pd.DataFrame:
     """
-    Talent 순위 Top50.
-    대상: 시총 >= 5,000억원.
-    talent 지수 = (n20/20)*0.5 + (n50/50)*0.3 + (n120/120)*0.2  (상승일수만)
-    표시: N일 내 상승/하락 = "상승일수/하락일수" (+10% / -10%).
+    Talent 순위 Top50 (시장별).
+    대상: 시총 >= 5,000억원 (+ market 필터).
+    talent 지수 = (n20/20)*0.5 + (n50/50)*0.3 + (n120/120)*0.2
     """
     eng = engine()
     as_of = as_of or _latest_date(eng)
     if as_of is None:
         return pd.DataFrame()
 
-    # 시총 필터
-    day0 = pd.read_sql(
-        """
-        SELECT ticker, name, close, chg_pct, mcap
-        FROM ohlcv
-        WHERE date = %s AND mcap >= %s
-          AND market IN ('KOSPI','KOSDAQ')
-        """,
-        eng,
-        params=(as_of, TALENT_MCAP_MIN),
-    )
-    if day0.empty:
-        # market NULL 이관분 폴백
+    if market:
+        day0 = pd.read_sql(
+            """
+            SELECT ticker, name, close, chg_pct, mcap, market
+            FROM ohlcv
+            WHERE date = %s AND mcap >= %s AND market = %s
+            """,
+            eng,
+            params=(as_of, TALENT_MCAP_MIN, market),
+        )
+    else:
         day0 = pd.read_sql(
             """
             SELECT ticker, name, close, chg_pct, mcap
             FROM ohlcv
             WHERE date = %s AND mcap >= %s
+              AND market IN ('KOSPI','KOSDAQ')
             """,
             eng,
             params=(as_of, TALENT_MCAP_MIN),
         )
+        if day0.empty:
+            day0 = pd.read_sql(
+                """
+                SELECT ticker, name, close, chg_pct, mcap
+                FROM ohlcv
+                WHERE date = %s AND mcap >= %s
+                """,
+                eng,
+                params=(as_of, TALENT_MCAP_MIN),
+            )
     if day0.empty:
         return pd.DataFrame()
 
@@ -520,7 +571,6 @@ def build_talent_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataF
     hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
     hist["ticker"] = hist["ticker"].astype(str)
 
-    # 전일종가 기반 당일상승률
     prev_d = dates[-2] if len(dates) >= 2 else None
     prev_map = {}
     if prev_d is not None:
@@ -541,7 +591,6 @@ def build_talent_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataF
         d20 = int(down.tail(20).sum()) if len(down) >= 1 else 0
         d50 = int(down.tail(50).sum()) if len(down) >= 1 else 0
         d120 = int(down.tail(120).sum()) if len(down) >= 1 else 0
-        # 기간 부족 시 분모는 고정 20/50/120 (스펙 그대로) — 상승일수만
         idx = (n20 / 20.0) * 0.5 + (n50 / 50.0) * 0.3 + (n120 / 120.0) * 0.2
         rows.append(
             {
@@ -562,7 +611,6 @@ def build_talent_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataF
     if m.empty:
         return pd.DataFrame()
 
-    # 당일상승률
     def _chg_row(r):
         prev = prev_map.get(r["ticker"])
         if prev and prev > 0 and pd.notna(r["close"]):
@@ -589,11 +637,140 @@ def build_talent_rank(as_of: Optional[date] = None, top_n: int = 50) -> pd.DataF
     return out[cols]
 
 
-def build_all_market(as_of: Optional[date] = None) -> dict[str, pd.DataFrame]:
-    return {
-        "energy": build_energy_rank(as_of),
-        "high": build_new_highs(as_of),
-        "low": build_new_lows(as_of),
-        "talent": build_talent_rank(as_of),
-        "rs": build_rs_rank(as_of),
-    }
+def build_price_position_rank(
+    as_of: Optional[date] = None,
+    top_n: int = 50,
+    market: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    주가위치 Top50.
+    주가위치 = (현재가 - 120거래일 최저가) / (120거래일 최고가 - 120거래일 최저가)
+    최고·최저 = 고가·저가(intraday). 시총 >= 5,000억, 이력 120일 미만·분모0 제외.
+    """
+    eng = engine()
+    as_of = as_of or _latest_date(eng)
+    if as_of is None:
+        return pd.DataFrame()
+
+    if market:
+        day0 = pd.read_sql(
+            """
+            SELECT ticker, name, close, chg_pct, mcap, market
+            FROM ohlcv
+            WHERE date = %s AND mcap >= %s AND market = %s
+            """,
+            eng,
+            params=(as_of, TALENT_MCAP_MIN, market),
+        )
+    else:
+        day0 = pd.read_sql(
+            """
+            SELECT ticker, name, close, chg_pct, mcap, market
+            FROM ohlcv
+            WHERE date = %s AND mcap >= %s
+              AND market IN ('KOSPI','KOSDAQ')
+            """,
+            eng,
+            params=(as_of, TALENT_MCAP_MIN),
+        )
+    if day0.empty:
+        return pd.DataFrame()
+
+    for c in ("close", "chg_pct", "mcap"):
+        day0[c] = pd.to_numeric(day0[c], errors="coerce")
+    tickers = [str(t) for t in day0["ticker"].tolist()]
+
+    dates = _trading_dates(eng, as_of, PRICE_POS_WINDOW + 5)
+    if len(dates) < PRICE_POS_WINDOW:
+        return pd.DataFrame()
+    load_start = dates[0]
+    win_dates = set(dates[-PRICE_POS_WINDOW:])
+
+    frames = []
+    for i in range(0, len(tickers), 400):
+        chunk = tickers[i : i + 400]
+        ph = ",".join(["%s"] * len(chunk))
+        frames.append(
+            pd.read_sql(
+                f"""
+                SELECT ticker, date, high, low, close FROM ohlcv
+                WHERE date >= %s AND date <= %s AND ticker IN ({ph})
+                """,
+                eng,
+                params=(load_start, as_of, *chunk),
+            )
+        )
+    hist = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if hist.empty:
+        return pd.DataFrame()
+    hist["date"] = pd.to_datetime(hist["date"]).dt.date
+    for c in ("high", "low", "close"):
+        hist[c] = pd.to_numeric(hist[c], errors="coerce")
+    hist["ticker"] = hist["ticker"].astype(str)
+
+    prev_d = dates[-2] if len(dates) >= 2 else None
+    prev_map = {}
+    if prev_d is not None:
+        prev_map = hist[hist["date"] == prev_d].set_index("ticker")["close"].to_dict()
+
+    rows = []
+    for tk, g in hist.groupby("ticker"):
+        g = g.sort_values("date")
+        if g["date"].iloc[-1] != as_of:
+            continue
+        win = g[g["date"].isin(win_dates)]
+        if len(win) < PRICE_POS_WINDOW:
+            continue
+        hi = float(win["high"].max())
+        lo = float(win["low"].min())
+        cur = float(g["close"].iloc[-1])
+        if not np.isfinite(hi) or not np.isfinite(lo) or not np.isfinite(cur):
+            continue
+        denom = hi - lo
+        if denom <= 0:
+            continue
+        pos = (cur - lo) / denom
+        if not np.isfinite(pos):
+            continue
+        pos = float(np.clip(pos, 0.0, 1.0))
+        rows.append({"ticker": tk, PRICE_POS_COL: round(pos, 2)})
+
+    if not rows:
+        return pd.DataFrame()
+
+    pos_df = pd.DataFrame(rows)
+    day0 = day0.copy()
+    day0["ticker"] = day0["ticker"].astype(str)
+    m = day0.merge(pos_df, on="ticker", how="inner")
+    if m.empty:
+        return pd.DataFrame()
+
+    def _chg_row(r):
+        prev = prev_map.get(r["ticker"])
+        if prev and prev > 0 and pd.notna(r["close"]):
+            return round((float(r["close"]) / float(prev) - 1.0) * 100.0, 2)
+        return r["chg_pct"]
+
+    m["당일상승률"] = m.apply(_chg_row, axis=1)
+    m[MCAP_COL] = (m["mcap"] / 1e12).round(2)
+    m = m.sort_values(PRICE_POS_COL, ascending=False).head(top_n).reset_index(drop=True)
+    m.insert(0, "순위", range(1, len(m) + 1))
+    out = m.rename(columns={"ticker": "티커", "name": "종목명", "close": "현재가"})
+    cols = ["순위", "티커", "종목명", "현재가", "당일상승률", PRICE_POS_COL, MCAP_COL]
+    return out[cols]
+
+
+def build_all_market(as_of: Optional[date] = None) -> dict[str, dict[str, pd.DataFrame]]:
+    """시장별 {energy, rs, pos, talent, high, low}."""
+    out: dict[str, dict[str, pd.DataFrame]] = {}
+    for mkt in MARKETS:
+        log.info("시장 스냅샷 산출 %s", mkt)
+        out[mkt] = {
+            "energy": build_energy_rank(as_of, market=mkt),
+            "rs": build_rs_rank(as_of, market=mkt),
+            "pos": build_price_position_rank(as_of, market=mkt),
+            "talent": build_talent_rank(as_of, market=mkt),
+            "high": build_new_highs(as_of, market=mkt),
+            "low": build_new_lows(as_of, market=mkt),
+        }
+    return out

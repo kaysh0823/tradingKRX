@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="{{DATE}} KOSPI·KOSDAQ 마켓 변동성 데일리 리포트" />
+  <title>마켓 변동성 리포트 | {{DATE}}</title>
+  <style>
+{{BASE_CSS}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">MV</div>
+        <span>Market Volatility Daily</span>
+      </div>
+      <nav class="nav" aria-label="페이지 목차">
+        <a href="#overview">Overview</a>
+        <a href="#kospi">KOSPI</a>
+        <a href="#kosdaq">KOSDAQ</a>
+        <a href="#methodology">Methodology</a>
+      </nav>
+    </header>
+    <section class="hero" id="overview">
+      <div class="hero-grid">
+        <div>
+          <div class="eyebrow">Daily Market Intelligence</div>
+          <h1>마켓 변동성<br />데일리 리포트</h1>
+          <div class="hero-date">{{DATE_KR}} · KOSPI / KOSDAQ</div>
+          <p class="hero-summary">
+            지수 추세, 종목별 ATR 분포, 시장 변동성 추이와 모멘텀 속도를 한 화면에서 점검합니다.
+            최근 250거래일을 기준으로 시장의 방향성과 위험 수준을 구조적으로 비교할 수 있도록 구성했습니다.
+          </p>
+        </div>
+        <aside class="hero-note">
+          <strong>읽는 순서</strong>
+          <p>
+            ① 장기 추세와 이동평균 확인 → ② 종목별 변동성 분포 비교 →
+            ③ 시장 전체 변동성 추이 확인 → ④ ROC 기반 모멘텀 속도 점검
+          </p>
+        </aside>
+      </div>
+    </section>
+    <section class="metrics" aria-label="핵심 지표">
+      <article class="metric kospi">
+        <div class="metric-label">KOSPI 변동성</div>
+        <div class="metric-value">{{KOSPI_VOL}}</div>
+        <div class="metric-meta">유효일 {{KOSPI_VOL_DAYS}}일</div>
+      </article>
+      <article class="metric kosdaq">
+        <div class="metric-label">KOSDAQ 변동성</div>
+        <div class="metric-value">{{KOSDAQ_VOL}}</div>
+        <div class="metric-meta">유효일 {{KOSDAQ_VOL_DAYS}}일</div>
+      </article>
+      <article class="metric universe">
+        <div class="metric-label">분석 종목 수</div>
+        <div class="metric-value">{{TOTAL_STOCKS}}</div>
+        <div class="metric-meta">KOSPI {{KOSPI_STOCKS}} · KOSDAQ {{KOSDAQ_STOCKS}}</div>
+      </article>
+      <article class="metric period">
+        <div class="metric-label">차트 분석 기간</div>
+        <div class="metric-value">250D</div>
+        <div class="metric-meta">MA 워밍업 120일</div>
+      </article>
+    </section>
+    <section class="section" id="kospi">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Market 01</div>
+          <h2>코스피 변동성 대시보드</h2>
+          <p class="section-desc">대형주 중심 시장의 추세·분산·변동성·모멘텀을 네 개의 관점으로 확인합니다.</p>
+        </div>
+        <div class="market-badge" style="color: var(--blue)"><i></i>KOSPI · {{KOSPI_STOCKS}}종</div>
+      </div>
+      <div class="chart-grid">
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number">01</div>
+            <div class="chart-title-wrap">
+              <h3>지수 캔들 &amp; 이동평균</h3>
+              <div class="chart-caption">OHLC + MA20 / MA50 / MA120 · 최근 250거래일</div>
+            </div>
+            <div class="chart-tag">Trend</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kospi_candle.png" alt="코스피 지수 캔들과 이동평균 차트" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kospi_candle.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number">02</div>
+            <div class="chart-title-wrap">
+              <h3>ATR14/종가 vs 시가총액</h3>
+              <div class="chart-caption">평균·중앙값·P80·P20 및 거래대금 상위 종목</div>
+            </div>
+            <div class="chart-tag">Dispersion</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kospi_scatter.png" alt="코스피 ATR14 대비 시가총액 산점도" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kospi_scatter.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number">03</div>
+            <div class="chart-title-wrap">
+              <h3>시장 변동성 추이</h3>
+              <div class="chart-caption">시총가중 ATR14/종가 + Vol SMA20 + 지수</div>
+            </div>
+            <div class="chart-tag">Risk</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kospi_trend.png" alt="코스피 시장 변동성 추이" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kospi_trend.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number">04</div>
+            <div class="chart-title-wrap">
+              <h3>모멘텀 속도</h3>
+              <div class="chart-caption">ROC(N)% ÷ N · 20일 / 50일 모멘텀과 지수 비교</div>
+            </div>
+            <div class="chart-tag">Momentum</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kospi_momentum.png" alt="코스피 모멘텀 속도 차트" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kospi_momentum.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+      </div>
+    </section>
+    <section class="section" id="kosdaq">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker" style="color: var(--cyan)">Market 02</div>
+          <h2>코스닥 변동성 대시보드</h2>
+          <p class="section-desc">성장주 중심 시장의 높은 변동성과 모멘텀 변화를 코스피와 동일한 기준으로 비교합니다.</p>
+        </div>
+        <div class="market-badge" style="color: var(--cyan)"><i></i>KOSDAQ · {{KOSDAQ_STOCKS}}종</div>
+      </div>
+      <div class="chart-grid">
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number" style="background:rgba(80,227,194,.12);border-color:rgba(80,227,194,.18)">01</div>
+            <div class="chart-title-wrap">
+              <h3>지수 캔들 &amp; 이동평균</h3>
+              <div class="chart-caption">OHLC + MA20 / MA50 / MA120 · 최근 250거래일</div>
+            </div>
+            <div class="chart-tag">Trend</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kosdaq_candle.png" alt="코스닥 지수 캔들과 이동평균 차트" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kosdaq_candle.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number" style="background:rgba(80,227,194,.12);border-color:rgba(80,227,194,.18)">02</div>
+            <div class="chart-title-wrap">
+              <h3>ATR14/종가 vs 시가총액</h3>
+              <div class="chart-caption">평균·중앙값·P80·P20 및 거래대금 상위 종목</div>
+            </div>
+            <div class="chart-tag">Dispersion</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kosdaq_scatter.png" alt="코스닥 ATR14 대비 시가총액 산점도" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kosdaq_scatter.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number" style="background:rgba(80,227,194,.12);border-color:rgba(80,227,194,.18)">03</div>
+            <div class="chart-title-wrap">
+              <h3>시장 변동성 추이</h3>
+              <div class="chart-caption">시총가중 ATR14/종가 + Vol SMA20 + 지수</div>
+            </div>
+            <div class="chart-tag">Risk</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kosdaq_trend.png" alt="코스닥 시장 변동성 추이" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kosdaq_trend.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-head">
+            <div class="chart-number" style="background:rgba(80,227,194,.12);border-color:rgba(80,227,194,.18)">04</div>
+            <div class="chart-title-wrap">
+              <h3>모멘텀 속도</h3>
+              <div class="chart-caption">ROC(N)% ÷ N · 20일 / 50일 모멘텀과 지수 비교</div>
+            </div>
+            <div class="chart-tag">Momentum</div>
+          </div>
+          <div class="chart-body">
+            <img src="05_volatility_kosdaq_momentum.png" alt="코스닥 모멘텀 속도 차트" onerror="showFallback(this)" />
+            <div class="image-fallback"><div><strong>이미지 파일을 찾을 수 없습니다.</strong>HTML과 같은 폴더에 <code>05_volatility_kosdaq_momentum.png</code>를 두세요.</div></div>
+          </div>
+        </article>
+      </div>
+    </section>
+    <section class="method" id="methodology">
+      <div class="section-kicker">Methodology</div>
+      <h2 style="font-size:30px">분석 기준</h2>
+      <div class="method-grid">
+        <div class="method-item">
+          <b>지수 캔들</b>
+          <span>OHLC와 MA20·50·120을 최근 250거래일 기준으로 표시하며, 이동평균 계산을 위해 120일의 워밍업 구간을 사용합니다.</span>
+        </div>
+        <div class="method-item">
+          <b>종목 산점도</b>
+          <span>ATR14/종가가 0.4 이상인 값을 제외하고 평균·중앙값·P80·P20 기준선과 거래대금 상위 20종목 라벨을 표시합니다.</span>
+        </div>
+        <div class="method-item">
+          <b>변동성 추이</b>
+          <span>시가총액 가중 ATR14/종가, 변동성의 20일 단순이동평균, 지수 흐름을 함께 비교합니다.</span>
+        </div>
+        <div class="method-item">
+          <b>모멘텀 속도</b>
+          <span>20일·50일 ROC를 기간으로 나눈 일평균 변화율(%/일)로 계산해 지수와 함께 표시합니다.</span>
+        </div>
+      </div>
+    </section>
+    <footer>
+      <span>Market Volatility Daily · {{DATE}}</span>
+      <span>본 자료는 정보 제공 목적이며 투자 판단의 최종 책임은 투자자에게 있습니다.</span>
+    </footer>
+  </main>
+  <script>
+    function showFallback(img) {
+      img.style.display = 'none';
+      const fallback = img.nextElementSibling;
+      if (fallback) fallback.style.display = 'grid';
+    }
+  </script>
+</body>
+</html>

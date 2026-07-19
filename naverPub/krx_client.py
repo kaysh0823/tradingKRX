@@ -278,20 +278,22 @@ def download_index_csv(
     day_str: str,
     ind_idx: str,
     ind_idx2: str,
+    *,
+    start_str: Optional[str] = None,
 ) -> tuple[pd.DataFrame, bytes]:
     """
     [11003] 개별지수 시세 추이 (MDCSTAT00301).
     KOSPI: indIdx=1, indIdx2=001 / KOSDAQ: indIdx=2, indIdx2=001
-    strtDd=endDd=수집일.
-    Returns (DataFrame, raw_bytes) — 빈 응답 진단용으로 raw 포함.
+    start_str 없으면 strtDd=endDd=day_str (단일).
+    기간 조회 시 strtDd=start_str, endDd=day_str.
+    Returns (DataFrame, raw_bytes).
     """
     params = {
         "indIdx": str(ind_idx),
         "indIdx2": str(ind_idx2),
-        "strtDd": day_str,
+        "strtDd": start_str or day_str,
         "endDd": day_str,
     }
-    # 지수 CSV는 헤더만 오면 수십 바이트일 수 있어 min_bytes=0
     content = get_krx_csv(session, BLD_INDEX, params, min_bytes=0)
     try:
         df = read_csv_bytes(content)

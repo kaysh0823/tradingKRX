@@ -76,6 +76,8 @@ ISU_CODES: dict[str, dict[str, str]] = {
         '364690': 'KODEX 혁신기술테마액티브',
         '0172Y0': 'ACE K수출핵심TOP10산업액티브',
         '0074K0': 'KoAct K수출핵심기업TOP30액티브',
+        '487130': 'KoAct AI인프라액티브',
+        '0205S0': 'TIGER 코스닥AI액티브',
     },
     "반도체": {
         '494220': 'UNICORN SK하이닉스밸류체인액티브',
@@ -105,6 +107,8 @@ ISU_CODES: dict[str, dict[str, str]] = {
     "코스닥": {
         '0162Y0': 'TIME 코스닥액티브',
         '0163Y0': 'KoAct 코스닥액티브',
+        '0204S0': 'TIGER 코스닥액티브',
+        '0166N0': 'PLUS 코스닥150액티브',
     },
 }
 

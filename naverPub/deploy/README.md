@@ -165,8 +165,9 @@ systemctl list-timers | grep naverpub
 
 | 파일 | 설명 |
 |------|------|
-| `daily_snapshot_YYYYMMDD/` | 데일리 스냅샷 (에너지·신고가·신저가·RS) png/xlsx/csv |
-| `active_etf_pdf_YYYYMMDD/` | 액티브 ETF PDF 구성 png/xlsx/csv |
+| `YYYYMMDD/tickers/` | 시장 스냅샷 (에너지·신고저가·Talent·RS) + `market.md/html` |
+| `YYYYMMDD/etfs/` | 액티브 ETF PDF 구성 + `etf.md/html` |
+| `YYYYMMDD/martket/` | 마켓 변동성 그래프 + `volatility.md/html` |
 
 단독 실행: `python runner.py --force --daily-only` / `--etf-only`
 

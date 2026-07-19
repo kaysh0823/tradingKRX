@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="{{DATE}} Picking 통합 랭킹" />
+  <title>Picking | {{DATE}}</title>
+  <style>
+{{BASE_CSS}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">PK</div>
+        <span>Picking Daily</span>
+      </div>
+      <nav class="nav" aria-label="페이지 목차">
+        <a href="#overview">Overview</a>
+        <a href="#pick">Top50</a>
+        <a href="#screening">스크리닝 차트</a>
+        <a href="#methodology">Methodology</a>
+      </nav>
+    </header>
+    <section class="hero" id="overview">
+      <div class="hero-grid">
+        <div>
+          <div class="eyebrow">Daily Market Intelligence</div>
+          <h1>Picking<br />통합 랭킹</h1>
+          <div class="hero-date">{{DATE_KR}} · KOSPI + KOSDAQ</div>
+          <p class="hero-summary">
+            에너지배율·RS·주가위치·Talent 네 지표의 Top50 순위를 점수로 환산해 합산합니다.
+            시장을 가리지 않고 당일 모멘텀·상대강도·가격위치·재능 신호가 겹치는 종목을 가려냅니다.
+          </p>
+        </div>
+        <aside class="hero-note">
+          <strong>읽는 순서</strong>
+          <p>
+            ① picking 점수 Top50 표 → ② 스크리닝 패턴 3개 이상 종목 차트 →
+            ③ 신고가(50·120·250일) 여부 확인
+          </p>
+        </aside>
+      </div>
+    </section>
+    <section class="metrics" aria-label="핵심 지표">
+      <article class="metric a">
+        <div class="metric-label">기준일</div>
+        <div class="metric-value">{{AS_OF_SHORT}}</div>
+        <div class="metric-meta">스냅샷 기준</div>
+      </article>
+      <article class="metric b">
+        <div class="metric-label">선정 종목</div>
+        <div class="metric-value">{{PICK_COUNT}}</div>
+        <div class="metric-meta">합산 점수 &gt; 0 Top50</div>
+      </article>
+      <article class="metric c">
+        <div class="metric-label">1위</div>
+        <div class="metric-value">{{PICK_TOP}}</div>
+        <div class="metric-meta">{{PICK_TOP_SCORE}}점</div>
+      </article>
+      <article class="metric d">
+        <div class="metric-label">스크리닝 통과</div>
+        <div class="metric-value">{{SCREEN_COUNT}}</div>
+        <div class="metric-meta">패턴 3개 이상</div>
+      </article>
+    </section>
+    <section class="section" id="pick">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Section 01</div>
+          <h2>Picking Top50</h2>
+          <p class="section-desc">
+            네 지표 Top50 순위 환산점수의 합산 순위입니다. 지표 칸은 원본 값(에너지·RS120·주가위치·talent), 신고가여부는 최장 달성 구간입니다.
+          </p>
+        </div>
+        <div class="market-badge" style="color: var(--violet)"><i></i>Unified</div>
+      </div>
+      <div class="chart-grid">
+{{PICK_CARD_HTML}}
+      </div>
+    </section>
+    <section class="section" id="screening">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker" style="color: var(--cyan)">Section 02</div>
+          <h2>스크리닝 통과 차트</h2>
+          <p class="section-desc">
+            51번 Picking 스크리닝에서 서로 다른 패턴 3개 이상에 선정된 종목입니다.
+            패턴 수 많은 순·동률 시 picking점수 순으로 정렬합니다.
+          </p>
+        </div>
+        <div class="market-badge" style="color: var(--cyan)"><i></i>Screen · {{SCREEN_COUNT}}</div>
+      </div>
+      <div class="chart-grid">
+{{SCREEN_CHARTS_HTML}}
+      </div>
+    </section>
+    <section class="method" id="methodology">
+      <div class="section-kicker">Methodology</div>
+      <h2 style="font-size:30px">점수 산출</h2>
+      <div class="method-grid">
+        <div class="method-item">
+          <b>배점</b>
+          <span>지표별 1위 250점 · 50위 200점. 선형 보간 score = 250 − (순위−1)×(50/49). Top50 밖은 0점.</span>
+        </div>
+        <div class="method-item">
+          <b>지표 재사용</b>
+          <span>에너지배율(거래대금 상위50→3일배율), RS·주가위치·Talent(시총 5,000억↑)의 시장별 Top50 순위를 그대로 사용합니다.</span>
+        </div>
+        <div class="method-item">
+          <b>표 표시</b>
+          <span>지표 칸은 원값(3일 에너지배율, rs_120, 주가위치 0~1, talent 지수). Top50 밖은 -. picking점수만 환산 합산·그라데이션.</span>
+        </div>
+        <div class="method-item">
+          <b>스크리닝 차트</b>
+          <span>시총 2,000억↑·변동성 게이트 후 p11~p93 패턴 판정. 서로 다른 패턴 3개 이상 종목만 최근 250일 캔들(MA20/50/120·거래량)로 표시합니다.</span>
+        </div>
+        <div class="method-item">
+          <b>신고가여부</b>
+          <span>당일 고가가 직전 50·120·250거래일 고가 최고를 넘으면 최장 구간(예: 250일)을 표기, 아니면 -.</span>
+        </div>
+      </div>
+    </section>
+    <footer>
+      <span>Picking Daily · {{DATE}}</span>
+      <span>본 자료는 정보 제공 목적이며 투자 판단의 최종 책임은 투자자에게 있습니다.</span>
+    </footer>
+  </main>
+  <script>
+    function showFallback(img) {
+      img.style.display = 'none';
+      const fallback = img.nextElementSibling;
+      if (fallback) fallback.style.display = 'grid';
+    }
+  </script>
+</body>
+</html>

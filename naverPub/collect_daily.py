@@ -161,17 +161,28 @@ def upsert_ohlcv(df: pd.DataFrame) -> dict:
         con.close()
 
 
-def upsert_index(ticker: str, day: date, close: float) -> None:
+def upsert_index(
+    ticker: str,
+    day: date,
+    close: float,
+    open_: Optional[float] = None,
+    high: Optional[float] = None,
+    low: Optional[float] = None,
+) -> None:
     con = connect()
     try:
         with con.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO index_ohlcv (ticker, date, close)
-                VALUES (%s,%s,%s)
-                ON DUPLICATE KEY UPDATE close=VALUES(close)
+                INSERT INTO index_ohlcv (ticker, date, open, high, low, close)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE
+                  close=VALUES(close),
+                  open=COALESCE(VALUES(open), open),
+                  high=COALESCE(VALUES(high), high),
+                  low=COALESCE(VALUES(low), low)
                 """,
-                (ticker, day, close),
+                (ticker, day, open_, high, low, close),
             )
         con.commit()
     finally:
@@ -185,8 +196,30 @@ def _preview_bytes(content: bytes, n: int = 200) -> str:
         return repr(content[:n])
 
 
+def _parse_index_ohlc_df(df: pd.DataFrame) -> pd.DataFrame:
+    """MDCSTAT00301 CSV → date/open/high/low/close."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out.columns = out.columns.str.replace(" ", "", regex=False)
+    date_col = next((c for c in ("일자", "날짜", "date") if c in out.columns), None)
+    if date_col is None or "종가" not in out.columns:
+        return pd.DataFrame()
+    rows = pd.DataFrame(
+        {
+            "date": pd.to_datetime(out[date_col], errors="coerce").dt.date,
+            "close": _num(out["종가"]),
+            "open": _num(out["시가"]) if "시가" in out.columns else np.nan,
+            "high": _num(out["고가"]) if "고가" in out.columns else np.nan,
+            "low": _num(out["저가"]) if "저가" in out.columns else np.nan,
+        }
+    )
+    rows = rows.dropna(subset=["date", "close"])
+    return rows.sort_values("date").reset_index(drop=True)
+
+
 def collect_index(session, day_str: str) -> None:
-    """KOSPI(1001)·KOSDAQ(2001) 종가 적재. MDCSTAT00301 + indIdx/indIdx2."""
+    """KOSPI(1001)·KOSDAQ(2001) OHLC 적재. MDCSTAT00301."""
     day = datetime.strptime(day_str, "%Y%m%d").date()
     specs = [
         ("1001", "1", "001", "KOSPI"),
@@ -195,10 +228,8 @@ def collect_index(session, day_str: str) -> None:
     for code, ind, ind2, label in specs:
         try:
             df, raw = krx.download_index_csv(session, day_str, ind, ind2)
-            if df is not None and not df.empty:
-                df.columns = df.columns.str.replace(" ", "")
-            close_col = "종가" if (df is not None and "종가" in df.columns) else None
-            if close_col is None or df is None or df.empty:
+            parsed = _parse_index_ohlc_df(df)
+            if parsed.empty:
                 log.warning(
                     "지수 %s 응답 비어 있음 (bytes=%d). 원문 앞200자: %s",
                     label,
@@ -206,7 +237,8 @@ def collect_index(session, day_str: str) -> None:
                     _preview_bytes(raw or b""),
                 )
                 continue
-            close = float(_num(df[close_col]).iloc[-1])
+            row = parsed.iloc[-1]
+            close = float(row["close"])
             if not np.isfinite(close):
                 log.warning(
                     "지수 %s 종가 파싱 실패. 원문 앞200자: %s",
@@ -214,10 +246,102 @@ def collect_index(session, day_str: str) -> None:
                     _preview_bytes(raw or b""),
                 )
                 continue
-            upsert_index(code, day, close)
-            log.info("지수 %s(%s) close=%.2f", label, code, close)
+
+            def _opt(v):
+                try:
+                    x = float(v)
+                    return x if np.isfinite(x) else None
+                except (TypeError, ValueError):
+                    return None
+
+            upsert_index(
+                code,
+                day,
+                close,
+                open_=_opt(row.get("open")),
+                high=_opt(row.get("high")),
+                low=_opt(row.get("low")),
+            )
+            log.info(
+                "지수 %s(%s) O=%.2f H=%.2f L=%.2f C=%.2f",
+                label,
+                code,
+                _opt(row.get("open")) or float("nan"),
+                _opt(row.get("high")) or float("nan"),
+                _opt(row.get("low")) or float("nan"),
+                close,
+            )
         except Exception as e:
             log.warning("지수 %s 수집 실패: %s", label, e)
+
+
+def index_ohl_needs_backfill(lookback_calendar_days: int = 280) -> bool:
+    """최근 구간에 close는 있으나 open이 NULL인 행이 있으면 True."""
+    eng = engine()
+    df = pd.read_sql(
+        """
+        SELECT COUNT(*) AS c FROM index_ohlcv
+        WHERE date >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+          AND close IS NOT NULL
+          AND (open IS NULL OR high IS NULL OR low IS NULL)
+        """,
+        eng,
+        params=(lookback_calendar_days,),
+    )
+    return int(df.iloc[0]["c"] or 0) > 0
+
+
+def backfill_index_ohl(session, end_day: date, calendar_days: int = 560) -> dict:
+    """
+    코스피/코스닥 지수 OHL 일회성 백필.
+    MDCSTAT00301 기간 조회(최근 calendar_days ≈ 370거래일+) → 기존 행 UPDATE/INSERT.
+    캔들 MA120 워밍업(250+120)에 충분한 기간.
+    """
+    from datetime import timedelta
+
+    start_day = end_day - timedelta(days=calendar_days)
+    start_str = start_day.strftime("%Y%m%d")
+    end_str = end_day.strftime("%Y%m%d")
+    specs = [
+        ("1001", "1", "001", "KOSPI"),
+        ("2001", "2", "001", "KOSDAQ"),
+    ]
+    out = {"start": start_str, "end": end_str, "rows": {}}
+    for code, ind, ind2, label in specs:
+        try:
+            df, raw = krx.download_index_csv(
+                session, end_str, ind, ind2, start_str=start_str
+            )
+            parsed = _parse_index_ohlc_df(df)
+            n = 0
+            for r in parsed.itertuples(index=False):
+                close = float(r.close)
+                if not np.isfinite(close):
+                    continue
+
+                def _opt(v):
+                    try:
+                        x = float(v)
+                        return x if np.isfinite(x) else None
+                    except (TypeError, ValueError):
+                        return None
+
+                upsert_index(
+                    code,
+                    r.date,
+                    close,
+                    open_=_opt(r.open),
+                    high=_opt(r.high),
+                    low=_opt(r.low),
+                )
+                n += 1
+            out["rows"][label] = n
+            log.info("지수 OHL 백필 %s: %d행 (%s~%s)", label, n, start_str, end_str)
+            time.sleep(SLEEP_SEC)
+        except Exception as e:
+            out["rows"][label] = 0
+            log.warning("지수 OHL 백필 %s 실패: %s", label, e)
+    return out
 
 
 def load_etf_targets(path: Optional[Path] = None) -> list[dict]:
@@ -876,6 +1000,16 @@ def collect_daily(
                 except Exception as e:
                     result["errors"].append(f"etf_pdf: {e}")
                     log.warning("ETF PDF 오류: %s", e)
+
+        # 과거 close-only 행 → OHL 백필 (일회성, 스킵 경로에서도 실행)
+        try:
+            if force or index_ohl_needs_backfill():
+                bf = backfill_index_ohl(session, target, calendar_days=560)
+                result["index_ohl_backfill"] = bf
+                log.info("지수 OHL 백필 완료: %s", bf.get("rows"))
+        except Exception as e:
+            result["errors"].append(f"index_ohl_backfill: {e}")
+            log.warning("지수 OHL 백필 오류: %s", e)
 
         # 이관분 등: 원천 행은 있어도 tv/mcap/market NULL → KRX로 보정
         # --force 시 chg_pct 부호 보정(과거 '-' 제거 파서)을 위해 enrich 재실행
