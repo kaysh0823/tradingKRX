@@ -5,6 +5,127 @@ tradingKIS_test.py — KIS 잔고 차트 (단일 파일)
 Spyder: F5(전체 실행) 권장. 셀만 실행할 때는 작업 디렉터리를 본 파일 폴더로 맞출 것.
 """
 
+
+import os
+import sys
+from pathlib import Path
+
+def _find_repo_root():
+    """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""
+    markers = ("env_config.py", ".env", ".git")
+
+    def _is_root(p: Path) -> bool:
+        return any((p / m).exists() for m in markers)
+
+    def _walk_up(start: Path):
+        try:
+            start = Path(start).expanduser().resolve()
+        except Exception:
+            return None
+        if not start.exists():
+            return None
+        if start.is_file():
+            start = start.parent
+        for p in [start, *start.parents]:
+            if _is_root(p):
+                return p
+        return None
+
+    tried = []
+    seen = set()
+    _nl = chr(10)
+    _hint = _nl + "REPO_ROOT 환경변수를 리포 루트로 지정하거나 F5로 실행하세요"
+
+    env_root = os.environ.get("REPO_ROOT", "").strip()
+    if env_root:
+        er = Path(env_root).expanduser()
+        try:
+            er = er.resolve()
+        except Exception as e:
+            raise RuntimeError(
+                "REPO_ROOT 경로를 해석할 수 없습니다: {!r} ({}){}".format(
+                    env_root, e, _hint
+                )
+            ) from e
+        tried.append(str(er))
+        if not er.is_dir():
+            raise RuntimeError(
+                "REPO_ROOT 가 디렉터리가 아닙니다: {}{}".format(er, _hint)
+            )
+        if _is_root(er):
+            return er
+        found = _walk_up(er)
+        if found:
+            return found
+        raise RuntimeError(
+            "REPO_ROOT={} 에서 마커(env_config.py / .env / .git)를 찾지 못했습니다.{}".format(
+                er, _hint
+            )
+        )
+
+    starts = []
+    try:
+        here = Path(__file__).resolve()
+        starts.append(here if here.is_dir() else here.parent)
+    except NameError:
+        pass
+    try:
+        import inspect
+        for fi in inspect.stack():
+            fn = getattr(fi, "filename", None) or ""
+            if not fn or fn.startswith("<"):
+                continue
+            try:
+                p = Path(fn).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() == ".py" and p.is_file():
+                starts.append(p.parent)
+    except Exception:
+        pass
+    starts.append(Path.cwd())
+    for item in sys.path:
+        if not item or item == ".":
+            continue
+        try:
+            p = Path(item)
+            if p.is_dir():
+                starts.append(p)
+        except Exception:
+            continue
+
+    for c in starts:
+        try:
+            key = str(Path(c).expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(key)
+        found = _walk_up(Path(c))
+        if found:
+            return found
+
+    raise RuntimeError(
+        "프로젝트 루트를 찾지 못했습니다 (env_config.py / .env / .git)."
+        + _nl
+        + "탐색 후보:"
+        + _nl
+        + "  - "
+        + (_nl + "  - ").join(tried)
+        + _hint
+    )
+
+_ROOT = _find_repo_root()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from env_config import load_project_env, require_env, db_url, db_connect_kwargs
+load_project_env()
+
+from indicators_core import atr_wilder, energy_ratio, rs_avg
+
+
 import requests
 import json
 import pandas as pd
@@ -221,13 +342,13 @@ def get_indicators(d, tradeHist=None):
         
         d = pd.concat([d, minmax_df], axis=1)
         
-        atr4 = talib.ATR(d.high, d.low, d.close, timeperiod=4)
-        atr14 = talib.ATR(d.high, d.low, d.close, timeperiod=14)
-        atr10 = talib.ATR(d.high, d.low, d.close, timeperiod=10)
-        atr20 = talib.ATR(d.high, d.low, d.close, timeperiod=20)
-        atr30 = talib.ATR(d.high, d.low, d.close, timeperiod=30)
-        # d['atr120'] = talib.ATR(d.high, d.low, d.close, timeperiod=120)
-        # d['atr56'] = talib.ATR(d.high, d.low, d.close, timeperiod=56)
+        atr4 = atr_wilder(d.high, d.low, d.close, 4)
+        atr14 = atr_wilder(d.high, d.low, d.close, 14)
+        atr10 = atr_wilder(d.high, d.low, d.close, 10)
+        atr20 = atr_wilder(d.high, d.low, d.close, 20)
+        atr30 = atr_wilder(d.high, d.low, d.close, 30)
+        # d['atr120'] = atr_wilder(d.high, d.low, d.close, 120)
+        # d['atr56'] = atr_wilder(d.high, d.low, d.close, 56)
         
         atr_df = pd.DataFrame({'atr4': atr4, 'atr10': atr10, 'atr20': atr20, 'atr30': atr30, 
                                'atr14': atr14})
@@ -295,7 +416,7 @@ def get_indicators(d, tradeHist=None):
         # CSI — Pine: cs=(close-sma(close,L))/atr(L); csi=sma(cs,2); fast=ema(cs,10); slow=ema(cs,20)
         _L = _CSI_LENGTH
         _csi_sma = talib.SMA(d.close, timeperiod=_L)
-        _csi_atr = talib.ATR(d.high, d.low, d.close, timeperiod=_L)
+        _csi_atr = atr_wilder(d.high, d.low, d.close, _L)
         cs = (d.close - _csi_sma) / _csi_atr.replace(0, np.nan)
         d["csi"] = talib.SMA(cs, timeperiod=2)
         d["csi_fast"] = talib.EMA(cs, timeperiod=10)
@@ -495,8 +616,8 @@ CCLD_OLD_END_DT = (_ccld_cutoff_dt + timedelta(days=-1)).strftime("%Y%m%d")
 ###################################
 ## 키 
 
-app_key = "PSIwqIqeDd7TF8HKATCI74UP0fCGycmdUbrJ"
-app_secret = "ZkOYH8sqVy+4R+OGaSBKtz1tQezHUDBePqq00ukLwXB4N1xnNXW+c4mfc4ebuOKS45kFTAL2LWmx/lcrKoETGbheNE1f5jHkR1XydF0Xxd9XHl2TGDl43P8gwXLHqWAkpC8TbjRQRdTwq7i8W/nXrWaYboatpSFBQSbnG68PgV/AfEpzOEw="
+app_key = require_env('KIS_APP_KEY')
+app_secret = require_env('KIS_APP_SECRET')
 account_no = "72627877"
 
 url_base = "https://openapi.koreainvestment.com:9443" # 실전투자 도메인
@@ -874,7 +995,7 @@ position = get_balance()
 #### 포지션 잔고의 OHLCV 가져오기
 
 ## 서버 접속
-engine = create_engine('mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db')
+engine = create_engine(db_url())
 
 
 ohlcv_data = {}
@@ -1100,6 +1221,24 @@ print("=" * 80)
 rs_start_time = time.time()
 
 # DB에서 최신 날짜의 RS 데이터 가져오기
+_RS_SCORE_COLS = ["rs20_score", "rs50_score", "rs120_score", "rs200_score", "rs_score"]
+_RS_AVG_DB_COLS = ("rs_20d", "rs_50d", "rs_120d", "rs_200d")
+
+
+def _rs_scores_from_db(frame: pd.DataFrame) -> pd.DataFrame:
+    """krx_relative_strength 행 → 표시용 rs20/50 + 정본 rs_score(20/50/120/200 평균)."""
+    out = frame.copy()
+    for src, dst in (
+        ("rs_20d", "rs20_score"),
+        ("rs_50d", "rs50_score"),
+        ("rs_120d", "rs120_score"),
+        ("rs_200d", "rs200_score"),
+    ):
+        out[dst] = pd.to_numeric(out[src], errors="coerce") if src in out.columns else np.nan
+    out["rs_score"] = rs_avg(frame=out, cols=_RS_AVG_DB_COLS).round(2)
+    return out[_RS_SCORE_COLS]
+
+
 query_max_date = """
     SELECT MAX(date) as max_date
     FROM krx_relative_strength;
@@ -1110,9 +1249,9 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
     latest_date = max_rs_date.iloc[0]['max_date']
     print(f"최신 RS 데이터 날짜: {latest_date}")
     
-    # 최신 날짜의 RS 데이터 가져오기
+    # 최신 날짜의 RS 데이터 가져오기 (정본 평균용 20/50/120/200)
     query_rs = """
-        SELECT ticker, market_type, rs_10d, rs_20d, rs_50d
+        SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, rs_120d, rs_200d
         FROM krx_relative_strength
         WHERE date = %s;
     """
@@ -1122,7 +1261,7 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
         print("⚠️ 경고: RS 데이터가 없습니다. 최신 날짜로 다시 시도합니다.")
         # 최신 날짜로 다시 조회
         query_rs_all = """
-            SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, date
+            SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, rs_120d, rs_200d, date
             FROM krx_relative_strength
             ORDER BY date DESC
             LIMIT 10000;
@@ -1132,7 +1271,9 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
             latest_date = rs_data_all.iloc[0]['date']
             print(f"실제 최신 날짜: {latest_date}")
             rs_data = rs_data_all[rs_data_all['date'] == latest_date].copy()
-            rs_data = rs_data[['ticker', 'market_type', 'rs_10d', 'rs_20d', 'rs_50d']]
+            rs_data = rs_data[
+                ["ticker", "market_type", "rs_10d", "rs_20d", "rs_50d", "rs_120d", "rs_200d"]
+            ]
     
     if len(rs_data) > 0:
         print(f"RS 데이터 로드 완료: {len(rs_data)}개 종목")
@@ -1141,19 +1282,10 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
         rs_kospi_df = rs_data[rs_data['market_type'] == 'KOSPI'].copy()
         rs_kosdaq_df = rs_data[rs_data['market_type'] == 'KOSDAQ'].copy()
         
-        # ticker를 인덱스로 설정
+        # ticker를 인덱스로 설정 + 정본 rs_avg(20/50/120/200)
         if len(rs_kospi_df) > 0:
             rs_kospi_df = rs_kospi_df.set_index('ticker')
-            # DB의 rs_10d를 rs5로, rs_20d를 rs20으로, rs_50d를 rs50으로 매핑
-            rs_kospi_df['rs5_score'] = rs_kospi_df['rs_10d']
-            rs_kospi_df['rs20_score'] = rs_kospi_df['rs_20d']
-            rs_kospi_df['rs50_score'] = rs_kospi_df['rs_50d']
-            # rs_score 계산 (3개 기간의 평균)
-            rs_kospi_df['rs_score'] = round((rs_kospi_df['rs5_score'] + 
-                                            rs_kospi_df['rs20_score'] + 
-                                            rs_kospi_df['rs50_score']) / 3, 2)
-            # 불필요한 컬럼 제거
-            rs_kospi_df = rs_kospi_df[['rs5_score', 'rs20_score', 'rs50_score', 'rs_score']]
+            rs_kospi_df = _rs_scores_from_db(rs_kospi_df)
             print(f"코스피 RS 데이터: {len(rs_kospi_df)}개 종목")
         else:
             rs_kospi_df = pd.DataFrame()
@@ -1161,16 +1293,7 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
         
         if len(rs_kosdaq_df) > 0:
             rs_kosdaq_df = rs_kosdaq_df.set_index('ticker')
-            # DB의 rs_10d를 rs5로, rs_20d를 rs20으로, rs_50d를 rs50으로 매핑
-            rs_kosdaq_df['rs5_score'] = rs_kosdaq_df['rs_10d']
-            rs_kosdaq_df['rs20_score'] = rs_kosdaq_df['rs_20d']
-            rs_kosdaq_df['rs50_score'] = rs_kosdaq_df['rs_50d']
-            # rs_score 계산 (3개 기간의 평균)
-            rs_kosdaq_df['rs_score'] = round((rs_kosdaq_df['rs5_score'] + 
-                                             rs_kosdaq_df['rs20_score'] + 
-                                             rs_kosdaq_df['rs50_score']) / 3, 2)
-            # 불필요한 컬럼 제거
-            rs_kosdaq_df = rs_kosdaq_df[['rs5_score', 'rs20_score', 'rs50_score', 'rs_score']]
+            rs_kosdaq_df = _rs_scores_from_db(rs_kosdaq_df)
             print(f"코스닥 RS 데이터: {len(rs_kosdaq_df)}개 종목")
         else:
             rs_kosdaq_df = pd.DataFrame()
@@ -1184,19 +1307,19 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
         elif len(rs_kosdaq_df) > 0:
             rs_df = rs_kosdaq_df
         else:
-            rs_df = pd.DataFrame(columns=['rs5_score', 'rs20_score', 'rs50_score', 'rs_score'])
+            rs_df = pd.DataFrame(columns=_RS_SCORE_COLS)
             print("⚠️ 경고: RS 데이터프레임이 비어있습니다.")
         
     else:
         print("⚠️ 경고: RS 데이터를 가져올 수 없습니다. 빈 데이터프레임을 생성합니다.")
-        rs_kospi_df = pd.DataFrame(columns=['rs5_score', 'rs20_score', 'rs50_score', 'rs_score'])
-        rs_kosdaq_df = pd.DataFrame(columns=['rs5_score', 'rs20_score', 'rs50_score', 'rs_score'])
-        rs_df = pd.DataFrame(columns=['rs5_score', 'rs20_score', 'rs50_score', 'rs_score'])
+        rs_kospi_df = pd.DataFrame(columns=_RS_SCORE_COLS)
+        rs_kosdaq_df = pd.DataFrame(columns=_RS_SCORE_COLS)
+        rs_df = pd.DataFrame(columns=_RS_SCORE_COLS)
 else:
     print("⚠️ 경고: RS 데이터가 없습니다. 빈 데이터프레임을 생성합니다.")
-    rs_kospi_df = pd.DataFrame(columns=['rs5_score', 'rs20_score', 'rs50_score', 'rs_score'])
-    rs_kosdaq_df = pd.DataFrame(columns=['rs5_score', 'rs20_score', 'rs50_score', 'rs_score'])
-    rs_df = pd.DataFrame(columns=['rs5_score', 'rs20_score', 'rs50_score', 'rs_score'])
+    rs_kospi_df = pd.DataFrame(columns=_RS_SCORE_COLS)
+    rs_kosdaq_df = pd.DataFrame(columns=_RS_SCORE_COLS)
+    rs_df = pd.DataFrame(columns=_RS_SCORE_COLS)
 
 rs_time = time.time() - rs_start_time
 print(f"⏱️ RS 데이터 로드 완료: {rs_time:.2f}초")
@@ -1336,20 +1459,27 @@ def _is_120d_close_high(df):
         return "-"
 
 
-def _energy_ratio(tv_s, mcap_s, total_tv, total_mcap):
-    try:
-        if total_tv <= 0 or total_mcap <= 0 or tv_s is None or mcap_s is None:
-            return np.nan
-        tv_s, mcap_s = float(tv_s), float(mcap_s)
-        if tv_s <= 0 or mcap_s <= 0 or not np.isfinite(tv_s) or not np.isfinite(mcap_s):
-            return np.nan
-        tv_pct = tv_s / total_tv * 100.0
-        mcap_pct = mcap_s / total_mcap * 100.0
-        if mcap_pct <= 0 or not np.isfinite(mcap_pct):
-            return np.nan
-        return tv_pct / mcap_pct
-    except Exception:
-        return np.nan
+def _ret_pct_by_date(df) -> dict:
+    """OHLCV df → {YYYY-MM-DD: 전일종가 대비 등락률%}."""
+    out: dict = {}
+    if df is None or getattr(df, "empty", True) or "close" not in getattr(df, "columns", []):
+        return out
+    work = df.sort_index()
+    cl = pd.to_numeric(work["close"], errors="coerce")
+    prev = cl.shift(1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ret = (cl / prev.replace(0, np.nan) - 1.0) * 100.0
+    for ts, r in zip(work.index, ret):
+        try:
+            key = pd.Timestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        try:
+            rv = float(r)
+        except (TypeError, ValueError):
+            continue
+        out[key] = rv if np.isfinite(rv) else float("nan")
+    return out
 
 
 def _load_dashboard_energy_data(engine, tickers_z6):
@@ -1759,11 +1889,11 @@ def build_position_dashboard_df(
             try:
                 rs20 = float(rs_row.rs20_score)
                 rs50 = float(rs_row.rs50_score)
-                rs_avg = float(rs_row.rs_score)
+                rs_mean = float(rs_row.rs_score)
             except Exception:
-                rs20 = rs50 = rs_avg = np.nan
+                rs20 = rs50 = rs_mean = np.nan
         else:
-            rs20 = rs50 = rs_avg = np.nan
+            rs20 = rs50 = rs_mean = np.nan
 
         def _f(col, nd=2):
             if col not in last.index:
@@ -1789,6 +1919,7 @@ def build_position_dashboard_df(
         er_day_s = "-"
         er3_s = "-"
         dlist = energy.get("dates") or []
+        ret_map = _ret_pct_by_date(df)
         if sec and dlist:
             total_mcap = float(energy["mcap_market"].get(sec, 0) or 0)
             mcap_s = energy["mcap_ticker"].get(key6)
@@ -1796,7 +1927,25 @@ def build_position_dashboard_df(
             for dstr in dlist:
                 total_tv = float(energy["tv_market"].get((dstr, sec), 0) or 0)
                 tv_s = energy["tv_ticker"].get((key6, dstr))
-                er = _energy_ratio(tv_s, mcap_s, total_tv, total_mcap)
+                try:
+                    if (
+                        total_tv <= 0
+                        or total_mcap <= 0
+                        or tv_s is None
+                        or mcap_s is None
+                    ):
+                        continue
+                    tv_f, mcap_f = float(tv_s), float(mcap_s)
+                    if tv_f <= 0 or mcap_f <= 0 or not np.isfinite(tv_f) or not np.isfinite(mcap_f):
+                        continue
+                    tv_pct = tv_f / total_tv * 100.0
+                    mcap_pct = mcap_f / total_mcap * 100.0
+                    ret = ret_map.get(dstr, np.nan)
+                    if (not np.isfinite(ret)) and dstr == dlist[0] and np.isfinite(chg_pct):
+                        ret = float(chg_pct)
+                    er = float(energy_ratio(tv_pct, mcap_pct, ret))
+                except Exception:
+                    er = np.nan
                 if not np.isnan(er):
                     ers.append(er)
             if ers:
@@ -1820,7 +1969,7 @@ def build_position_dashboard_df(
             "ATR14": _comma_int(atr_v) if not np.isnan(atr_v) else "-",
             "RS20": _fmt_float_simple(rs20, 2),
             "RS50": _fmt_float_simple(rs50, 2),
-            "RS평균": _fmt_float_simple(rs_avg, 2),
+            "RS평균": _fmt_float_simple(rs_mean, 2),
             "MACD히스토": _macd_hist_trend(df),
             "MFI": _fmt_float_simple(_f("mfi", 4), 1),
             "WilliamsR": _fmt_float_simple(_f("willr", 4), 1),
@@ -1832,7 +1981,7 @@ def build_position_dashboard_df(
             "당일에너지배율": er_day_s,
             "3일에너지배율": er3_s,
             "120일신고가": _is_120d_close_high(df),
-            "_rs_sort": rs_avg,
+            "_rs_sort": rs_mean,
         }
         rows.append(row)
 

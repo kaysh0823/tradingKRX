@@ -9,6 +9,134 @@ v4.0: OHLCV + KRX 종목/ETF 정보(krx_info_v3.0) 통합.
 """
 
 
+import os
+import sys
+from pathlib import Path
+
+os.environ["REPO_ROOT"] = r"C:\Users\hachi\OneDrive\02. Project\tradingKRX"
+print(repr(os.getenv("DB_USER")), repr(os.getenv("DB_PASSWORD")))
+
+def _find_repo_root():
+    """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""
+    markers = ("env_config.py", ".env", ".git")
+
+    def _is_root(p: Path) -> bool:
+        return any((p / m).exists() for m in markers)
+
+    def _walk_up(start: Path):
+        try:
+            start = Path(start).expanduser().resolve()
+        except Exception:
+            return None
+        if not start.exists():
+            return None
+        if start.is_file():
+            start = start.parent
+        for p in [start, *start.parents]:
+            if _is_root(p):
+                return p
+        return None
+
+    tried = []
+    seen = set()
+    _nl = chr(10)
+    _hint = _nl + "REPO_ROOT 환경변수를 리포 루트로 지정하거나 F5로 실행하세요"
+
+    env_root = os.environ.get("REPO_ROOT", "").strip()
+    if env_root:
+        er = Path(env_root).expanduser()
+        try:
+            er = er.resolve()
+        except Exception as e:
+            raise RuntimeError(
+                "REPO_ROOT 경로를 해석할 수 없습니다: {!r} ({}){}".format(
+                    env_root, e, _hint
+                )
+            ) from e
+        tried.append(str(er))
+        if not er.is_dir():
+            raise RuntimeError(
+                "REPO_ROOT 가 디렉터리가 아닙니다: {}{}".format(er, _hint)
+            )
+        if _is_root(er):
+            return er
+        found = _walk_up(er)
+        if found:
+            return found
+        raise RuntimeError(
+            "REPO_ROOT={} 에서 마커(env_config.py / .env / .git)를 찾지 못했습니다.{}".format(
+                er, _hint
+            )
+        )
+
+    starts = []
+    try:
+        here = Path(__file__).resolve()
+        starts.append(here if here.is_dir() else here.parent)
+    except NameError:
+        pass
+    try:
+        import inspect
+        for fi in inspect.stack():
+            fn = getattr(fi, "filename", None) or ""
+            if not fn or fn.startswith("<"):
+                continue
+            try:
+                p = Path(fn).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() == ".py" and p.is_file():
+                starts.append(p.parent)
+    except Exception:
+        pass
+    starts.append(Path.cwd())
+    for item in sys.path:
+        if not item or item == ".":
+            continue
+        try:
+            p = Path(item)
+            if p.is_dir():
+                starts.append(p)
+        except Exception:
+            continue
+
+    for c in starts:
+        try:
+            key = str(Path(c).expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(key)
+        found = _walk_up(Path(c))
+        if found:
+            return found
+
+    raise RuntimeError(
+        "프로젝트 루트를 찾지 못했습니다 (env_config.py / .env / .git)."
+        + _nl
+        + "탐색 후보:"
+        + _nl
+        + "  - "
+        + (_nl + "  - ").join(tried)
+        + _hint
+    )
+
+_ROOT = _find_repo_root()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from env_config import load_project_env, require_env, db_url, db_connect_kwargs
+from krx_naver_ohlcv import (
+    get_index_ohlcv_from_naver,
+    get_index_ohlcv_from_naver_api,
+    get_index_ohlcv_from_naver_crawl,
+)
+from indicators_core import RS_AVG_COLS_D, rs_avg, talent_score, talent_up_count
+load_project_env()
+
+
+
 import requests as rq
 from bs4 import BeautifulSoup
 import re
@@ -28,14 +156,10 @@ import traceback
 import os
 import inspect
 
-from pykrx import stock
 import math
 
 
 # 임시 해결: 스크립트 실행 전에 셀에서 직접 주입
-os.environ['KRX_ID'] = 'hachimitsu79'
-os.environ['KRX_PW'] = 'GloriaDahn0823$$'
-
 def _script_dir():
     """Spyder F5 / Jupyter 셀 / IPython 모두에서 스크립트 경로 반환."""
     try:
@@ -298,11 +422,7 @@ def krx_login(session: rq.Session) -> bool:
     KRX_ID / KRX_PW 환경변수로 로그인.
     CD001=성공, CD011=중복로그인(skipDup=Y 재시도), CD010=비밀번호 변경 필요.
     """
-    uid, upw = os.getenv('KRX_ID'), os.getenv('KRX_PW')
-    if not (uid and upw):
-        print('⚠️ 환경변수 KRX_ID / KRX_PW 가 설정되지 않았습니다.')
-        print('   Windows(PowerShell): setx KRX_ID "아이디" / setx KRX_PW "비번"  (후 새 터미널)')
-        return False
+    uid, upw = require_env('KRX_ID'), require_env('KRX_PW')
 
     session.get(LOGIN_PAGE, headers={'User-Agent': _LOGIN_UA}, timeout=15)
     session.get(LOGIN_JSP, headers={'User-Agent': _LOGIN_UA, 'Referer': LOGIN_PAGE}, timeout=15)
@@ -499,8 +619,8 @@ def update_krx_info():
 
     ## DB 적재 (krx_ticker)
     con = pymysql.connect(
-        user='root',
-        passwd='GloriaDahn03240701',
+        user=require_env('DB_USER'),
+        passwd=require_env('DB_PASSWORD'),
         host='127.0.0.1',
         db='kor_stock_db',
         charset='utf8'
@@ -573,7 +693,7 @@ def update_krx_info():
 
 
 
-    # engine = create_engine('mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db')
+    # engine = create_engine(db_url())
 
     # query = """
     # select * from krx_ticker
@@ -617,7 +737,7 @@ def update_krx_info():
     # ## DB 저장 쿼리
 
     # con = pymysql.connect(user='root',
-    # passwd='GloriaDahn03240701',
+    # passwd=require_env('DB_PASSWORD'),
     # host='127.0.0.1',
     # db='kor_stock_db',
     # charset='utf8')
@@ -677,8 +797,8 @@ def update_krx_info():
     etf_df = etf_df[etf_cols]
 
     con = pymysql.connect(
-        user='root',
-        passwd='GloriaDahn03240701',
+        user=require_env('DB_USER'),
+        passwd=require_env('DB_PASSWORD'),
         host='127.0.0.1',
         db='kor_stock_db',
         charset='utf8'
@@ -765,7 +885,7 @@ def update_krx_info():
 # =============================================================================
 
 ## 서버 설정
-engine = create_engine('mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db')
+engine = create_engine(db_url())
 
 print('=' * 60)
 print('1. KRX 종목/ETF 정보 업데이트')
@@ -777,8 +897,8 @@ print('=' * 60)
 print('2. OHLCV 가져오기 시작')
 print('=' * 60)
 
-con = pymysql.connect(user='root',
-passwd='GloriaDahn03240701',
+con = pymysql.connect(user=require_env('DB_USER'),
+passwd=require_env('DB_PASSWORD'),
 host='127.0.0.1',
 db='kor_stock_db',
 charset='utf8')
@@ -1102,10 +1222,8 @@ if ENABLE_KIS_INVESTOR_TRADE_KIS:
     # --- KIS API: 종목별 투자자매매동향(일별) FHPTJ04160001 ---
     # https://apiportal.koreainvestment.com/apiservice-apiservice?/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily
     KIS_URL_BASE = "https://openapi.koreainvestment.com:9443"
-    KIS_APP_KEY = "PSIwqIqeDd7TF8HKATCI74UP0fCGycmdUbrJ"
-    KIS_APP_SECRET = (
-        "ZkOYH8sqVy+4R+OGaSBKtz1tQezHUDBePqq00ukLwXB4N1xnNXW+c4mfc4ebuOKS45kFTAL2LWmx/lcrKoETGbheNE1f5jHkR1XydF0Xxd9XHl2TGDl43P8gwXLHqWAkpC8TbjRQRdTwq7i8W/nXrWaYboatpSFBQSbnG68PgV/AfEpzOEw="
-    )
+    KIS_APP_KEY = require_env('KIS_APP_KEY')
+    KIS_APP_SECRET = require_env('KIS_APP_SECRET')
     KIS_INVESTOR_TRADE_PATH = "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
     KIS_INVESTOR_TR_ID = "FHPTJ04160001"
     KIS_INVESTOR_MAX_DAYS = 300
@@ -1707,8 +1825,8 @@ index_df.set_index('ticker', inplace=True)
 
 ## DB 저장 쿼리
 
-con = pymysql.connect(user='root',
-passwd='GloriaDahn03240701',
+con = pymysql.connect(user=require_env('DB_USER'),
+passwd=require_env('DB_PASSWORD'),
 host='127.0.0.1',
 db='kor_stock_db',
 charset='utf8')
@@ -1731,176 +1849,8 @@ commit_counter = 0
 
 # 세션은 이미 위에서 생성됨 (재사용)
 
-def get_index_ohlcv_from_naver_api(index_code, start_date, end_date):
-    """네이버 파이낸스 API를 사용하여 지수 OHLCV 데이터를 가져옵니다."""
-    try:
-        # 네이버 파이낸스 API URL (주식과 동일한 형식 사용)
-        url = f'https://api.finance.naver.com/siseJson.naver?symbol={index_code}&requestType=1&startTime={start_date}&endTime={end_date}&timeframe=day'
-        
-        response = session.get(url, timeout=10)
-        
-        # 응답 확인
-        if response.status_code != 200:
-            print(f"  API 응답 오류: {response.status_code} (지수: {index_code})")
-            return None
-        
-        data = response.content
-        
-        # 응답이 JSON인지 확인 (지수는 JSON 형식일 수 있음)
-        try:
-            import json
-            json_data = json.loads(data.decode('utf-8'))
-            # JSON 형식이면 pandas로 변환
-            if isinstance(json_data, list) and len(json_data) > 1:
-                # 첫 번째 행은 헤더일 수 있음
-                data_price = pd.DataFrame(json_data[1:], columns=json_data[0] if json_data[0] else None)
-            else:
-                data_price = pd.DataFrame(json_data)
-        except:
-            # JSON이 아니면 CSV로 시도
-            data_price = pd.read_csv(BytesIO(data))
-        
-        if data_price.empty or len(data_price.columns) < 6:
-            print(f"  API 데이터 비어있음 (지수: {index_code})")
-            return None
-        
-        price = data_price.iloc[:, 0:6]
-        price.columns = ['date', 'open', 'high', 'low', 'close', 'volume']
-        
-        # 빈 행 제거
-        price = price.dropna(how='all')
-        
-        if len(price) == 0:
-            print(f"  유효한 데이터 없음 (지수: {index_code})")
-            return None
-        
-        # 날짜 형식 변환
-        # 날짜가 문자열인 경우 처리
-        if price['date'].dtype == 'object':
-            price['date'] = price['date'].astype(str).str.extract('(\\d+)')[0]
-        
-        price['date'] = pd.to_datetime(price['date'], format='%Y%m%d', errors='coerce')
-        price = price.dropna(subset=['date'])
-        
-        if len(price) == 0:
-            print(f"  날짜 변환 후 데이터 없음 (지수: {index_code})")
-            return None
-        
-        # 데이터 타입 변환
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            # 문자열인 경우 쉼표 제거
-            if price[col].dtype == 'object':
-                price[col] = price[col].astype(str).str.replace(',', '').str.replace(' ', '')
-            price[col] = pd.to_numeric(price[col], errors='coerce')
-        
-        # 숫자 변환이 실패한 행 제거
-        price = price.dropna(subset=['open', 'high', 'low', 'close'])
-        
-        if len(price) == 0:
-            print(f"  숫자 변환 후 데이터 없음 (지수: {index_code})")
-            return None
-        
-        # volume_amount와 market_value는 지수 데이터에 없으므로 None으로 설정
-        price['volume_amount'] = None
-        price['market_value'] = None
-        
-        print(f"  API로 {len(price)}개 데이터 가져옴 (지수: {index_code})")
-        return price
-        
-    except Exception as e:
-        print(f"  API 오류 (지수: {index_code}): {e}")
-        return None
 
-def get_index_ohlcv_from_naver_crawl(index_code, start_date, end_date):
-    """네이버 파이낸스 웹페이지를 크롤링하여 지수 OHLCV 데이터를 가져옵니다."""
-    try:
-        # 날짜 변환
-        start_dt = datetime.strptime(start_date, '%Y%m%d')
-        end_dt = datetime.strptime(end_date, '%Y%m%d')
-        
-        all_data = []
-        page = 1
-        
-        while True:
-            url = f'https://finance.naver.com/sise/sise_index_day.nhn?code={index_code}&page={page}'
-            response = session.get(url, timeout=10)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # 테이블 찾기
-            table = soup.find('table', class_='type_1')
-            if not table:
-                break
-            
-            rows = table.find_all('tr')[1:]  # 헤더 제외
-            
-            if not rows:
-                break
-            
-            page_data_found = False
-            
-            for row in rows:
-                tds = row.find_all('td')
-                if len(tds) < 6:
-                    continue
-                
-                try:
-                    date_str = tds[0].text.strip()
-                    if not date_str:
-                        continue
-                    
-                    date_val = datetime.strptime(date_str, '%Y.%m.%d')
-                    
-                    # 시작일 이전이면 중단
-                    if date_val < start_dt:
-                        return pd.DataFrame(all_data, columns=['date', 'open', 'high', 'low', 'close', 'volume', 'volume_amount', 'market_value']) if all_data else None
-                    
-                    # 종료일 이후면 다음 페이지로
-                    if date_val > end_dt:
-                        page += 1
-                        continue
-                    
-                    close = float(tds[1].text.replace(',', ''))
-                    # 전일비는 무시
-                    open_val = float(tds[3].text.replace(',', ''))
-                    high = float(tds[4].text.replace(',', ''))
-                    low = float(tds[5].text.replace(',', ''))
-                    volume = float(tds[6].text.replace(',', '')) if len(tds) > 6 and tds[6].text.strip() else 0
-                    
-                    all_data.append([date_val, open_val, high, low, close, volume, None, None])
-                    page_data_found = True
-                    
-                except (ValueError, IndexError) as e:
-                    continue
-            
-            if not page_data_found:
-                break
-            
-            page += 1
-            
-            # 너무 많은 페이지 요청 방지
-            if page > 100:
-                break
-        
-        if all_data:
-            df = pd.DataFrame(all_data, columns=['date', 'open', 'high', 'low', 'close', 'volume', 'volume_amount', 'market_value'])
-            df = df.sort_values('date').reset_index(drop=True)
-            return df
-        
-        return None
-        
-    except Exception as e:
-        return None
-
-def get_index_ohlcv_from_naver(index_code, start_date, end_date):
-    """네이버 파이낸스에서 지수 OHLCV 데이터를 가져옵니다 (API 우선, 실패시 크롤링)."""
-    # 먼저 API 시도
-    df = get_index_ohlcv_from_naver_api(index_code, start_date, end_date)
-    
-    # API 실패시 크롤링 시도
-    if df is None or len(df) == 0:
-        df = get_index_ohlcv_from_naver_crawl(index_code, start_date, end_date)
-    
-    return df
+# 지수 OHLCV: krx_naver_ohlcv 공통 모듈 사용
 
 # 성공한 지수만 저장할 리스트
 successful_indices = []
@@ -2051,8 +2001,8 @@ if error_list2:
 if successful_indices:
     print(f'\n=== DB 저장 확인 ===')
     try:
-        con_check = pymysql.connect(user='root',
-                                    passwd='GloriaDahn03240701',
+        con_check = pymysql.connect(user=require_env('DB_USER'),
+                                    passwd=require_env('DB_PASSWORD'),
                                     host='127.0.0.1',
                                     db='kor_stock_db',
                                     charset='utf8')
@@ -2118,8 +2068,8 @@ else:
 print('테마 정보 수집 시작')
 
 ## DB 연결
-con = pymysql.connect(user='root',
-passwd='GloriaDahn03240701',
+con = pymysql.connect(user=require_env('DB_USER'),
+passwd=require_env('DB_PASSWORD'),
 host='127.0.0.1',
 db='kor_stock_db',
 charset='utf8')
@@ -2730,8 +2680,8 @@ con.close()
 print('업종 정보 수집 시작')
 
 ## DB 연결
-con = pymysql.connect(user='root',
-passwd='GloriaDahn03240701',
+con = pymysql.connect(user=require_env('DB_USER'),
+passwd=require_env('DB_PASSWORD'),
 host='127.0.0.1',
 db='kor_stock_db',
 charset='utf8')
@@ -3390,8 +3340,8 @@ print('상대강도(RS) 산출 및 저장 시작')
 print(f"· RS_BACKFILL={RS_BACKFILL}")
 
 ## DB 연결
-con = pymysql.connect(user='root',
-passwd='GloriaDahn03240701',
+con = pymysql.connect(user=require_env('DB_USER'),
+passwd=require_env('DB_PASSWORD'),
 host='127.0.0.1',
 db='kor_stock_db',
 charset='utf8')
@@ -3607,6 +3557,13 @@ def compute_market_rs_rows(
     periods: list,
 ) -> list:
     """시장 단위 벡터 RS 계산 → DB insert 튜플 리스트.
+
+    저장 컬럼: rs_10d·rs_20d·rs_50d·rs_120d·rs_200d (전부 유지).
+    소비 측 평균은 indicators_core.rs_avg(cols=RS_AVG_COLS_D)
+    = mean(rs_20d, rs_50d, rs_120d, rs_200d) — rs_10 제외.
+
+    Talent(전일종가 +10%) 산출은 본 파일에 없음.
+    필요 시 indicators_core.talent_up_count / talent_score 사용.
 
     단기 거래정지(≤20거래일)는 ffill로 과거종가를 보간해 모멘텀 왜곡을 막되,
     당일 원본 종가가 NaN인 종목은 순위·저장에서 제외합니다.
