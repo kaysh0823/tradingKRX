@@ -5,7 +5,7 @@ KRX [13108] PDF 수집 + 구성비중 스냅샷 대시보드 (32. ETF_PDF_v2.0)
 2) DB 기준 구성비중 스냅샷 HTML 대시보드 생성
 
 종목코드(ETF) 딕셔너리 {코드: 종목명} × 수집일자 조합을 조회·저장한 뒤,
-DB최근 / 3일전 / 일주일전 / 2주일전 비중 비교표를 만듭니다.
+DB최근 / 전일 / 3일전 / 일주일전 / 2주일전 비중 비교표를 만듭니다.
 
 동작 방식 (KRX 정보데이터시스템 내부 API를 그대로 사용):
   · 로그인      : POST MDCCOMS001D1.cmd  (중복로그인 시 skipDup=Y 재전송)
@@ -198,12 +198,14 @@ DASH_ETF_FILTER = None  # list[str] | None — None이면 ISU_CODES 전체(그�
 
 SNAPSHOT_DEFS = [
     ("DB최근", 0),
+    ("전일", 1),
     ("3일전", 3),
     ("일주일전", 5),
     ("2주일전", 10),
 ]
 CHAIN_COMPARE = [
-    ("DB최근", "3일전"),
+    ("DB최근", "전일"),       # 전일대비 (DB최근 − 전일)
+    ("전일", "3일전"),
     ("3일전", "일주일전"),
     ("일주일전", "2주일전"),
 ]
@@ -847,7 +849,13 @@ def build_snapshot_wide(
         latest_rank = wide.sort_values("DB최근", ascending=False, na_position="last")
         pick = set(latest_rank.head(top_n)["티커"].tolist())
         # 이탈·큰 변화 종목도 포함
-        for col in ("vs최근_3일전", "vs최근_일주일전", "vs최근_2주일전", "chainΔ_DB최근"):
+        for col in (
+            "vs최근_전일",
+            "vs최근_3일전",
+            "vs최근_일주일전",
+            "vs최근_2주일전",
+            "chainΔ_DB최근",
+        ):
             if col not in wide.columns:
                 continue
             tmp = wide.dropna(subset=[col]).copy()
@@ -864,7 +872,9 @@ def build_snapshot_wide(
     # 정렬: 당일 비중 높은 순, 이탈(당일 없음)은 변화 절대값 큰 순으로 뒤에
     wide["_sort_w"] = wide["DB최근"].fillna(-1e9)
     wide["_sort_exit"] = wide["_miss_DB최근"].astype(int)
-    if "vs최근_3일전" in wide.columns:
+    if "vs최근_전일" in wide.columns:
+        wide["_sort_chg"] = wide["vs최근_전일"].fillna(0).abs()
+    elif "vs최근_3일전" in wide.columns:
         wide["_sort_chg"] = wide["vs최근_3일전"].fillna(0).abs()
     else:
         wide["_sort_chg"] = 0.0
@@ -969,7 +979,7 @@ def render_etf_weight_table(wide: pd.DataFrame, snaps: dict) -> str:
         + "<p class='hint'>셀 색: 직전 시점 대비 비중확대=초록 / 비중축소=빨강 (농도=|변화|). "
         "괄호=직전 대비 pp 변화. "
         "과거에만 있고 당일에 없으면 <strong>이탈</strong>(당일 비중 0)으로 표시·집계합니다. "
-        "DB최근←3일전, 3일전←일주일전, 일주일전←2주일전.</p>"
+        "DB최근←전일(전일대비), 전일←3일전, 3일전←일주일전, 일주일전←2주일전.</p>"
     )
 
 
@@ -1105,6 +1115,7 @@ def render_summary_section(universe: pd.DataFrame) -> str:
         ),
     ]
     for col, label in (
+        ("vs최근_전일", "전일대비"),
         ("vs최근_3일전", "3일전 대비"),
         ("vs최근_일주일전", "일주일전 대비"),
         ("vs최근_2주일전", "2주일전 대비"),
@@ -1314,7 +1325,7 @@ def build_dashboard_html(df: pd.DataFrame) -> str:
   <header>
     <h1>ETF PDF 구성비중 스냅샷</h1>
     <p class="sub">기준(DB최근) {latest_str} · ETF {df['ETF코드'].nunique()}개
-       · 비교: DB최근 / 3일전(T-3) / 일주일전(T-5) / 2주일전(T-10)
+       · 비교: DB최근 / 전일(T-1) / 3일전(T-3) / 일주일전(T-5) / 2주일전(T-10)
        · <code>{PDF_TABLE}</code></p>
     <p class="sub">{snapshot_meta_html(snaps)}</p>
     <nav class="nav">{''.join(nav_links)}</nav>

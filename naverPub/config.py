@@ -35,6 +35,14 @@ SLEEP_SEC = float(os.getenv("SLEEP_SEC", "1.0"))
 # 한글 폰트 (Linux: NanumGothic, Windows: Malgun Gothic)
 FONT_FAMILY = os.getenv("FONT_FAMILY", "NanumGothic")
 
+# Playwright 렌더 배율 (표·조각 캡처 device_scale_factor). 기본 3.
+RENDER_SCALE = int(os.getenv("RENDER_SCALE", "3"))
+
+# 그래프·표 PNG 목표 가로 픽셀 (텔레그램 나열 시 폭 통일)
+OUTPUT_WIDTH_PX = int(os.getenv("OUTPUT_WIDTH_PX", "1400"))
+# (legacy) matplotlib DPI — 변동성 차트는 Plotly+kaleido(RENDER_SCALE) 사용
+FIG_DPI = int(os.getenv("FIG_DPI", "140"))
+
 # 로컬→VPS 이관용 (migrate_initial.py)
 LOCAL_DB_HOST = os.getenv("LOCAL_DB_HOST", "127.0.0.1")
 LOCAL_DB_PORT = int(os.getenv("LOCAL_DB_PORT", "3306"))

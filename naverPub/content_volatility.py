@@ -1,12 +1,11 @@
 """
-마켓 변동성 차트 (별도 volatility.md/html, 시장별 섹션):
-0) 코스피/코스닥 지수 캔들 + MA20/50/120 (최근 250거래일, MA 워밍업 120일)
-1) ATR14/종가 vs 시가총액 산점도 (기준일, ATR14/종가 >= 0.4 제외, 거래대금 상위20 라벨)
-2) 시총가중 시장 변동성 250거래일 추이 + Vol SMA20 + 지수(보조축)
-3) 모멘텀 속도 (ROC(N)% / N, 20·50일 + 0선)
+마켓 변동성 차트 (별도 market.md/html, 시장별 섹션) — Plotly + kaleido PNG.
+0) 지수 캔들 + MA20/50/120 + MACD·이격도·BB Width (최근 250거래일)
+1) ATR14/종가 vs 시가총액 산점도 (거래대금 상위20 라벨)
+2) 시총가중 시장 변동성 + Vol SMA10/20 + 지수 캔들(우축)
+3) 모멘텀 속도 (ROC(N)% / N, 20·50일) + 지수 캔들(우축)
 
-ATR14 = True Range의 14일 단순이동평균 (talib 미사용).
-과거 mcap NULL은 티커별 bfill/ffill로 보간 (이관·수집에서 최신일만 시총이 있는 경우 대응).
+VPS 한글: apt install fonts-nanum fonts-nanum-coding 후 FONT_FAMILY=NanumGothic
 """
 from __future__ import annotations
 
@@ -18,61 +17,37 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import FONT_FAMILY
+from config import FONT_FAMILY, OUTPUT_WIDTH_PX, RENDER_SCALE
 from db import engine
 
 log = logging.getLogger("naverPub.content_volatility")
 
 ATR_N = 14
 VOL_WINDOW = 250
-MA_WARMUP = 120  # 캔들 MA120 워밍업 (표시 구간 앞)
-ATR_OC_MAX = 0.4  # 산점도 극단값 제외
-FIGSIZE = (10, 6.5)  # 산점도 기준 — 전 그래프 통일
-FIG_DPI = 140
+MA_WARMUP = 120
+ATR_OC_MAX = 0.4
 INDEX_CODES = {"KOSPI": "1001", "KOSDAQ": "2001"}
 MARKETS = ("KOSPI", "KOSDAQ")
 MARKET_LABELS = {"KOSPI": "코스피", "KOSDAQ": "코스닥"}
 MOMENTUM_PERIODS = (20, 50)
-MOMENTUM_COLORS = {20: "#43A047", 50: "#1E88E5"}
-DATE_FMT_SHORT = "%y-%m-%d"  # x축 라벨 (수평, 공간 절약)
-X_TICK_LABELSIZE = 9
-# 시총 로그축 한글 단위 (원)
-MCAP_YTICKS = (
-    (1e9, "십억"),
-    (1e10, "백억"),
-    (1e11, "천억"),
-    (1e12, "1조"),
-    (1e13, "10조"),
-    (1e14, "100조"),
-    (1e15, "1000조"),
-)
 SCATTER_TOP_TV = 20
 
+# 밝은 원색 팔레트
+C_UP = "#E53935"
+C_DOWN = "#1E88E5"
+C_GREEN = "#43A047"
+C_PURPLE = "#8E24AA"
+C_ORANGE = "#FB8C00"
+C_TEAL = "#00ACC1"
+C_BLUE = "#1E88E5"
+C_GRID = "#E0E0E0"
+C_ZERO = "#9E9E9E"
 
-def _setup_korean_font() -> str:
-    """matplotlib 한글 폰트. config FONT_FAMILY → Malgun → Nanum 순."""
-    import matplotlib.pyplot as plt
-    from matplotlib import font_manager as fm
+H_CANDLE = 1100
+H_SINGLE = 720
+H_DUAL = 780
 
-    candidates = [
-        FONT_FAMILY,
-        "Malgun Gothic",
-        "NanumGothic",
-        "Nanum Gothic",
-        "AppleGothic",
-    ]
-    available = {f.name for f in fm.fontManager.ttflist}
-    chosen = next((c for c in candidates if c in available), None)
-    if chosen is None:
-        for f in fm.fontManager.ttflist:
-            low = (f.name or "").lower() + " " + (getattr(f, "fname", "") or "").lower()
-            if "malgun" in low or "nanum" in low:
-                chosen = f.name
-                break
-    if chosen:
-        plt.rcParams["font.family"] = chosen
-    plt.rcParams["axes.unicode_minus"] = False
-    return chosen or "sans-serif"
+FONT_STACK = f"{FONT_FAMILY}, Malgun Gothic, NanumGothic, Nanum Gothic, sans-serif"
 
 
 def _trading_dates(eng, end: date, n: int) -> list[date]:
@@ -105,10 +80,6 @@ def _load_market_ohlcv(eng, market: str, start: date, end: date) -> pd.DataFrame
 
 
 def _fill_mcap(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    과거일 mcap NULL 보간.
-    이관/수집에서 최신일에만 시총이 있는 경우가 많아, 티커별 bfill→ffill.
-    """
     if df.empty or "mcap" not in df.columns:
         return df
     out = df.sort_values(["ticker", "date"]).copy()
@@ -139,7 +110,6 @@ def _load_index(eng, index_ticker: str, start: date, end: date) -> pd.Series:
 
 
 def _load_index_ohlc(eng, index_ticker: str, start: date, end: date) -> pd.DataFrame:
-    """캔들용 OHLC. open/high/low/close 모두 유효한 날만."""
     df = pd.read_sql(
         """
         SELECT date, open, high, low, close FROM index_ohlcv
@@ -160,8 +130,7 @@ def _load_index_ohlc(eng, index_ticker: str, start: date, end: date) -> pd.DataF
     df = df.rename(
         columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"}
     )
-    df = df.set_index("date").sort_index()
-    return df[["Open", "High", "Low", "Close"]]
+    return df.set_index("date").sort_index()[["Open", "High", "Low", "Close"]]
 
 
 def _add_atr_over_close(df: pd.DataFrame) -> pd.DataFrame:
@@ -183,7 +152,6 @@ def _add_atr_over_close(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _mcap_weighted_vol(df: pd.DataFrame) -> pd.Series:
-    """날짜별 Σ(ATR14/종가 × 시총) / Σ시총."""
     v = df[
         df["atr_over_close"].notna()
         & df["mcap"].notna()
@@ -217,59 +185,10 @@ def _scatter_snapshot(df: pd.DataFrame, as_of: date) -> pd.DataFrame:
     return day.loc[m, cols].reset_index(drop=True)
 
 
-def _comma_formatter():
-    from matplotlib.ticker import FuncFormatter
-
-    return FuncFormatter(lambda x, _p: f"{x:,.0f}")
-
-
-def _apply_horizontal_date_ticks(
-    ax,
-    fontsize: int = X_TICK_LABELSIZE,
-    *,
-    format_dates: bool = True,
-) -> None:
-    """x축 날짜: 회전 0도, YY-MM-DD, 눈금 개수는 유지하고 폰트만 축소."""
-    from matplotlib.dates import DateFormatter
-
-    if format_dates:
-        try:
-            ax.xaxis.set_major_formatter(DateFormatter(DATE_FMT_SHORT))
-        except Exception:
-            pass
-    ax.tick_params(axis="x", labelrotation=0, labelsize=fontsize)
-    for label in ax.get_xticklabels():
-        label.set_rotation(0)
-        label.set_horizontalalignment("center")
-        label.set_fontsize(fontsize)
-        t = (label.get_text() or "").strip()
-        # mplfinance 등 문자열 라벨 YYYY-MM-DD → YY-MM-DD
-        if len(t) >= 10 and t[4:5] == "-" and t[7:8] == "-":
-            label.set_text(t[2:10])
-
-
-def _apply_mcap_yticks(ax, mcap: pd.Series) -> None:
-    """시총 로그축 → 십억·백억·천억·1조…"""
-    if mcap is None or mcap.empty:
-        return
-    lo = float(np.nanmin(mcap.values))
-    hi = float(np.nanmax(mcap.values))
-    if not np.isfinite(lo) or not np.isfinite(hi) or lo <= 0:
-        return
-    ticks = [(v, lab) for v, lab in MCAP_YTICKS if lo * 0.5 <= v <= hi * 2.0]
-    if not ticks:
-        ticks = [(v, lab) for v, lab in MCAP_YTICKS if v >= lo * 0.1]
-    if not ticks:
-        return
-    ax.set_yticks([v for v, _ in ticks])
-    ax.set_yticklabels([lab for _, lab in ticks])
-
-
 def _compute_momentum_speed(
     close: pd.Series,
     periods: tuple[int, ...] = MOMENTUM_PERIODS,
 ) -> pd.DataFrame:
-    """Pine ROC(close,N)/N → 하루 평균 변화율(%/일). 21번 파일과 동일."""
     s = pd.to_numeric(close, errors="coerce")
     out = pd.DataFrame(index=s.index)
     for length in periods:
@@ -279,158 +198,238 @@ def _compute_momentum_speed(
     return out
 
 
+def _macd_series(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    s = pd.to_numeric(close, errors="coerce")
+    ema_f = s.ewm(span=fast, adjust=False).mean()
+    ema_s = s.ewm(span=slow, adjust=False).mean()
+    macd = ema_f - ema_s
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    return macd, sig, macd - sig
+
+
+def _bb_width(close: pd.Series, window: int = 20, n_sigma: float = 2.0) -> pd.Series:
+    s = pd.to_numeric(close, errors="coerce")
+    mid = s.rolling(window, min_periods=window).mean()
+    std = s.rolling(window, min_periods=window).std()
+    return (2.0 * n_sigma * std) / mid.replace(0, np.nan)
+
+
+def _to_dt_index(idx) -> pd.DatetimeIndex:
+    return pd.to_datetime(pd.Index(idx))
+
+
+def _day_close_from_ohlc(ohlc: Optional[pd.DataFrame], as_of: date) -> float:
+    if ohlc is None or ohlc.empty or "Close" not in ohlc.columns:
+        return float("nan")
+    try:
+        ts = pd.Timestamp(as_of)
+        if isinstance(ohlc.index, pd.DatetimeIndex):
+            m = ohlc.index.normalize() == ts.normalize()
+            sub = ohlc.loc[m]
+            if not sub.empty:
+                return float(sub["Close"].iloc[-1])
+        return float(ohlc["Close"].iloc[-1])
+    except Exception:
+        return float("nan")
+
+
+def _base_layout(title: str, height: int) -> dict:
+    return dict(
+        title=dict(text=title, font=dict(size=16, family=FONT_STACK), x=0.01, xanchor="left"),
+        width=OUTPUT_WIDTH_PX,
+        height=height,
+        font=dict(family=FONT_STACK, size=12, color="#212121"),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        margin=dict(l=64, r=56, t=56, b=56),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
+        hovermode="x unified",
+    )
+
+
+def _style_axes(fig, rows: int = 1, *, secondary: bool = False) -> None:
+    for r in range(1, rows + 1):
+        fig.update_xaxes(
+            showgrid=True,
+            gridcolor=C_GRID,
+            tickformat="%y-%m-%d",
+            ticks="outside",
+            row=r,
+            col=1,
+        )
+        fig.update_yaxes(showgrid=True, gridcolor=C_GRID, row=r, col=1)
+        if secondary:
+            fig.update_yaxes(showgrid=False, row=r, col=1, secondary_y=True)
+
+
+def _write_png(fig, out_path: Path, height: int) -> Path:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.update_layout(width=OUTPUT_WIDTH_PX, height=height)
+    try:
+        fig.write_image(
+            str(out_path),
+            width=OUTPUT_WIDTH_PX,
+            height=height,
+            scale=max(1, int(RENDER_SCALE)),
+            engine="kaleido",
+        )
+    except Exception as e:
+        log.error("Plotly write_image 실패(%s): %s", out_path.name, e)
+        raise
+    return out_path
+
+
+def _empty_fig(title: str, msg: str, height: int, out_path: Path) -> Path:
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.add_annotation(text=msg, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+    fig.update_layout(**_base_layout(title, height))
+    return _write_png(fig, out_path, height)
+
+
+def _add_day_note(fig, text: str) -> None:
+    if not text:
+        return
+    fig.add_annotation(
+        text=text,
+        xref="paper",
+        yref="paper",
+        x=1.0,
+        y=-0.08 if fig.layout.height and fig.layout.height < 900 else -0.04,
+        xanchor="right",
+        yanchor="top",
+        showarrow=False,
+        font=dict(size=11, color="#37474F", family=FONT_STACK),
+    )
+
+
+def _candlestick_trace(ohlc: pd.DataFrame, name: str = "지수"):
+    import plotly.graph_objects as go
+
+    x = _to_dt_index(ohlc.index)
+    return go.Candlestick(
+        x=x,
+        open=ohlc["Open"],
+        high=ohlc["High"],
+        low=ohlc["Low"],
+        close=ohlc["Close"],
+        name=name,
+        increasing_line_color=C_UP,
+        increasing_fillcolor=C_UP,
+        decreasing_line_color=C_DOWN,
+        decreasing_fillcolor=C_DOWN,
+        showlegend=True,
+    )
+
+
 def _plot_index_candle(
     ohlc: pd.DataFrame,
     market: str,
     as_of: date,
     out_path: Path,
 ) -> Path:
-    """지수 캔들 + MA20/50/120. 상승 빨강 / 하락 파랑. MA는 워밍업 후 250일만 표시."""
-    import matplotlib.pyplot as plt
-    import mplfinance as mpf
-    from matplotlib.lines import Line2D
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
-    _setup_korean_font()
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+    title = f"{market} 지수 · {as_of}"
     if ohlc is None or ohlc.empty or len(ohlc) < 5:
-        fig, ax = plt.subplots(figsize=FIGSIZE, dpi=FIG_DPI)
-        ax.text(0.5, 0.5, "OHLC 데이터 없음 (백필 필요)", ha="center", va="center", transform=ax.transAxes)
-        ax.set_title(f"{market} 지수 캔들 ({as_of})")
-        fig.tight_layout()
-        fig.savefig(out_path, bbox_inches="tight", facecolor="white")
-        plt.close(fig)
-        return out_path
+        return _empty_fig(title, "OHLC 데이터 없음 (백필 필요)", H_CANDLE, out_path)
 
-    # MA 워밍업: 표시 250일 + 120일 과거에서 MA 계산 → 최근 250일만 플롯
-    full = ohlc.sort_index()
-    need_n = VOL_WINDOW + MA_WARMUP
-    full = full.tail(need_n)
-    ma20 = full["Close"].rolling(20, min_periods=20).mean()
-    ma50 = full["Close"].rolling(50, min_periods=50).mean()
-    ma120 = full["Close"].rolling(120, min_periods=120).mean()
+    full = ohlc.sort_index().tail(VOL_WINDOW + MA_WARMUP)
+    close = full["Close"]
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma50 = close.rolling(50, min_periods=50).mean()
+    ma120 = close.rolling(120, min_periods=120).mean()
+    macd, signal, hist = _macd_series(close)
+    disp50 = (close / ma50.replace(0, np.nan)) * 100.0
+    disp120 = (close / ma120.replace(0, np.nan)) * 100.0
+    bbw = _bb_width(close)
+
     plot_df = full.tail(VOL_WINDOW).copy()
-    ma20_p = ma20.reindex(plot_df.index)
-    ma50_p = ma50.reindex(plot_df.index)
-    ma120_p = ma120.reindex(plot_df.index)
+    x = _to_dt_index(plot_df.index)
 
-    font_name = plt.rcParams.get("font.family", "sans-serif")
-    if isinstance(font_name, (list, tuple)):
-        font_name = font_name[0] if font_name else "sans-serif"
-    mc = mpf.make_marketcolors(
-        up="#d32f2f",
-        down="#1565c0",
-        edge="inherit",
-        wick={"up": "#d32f2f", "down": "#1565c0"},
-        ohlc="inherit",
+    fig = make_subplots(
+        rows=4,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.5, 0.2, 0.2, 0.1],
+        subplot_titles=("지수 + MA", "MACD", "이격도", "BB Width"),
     )
-    style = mpf.make_mpf_style(
-        marketcolors=mc,
-        facecolor="white",
-        gridstyle=":",
-        y_on_right=False,
-        rc={
-            "font.family": font_name,
-            "axes.unicode_minus": False,
-            "figure.facecolor": "white",
-        },
+    fig.add_trace(_candlestick_trace(plot_df, name=f"{market} 지수"), row=1, col=1)
+    fig.add_trace(
+        go.Scatter(x=x, y=ma20.reindex(plot_df.index), name="MA20", line=dict(color=C_ORANGE, width=1.6)),
+        row=1, col=1,
     )
-    mav_colors = ["#ef6c00", "#2e7d32", "#5e35b1"]  # 20, 50, 120
-    addplots = [
-        mpf.make_addplot(ma20_p, color=mav_colors[0], width=1.4),
-        mpf.make_addplot(ma50_p, color=mav_colors[1], width=1.4),
-        mpf.make_addplot(ma120_p, color=mav_colors[2], width=1.4),
-    ]
-    fig, axes = mpf.plot(
-        plot_df,
-        type="candle",
-        style=style,
-        addplot=addplots,
-        figsize=FIGSIZE,
-        returnfig=True,
-        datetime_format=DATE_FMT_SHORT,
-        title=f"{market} 지수 캔들 + MA20/50/120 ({as_of})",
-        ylabel="지수",
+    fig.add_trace(
+        go.Scatter(x=x, y=ma50.reindex(plot_df.index), name="MA50", line=dict(color=C_GREEN, width=1.6)),
+        row=1, col=1,
     )
-    ax = axes[0] if isinstance(axes, (list, np.ndarray)) else axes
-    ax.yaxis.set_major_formatter(_comma_formatter())
-    # datetime_format으로 이미 YY-MM-DD — 회전만 강제 (카테고리 축에 DateFormatter 금지)
-    targets = axes if isinstance(axes, (list, np.ndarray)) else [ax]
-    for a in targets:
+    fig.add_trace(
+        go.Scatter(x=x, y=ma120.reindex(plot_df.index), name="MA120", line=dict(color=C_PURPLE, width=1.6)),
+        row=1, col=1,
+    )
+
+    macd_p = macd.reindex(plot_df.index)
+    sig_p = signal.reindex(plot_df.index)
+    hist_p = hist.reindex(plot_df.index)
+    fig.add_trace(
+        go.Scatter(x=x, y=macd_p, name="MACD", line=dict(color=C_BLUE, width=1.4), legendgroup="macd"),
+        row=2, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=x, y=sig_p, name="Signal", line=dict(color=C_ORANGE, width=1.4), legendgroup="macd"),
+        row=2, col=1,
+    )
+    hist_colors = [C_UP if (isinstance(v, (int, float)) and np.isfinite(v) and v >= 0) else C_DOWN for v in hist_p.tolist()]
+    fig.add_trace(
+        go.Bar(x=x, y=hist_p, name="Hist", marker_color=hist_colors, opacity=0.75, legendgroup="macd"),
+        row=2, col=1,
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color=C_ZERO, row=2, col=1)
+
+    d50 = disp50.reindex(plot_df.index)
+    d120 = disp120.reindex(plot_df.index)
+    fig.add_trace(
+        go.Scatter(x=x, y=d50, name="이격도50", line=dict(color=C_GREEN, width=1.4), legendgroup="disp"),
+        row=3, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=x, y=d120, name="이격도120", line=dict(color=C_PURPLE, width=1.4), legendgroup="disp"),
+        row=3, col=1,
+    )
+    fig.add_hline(y=100, line_dash="dash", line_color=C_ZERO, row=3, col=1)
+
+    bbw_p = bbw.reindex(plot_df.index)
+    fig.add_trace(
+        go.Scatter(x=x, y=bbw_p, name="BB Width", line=dict(color=C_TEAL, width=1.5), legendgroup="bb"),
+        row=4, col=1,
+    )
+
+    fig.update_layout(**_base_layout(title, H_CANDLE), xaxis_rangeslider_visible=False)
+    fig.update_yaxes(title_text="지수", row=1, col=1)
+    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_yaxes(title_text="이격도", row=3, col=1)
+    fig.update_yaxes(title_text="BB Width", row=4, col=1)
+    _style_axes(fig, rows=4)
+
+    def _last(s):
         try:
-            _apply_horizontal_date_ticks(a, format_dates=False)
+            v = float(pd.to_numeric(s, errors="coerce").dropna().iloc[-1])
+            return v if np.isfinite(v) else float("nan")
         except Exception:
-            pass
-    handles = [
-        Line2D([0], [0], color=mav_colors[0], lw=1.5, label="MA20"),
-        Line2D([0], [0], color=mav_colors[1], lw=1.5, label="MA50"),
-        Line2D([0], [0], color=mav_colors[2], lw=1.5, label="MA120"),
-    ]
-    ax.legend(handles=handles, loc="upper left", fontsize=9, framealpha=0.92)
-    fig.set_size_inches(*FIGSIZE)
-    fig.set_dpi(FIG_DPI)
-    fig.savefig(out_path, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    return out_path
+            return float("nan")
 
-
-def _annotate_top_tv(ax, snap: pd.DataFrame, day_all: Optional[pd.DataFrame] = None) -> None:
-    """
-    당일 거래대금 상위 N 종목명 라벨 (산점도에 있는 점만).
-    오프셋 순환으로 겹침 완화 (adjustText 미사용).
-    """
-    if snap is None or snap.empty:
-        return
-    # 시장 당일 전체 기준 상위 N → 산점도 교집합
-    src = day_all if day_all is not None and not day_all.empty else snap
-    if "trading_value" not in src.columns:
-        return
-    tv = pd.to_numeric(src["trading_value"], errors="coerce")
-    ranked = src.loc[tv.notna() & (tv > 0)].copy()
-    if ranked.empty:
-        return
-    ranked = ranked.sort_values("trading_value", ascending=False).head(SCATTER_TOP_TV)
-    tickers = set(ranked["ticker"].astype(str))
-    labeled = snap[snap["ticker"].astype(str).isin(tickers)].copy()
-    if labeled.empty:
-        return
-    # 거래대금 순 유지
-    order = {str(t): i for i, t in enumerate(ranked["ticker"].astype(str))}
-    labeled["_ord"] = labeled["ticker"].astype(str).map(order)
-    labeled = labeled.sort_values("_ord")
-
-    offsets = [
-        (6, 5),
-        (6, -9),
-        (-6, 5),
-        (-6, -9),
-        (10, 0),
-        (-12, 0),
-        (6, 12),
-        (-6, 12),
-    ]
-    for i, (_, r) in enumerate(labeled.iterrows()):
-        name = r.get("name")
-        if name is None or (isinstance(name, float) and np.isnan(name)):
-            name = r.get("ticker", "")
-        name = str(name).strip()
-        if not name:
-            continue
-        ox, oy = offsets[i % len(offsets)]
-        oy += (i // len(offsets)) * 4
-        ax.annotate(
-            name,
-            xy=(float(r["atr_over_close"]), float(r["mcap"])),
-            xytext=(ox, oy),
-            textcoords="offset points",
-            fontsize=6.5,
-            color="#37474f",
-            alpha=0.92,
-            ha="left" if ox >= 0 else "right",
-            va="center",
-            zorder=5,
-        )
+    day_c = float(plot_df["Close"].iloc[-1])
+    note = (
+        f"당일 지수 {day_c:,.2f} / MACD {_last(macd_p):.2f} · "
+        f"이격도50 {_last(d50):.2f} · 이격도120 {_last(d120):.2f} · "
+        f"BB Width {_last(bbw_p):.4f}"
+    )
+    _add_day_note(fig, note)
+    return _write_png(fig, out_path, H_CANDLE)
 
 
 def _plot_scatter(
@@ -439,237 +438,220 @@ def _plot_scatter(
     as_of: date,
     out_path: Path,
     day_all: Optional[pd.DataFrame] = None,
+    index_close: Optional[float] = None,
+    day_vol: Optional[float] = None,
 ) -> Path:
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
+    import plotly.graph_objects as go
 
-    _setup_korean_font()
-    fig, ax = plt.subplots(figsize=FIGSIZE, dpi=FIG_DPI)
+    title = f"{market} 시총 대비 변동성 분포 · {as_of}"
     if snap is None or snap.empty:
-        ax.text(0.5, 0.5, "데이터 없음", ha="center", va="center", transform=ax.transAxes)
-    else:
-        ax.scatter(
-            snap["atr_over_close"],
-            snap["mcap"],
-            s=18,
-            alpha=0.45,
-            c="#1565c0" if market == "KOSPI" else "#c62828",
-            edgecolors="none",
-            zorder=2,
-            label="종목",
-        )
-        ax.set_yscale("log")
-        _apply_mcap_yticks(ax, snap["mcap"])
-        vals = pd.to_numeric(snap["atr_over_close"], errors="coerce").dropna()
-        if len(vals):
-            stats = [
-                ("평균", float(vals.mean()), "#2e7d32", "-"),
-                ("중앙값", float(vals.median()), "#ef6c00", "--"),
-                ("상위20%(P80)", float(vals.quantile(0.80)), "#c62828", "-."),
-                ("하위20%(P20)", float(vals.quantile(0.20)), "#6a1b9a", ":"),
-            ]
-            handles = [
-                Line2D(
-                    [0],
-                    [0],
-                    marker="o",
-                    color="w",
-                    markerfacecolor="#1565c0" if market == "KOSPI" else "#c62828",
-                    markersize=7,
-                    label="종목",
-                )
-            ]
-            for name, xv, color, ls in stats:
-                if not np.isfinite(xv):
-                    continue
-                ax.axvline(xv, color=color, ls=ls, lw=1.4, zorder=3)
-                handles.append(
-                    Line2D([0], [0], color=color, ls=ls, lw=1.4, label=f"{name} {xv:.4f}")
-                )
-            ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.92)
-        _annotate_top_tv(ax, snap, day_all=day_all)
+        return _empty_fig(title, "데이터 없음", H_SINGLE, out_path)
 
-    ax.set_xlabel("ATR14/종가")
-    ax.set_ylabel("시가총액")
-    ax.set_title(f"{market}: ATR14/종가 vs 시가총액 ({as_of})")
-    ax.grid(True, which="both", alpha=0.25)
-    fig.tight_layout()
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    return out_path
+    fig = go.Figure()
+    color = C_BLUE if market == "KOSPI" else C_UP
+    fig.add_trace(
+        go.Scatter(
+            x=snap["atr_over_close"],
+            y=snap["mcap"],
+            mode="markers",
+            name="종목",
+            marker=dict(size=7, color=color, opacity=0.45),
+            text=snap.get("name"),
+            hovertemplate="%{text}<br>ATR/종가=%{x:.4f}<br>시총=%{y:,.0f}<extra></extra>",
+        )
+    )
+    vals = pd.to_numeric(snap["atr_over_close"], errors="coerce").dropna()
+    if len(vals):
+        for name, xv, col, dash in (
+            ("평균", float(vals.mean()), C_GREEN, "solid"),
+            ("중앙값", float(vals.median()), C_ORANGE, "dash"),
+            ("상위20%(P80)", float(vals.quantile(0.80)), C_UP, "dot"),
+            ("하위20%(P20)", float(vals.quantile(0.20)), C_PURPLE, "dashdot"),
+        ):
+            if not np.isfinite(xv):
+                continue
+            fig.add_vline(
+                x=xv,
+                line_color=col,
+                line_dash=dash,
+                annotation_text=f"{name} {xv:.4f}",
+                annotation_position="top",
+            )
+
+    # 거래대금 상위 20 라벨
+    src = day_all if day_all is not None and not day_all.empty else snap
+    if "trading_value" in src.columns:
+        tv = pd.to_numeric(src["trading_value"], errors="coerce")
+        ranked = src.loc[tv.notna() & (tv > 0)].sort_values("trading_value", ascending=False).head(SCATTER_TOP_TV)
+        labeled = snap[snap["ticker"].astype(str).isin(set(ranked["ticker"].astype(str)))]
+        for _, r in labeled.iterrows():
+            nm = r.get("name") or r.get("ticker") or ""
+            fig.add_annotation(
+                x=float(r["atr_over_close"]),
+                y=float(r["mcap"]),
+                text=str(nm)[:10],
+                showarrow=False,
+                font=dict(size=9, color="#37474F"),
+                xanchor="left",
+                yanchor="middle",
+            )
+
+    fig.update_layout(**_base_layout(title, H_SINGLE))
+    fig.update_xaxes(title_text="ATR14/종가", showgrid=True, gridcolor=C_GRID)
+    fig.update_yaxes(title_text="시가총액", type="log", showgrid=True, gridcolor=C_GRID)
+    fig.add_annotation(
+        text="거래대금 상위 20개 종목",
+        xref="paper",
+        yref="paper",
+        x=0.0,
+        y=-0.08,
+        xanchor="left",
+        showarrow=False,
+        font=dict(size=11, color="#546E7A"),
+    )
+    ix = float(index_close) if index_close is not None and np.isfinite(index_close) else float("nan")
+    vv = float(day_vol) if day_vol is not None and np.isfinite(day_vol) else float("nan")
+    note = f"당일 지수 {ix:,.2f} / 시총가중 변동성 {vv:.4f}"
+    _add_day_note(fig, note)
+    return _write_png(fig, out_path, H_SINGLE)
+
+
+def _align_ohlc_to_dates(ohlc: pd.DataFrame, dates) -> pd.DataFrame:
+    if ohlc is None or ohlc.empty:
+        return pd.DataFrame()
+    o = ohlc.copy()
+    if not isinstance(o.index, pd.DatetimeIndex):
+        o.index = pd.to_datetime(o.index)
+    keys = pd.to_datetime(pd.Index(list(dates)))
+    # map date-only
+    o2 = o.copy()
+    o2.index = o2.index.normalize()
+    rows = []
+    idx = []
+    for d in keys:
+        dn = pd.Timestamp(d).normalize()
+        if dn in o2.index:
+            row = o2.loc[dn]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[-1]
+            rows.append(row)
+            idx.append(dn)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
 
 
 def _plot_vol_trend(
     vol: pd.Series,
-    index_close: pd.Series,
+    index_ohlc: pd.DataFrame,
     market: str,
     as_of: date,
     out_path: Path,
 ) -> Path:
-    """왼쪽=변동성(주축), 오른쪽=지수(twinx)."""
-    import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
-    _setup_korean_font()
-    fig, ax1 = plt.subplots(figsize=FIGSIZE, dpi=FIG_DPI)
-    vol_nn = vol.dropna() if vol is not None else pd.Series(dtype=float)
+    title = f"{market} 변동성 추이 (ATR 기준) · {as_of}"
+    day_ix = _day_close_from_ohlc(index_ohlc, as_of)
+    day_vol = float("nan")
 
-    if vol is None or vol_nn.empty:
-        ax1.text(
-            0.5,
-            0.5,
-            "변동성 데이터 없음 (시총·ATR 유효일 확인)",
-            ha="center",
-            va="center",
-            transform=ax1.transAxes,
-        )
-        log.warning("%s 변동성 시리즈 유효점 0", market)
-    else:
-        vol = vol.sort_index()
-        sma20 = vol.rolling(20, min_periods=1).mean()
-        (ln_vol,) = ax1.plot(
-            vol.index,
-            vol.values,
-            color="#2e7d32",
-            lw=2.0,
-            label="시장 변동성(시총가중)",
-            zorder=3,
-        )
-        (ln_sma,) = ax1.plot(
-            sma20.index,
-            sma20.values,
-            color="#ef6c00",
-            lw=1.5,
-            label="Vol SMA20",
-            zorder=3,
-        )
-        ax1.set_ylabel("ATR14/종가 (시총가중)", color="#2e7d32")
-        ax1.tick_params(axis="y", labelcolor="#2e7d32")
-        vmin = float(np.nanmin(vol.values))
-        vmax = float(np.nanmax(vol.values))
-        pad = max((vmax - vmin) * 0.12, 1e-4)
-        ax1.set_ylim(max(0.0, vmin - pad), vmax + pad)
+    if vol is None or vol.dropna().empty:
+        return _empty_fig(title, "변동성 데이터 없음", H_DUAL, out_path)
 
-        handles = [ln_vol, ln_sma]
-        labels = [ln_vol.get_label(), ln_sma.get_label()]
+    vol = vol.sort_index()
+    x = _to_dt_index(vol.index)
+    sma10 = vol.rolling(10, min_periods=1).mean()
+    sma20 = vol.rolling(20, min_periods=1).mean()
+    try:
+        day_vol = float(vol.dropna().iloc[-1])
+    except Exception:
+        pass
 
-        if index_close is not None and not index_close.empty:
-            ix = index_close.reindex(vol.index)
-            if ix.notna().any():
-                ax2 = ax1.twinx()
-                (ln_ix,) = ax2.plot(
-                    ix.index,
-                    ix.values,
-                    color="#546e7a",
-                    lw=1.3,
-                    alpha=0.9,
-                    label=f"{market} 지수",
-                    zorder=2,
-                )
-                ax2.set_ylabel(f"{market} 지수", color="#546e7a")
-                ax2.tick_params(axis="y", labelcolor="#546e7a")
-                ax2.yaxis.set_major_formatter(_comma_formatter())
-                handles.append(ln_ix)
-                labels.append(ln_ix.get_label())
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Scatter(x=x, y=vol.values, name="시장 변동성(시총가중)", line=dict(color=C_GREEN, width=2.2)),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(x=x, y=sma10.values, name="Vol SMA10", line=dict(color=C_PURPLE, width=1.6, dash="dash")),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(x=x, y=sma20.values, name="Vol SMA20", line=dict(color=C_ORANGE, width=1.6, dash="dot")),
+        secondary_y=False,
+    )
+    ohlc_a = _align_ohlc_to_dates(index_ohlc, vol.index)
+    if not ohlc_a.empty:
+        fig.add_trace(_candlestick_trace(ohlc_a, name=f"{market} 지수(캔들)"), secondary_y=True)
 
-        ax1.legend(handles, labels, loc="upper left", fontsize=9, framealpha=0.92)
-
-    ax1.set_xlabel("날짜")
-    ax1.set_title(f"{market}: 시장 변동성 추이 + 지수 (최근 {VOL_WINDOW}거래일, {as_of})")
-    ax1.grid(True, alpha=0.25, zorder=0)
-    _apply_horizontal_date_ticks(ax1)
-    fig.tight_layout()
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    return out_path
+    fig.update_layout(**_base_layout(title, H_DUAL), xaxis_rangeslider_visible=False)
+    fig.update_yaxes(title_text="ATR14/종가 (시총가중)", secondary_y=False, showgrid=True, gridcolor=C_GRID)
+    fig.update_yaxes(title_text=f"{market} 지수", secondary_y=True, showgrid=False)
+    fig.update_xaxes(tickformat="%y-%m-%d", showgrid=True, gridcolor=C_GRID)
+    _add_day_note(fig, f"당일 지수 {day_ix:,.2f} / 변동성 {day_vol:.4f}")
+    return _write_png(fig, out_path, H_DUAL)
 
 
 def _plot_momentum_speed(
     mom: pd.DataFrame,
-    index_close: pd.Series,
+    index_ohlc: pd.DataFrame,
     market: str,
     as_of: date,
     out_path: Path,
 ) -> Path:
-    """왼쪽=모멘텀 속도 20·50 + 0선, 오른쪽=지수(twinx)."""
-    import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
-    _setup_korean_font()
-    fig, ax1 = plt.subplots(figsize=FIGSIZE, dpi=FIG_DPI)
+    title = f"{market} 모멘텀 속도 · {as_of}"
+    day_ix = _day_close_from_ohlc(index_ohlc, as_of)
+    m20 = m50 = float("nan")
+
     if mom is None or mom.empty or not any(c in mom.columns for c in ("mom_20", "mom_50")):
-        ax1.text(0.5, 0.5, "데이터 없음", ha="center", va="center", transform=ax1.transAxes)
-    else:
-        ax1.axhline(0.0, color="#757575", lw=1.2, ls="-", zorder=1)
-        ylim_probe = mom[["mom_20", "mom_50"]].stack().dropna()
-        if not ylim_probe.empty:
-            ylo = float(ylim_probe.min())
-            yhi = float(ylim_probe.max())
-            pad = max((yhi - ylo) * 0.1, 0.05)
-            ax1.set_ylim(ylo - pad, yhi + pad)
-            ax1.axhspan(0, ax1.get_ylim()[1], color="#e8f5e9", alpha=0.45, zorder=0)
-            ax1.axhspan(ax1.get_ylim()[0], 0, color="#ffebee", alpha=0.45, zorder=0)
+        return _empty_fig(title, "데이터 없음", H_DUAL, out_path)
 
-        handles = []
-        labels = []
-        if "mom_20" in mom.columns:
-            (ln20,) = ax1.plot(
-                mom.index,
-                mom["mom_20"],
-                color=MOMENTUM_COLORS[20],
-                lw=1.8,
-                label="모멘텀 속도 20일",
-                zorder=3,
-            )
-            handles.append(ln20)
-            labels.append(ln20.get_label())
-        if "mom_50" in mom.columns:
-            (ln50,) = ax1.plot(
-                mom.index,
-                mom["mom_50"],
-                color=MOMENTUM_COLORS[50],
-                lw=1.8,
-                label="모멘텀 속도 50일",
-                zorder=3,
-            )
-            handles.append(ln50)
-            labels.append(ln50.get_label())
+    x = _to_dt_index(mom.index)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_hline(y=0, line_color=C_ZERO, line_width=1.2, secondary_y=False)
 
-        ax1.set_ylabel("하루 평균 변화율 (%/일)")
+    if "mom_20" in mom.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=mom["mom_20"],
+                name="모멘텀 속도 20일",
+                line=dict(color=C_GREEN, width=1.9),
+            ),
+            secondary_y=False,
+        )
+        try:
+            m20 = float(mom["mom_20"].dropna().iloc[-1])
+        except Exception:
+            pass
+    if "mom_50" in mom.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=mom["mom_50"],
+                name="모멘텀 속도 50일",
+                line=dict(color=C_PURPLE, width=1.9),
+            ),
+            secondary_y=False,
+        )
+        try:
+            m50 = float(mom["mom_50"].dropna().iloc[-1])
+        except Exception:
+            pass
 
-        if index_close is not None and not index_close.empty:
-            ix = index_close.reindex(mom.index)
-            if ix.notna().any():
-                ax2 = ax1.twinx()
-                (ln_ix,) = ax2.plot(
-                    ix.index,
-                    ix.values,
-                    color="#90a4ae",
-                    lw=1.2,
-                    alpha=0.75,
-                    label=f"{market} 지수",
-                    zorder=2,
-                )
-                ax2.set_ylabel(f"{market} 지수", color="#78909c")
-                ax2.tick_params(axis="y", labelcolor="#78909c")
-                ax2.yaxis.set_major_formatter(_comma_formatter())
-                handles.append(ln_ix)
-                labels.append(ln_ix.get_label())
+    ohlc_a = _align_ohlc_to_dates(index_ohlc, mom.index)
+    if not ohlc_a.empty:
+        fig.add_trace(_candlestick_trace(ohlc_a, name=f"{market} 지수(캔들)"), secondary_y=True)
 
-        ax1.legend(handles, labels, loc="upper left", fontsize=9, framealpha=0.92)
-
-    ax1.set_xlabel("날짜")
-    ax1.set_title(f"{market}: 모멘텀 속도 + 지수 (ROC÷N, 최근 {VOL_WINDOW}거래일, {as_of})")
-    ax1.grid(True, alpha=0.25, zorder=0)
-    _apply_horizontal_date_ticks(ax1)
-    fig.tight_layout()
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    return out_path
+    fig.update_layout(**_base_layout(title, H_DUAL), xaxis_rangeslider_visible=False)
+    fig.update_yaxes(title_text="하루 평균 변화율 (%/일)", secondary_y=False, showgrid=True, gridcolor=C_GRID)
+    fig.update_yaxes(title_text=f"{market} 지수", secondary_y=True, showgrid=False)
+    fig.update_xaxes(tickformat="%y-%m-%d", showgrid=True, gridcolor=C_GRID)
+    _add_day_note(fig, f"당일 지수 {day_ix:,.2f} / 모멘텀20 {m20:.3f} · 모멘텀50 {m50:.3f}")
+    return _write_png(fig, out_path, H_DUAL)
 
 
 def _write_volatility_docs(
@@ -679,7 +661,6 @@ def _write_volatility_docs(
     sections: list[dict],
     metrics: Optional[dict] = None,
 ) -> tuple[Path, Path]:
-    """outputs/.../volatility.md (기존) · volatility.html (디자인 템플릿)."""
     from design_html import date_iso, date_kr, write_design_html
 
     title = f"마켓 변동성 {as_of}"
@@ -695,13 +676,13 @@ def _write_volatility_docs(
             name = Path(png).name
             t = art.get("title") or name
             md.append(f"### {t}\n\n![{t}]({name})\n")
-    md_path = out_dir / "volatility.md"
+    md_path = out_dir / "market.md"
     md_path.write_text("\n".join(md), encoding="utf-8")
 
     m = metrics or {}
     html_path = write_design_html(
         "volatility_design.html",
-        out_dir / "volatility.html",
+        out_dir / "market.html",
         {
             "DATE": date_iso(as_of),
             "DATE_KR": date_kr(as_of),
@@ -722,7 +703,7 @@ def render_market_volatility(
     out_dir: Optional[Path] = None,
 ) -> dict:
     """
-    시장별(코스피→코스닥): 캔들 → 산점도 → 변동성추이 → 모멘텀속도 + volatility.md/html.
+    시장별(코스피→코스닥): 캔들 → 산점도 → 변동성추이 → 모멘텀속도 + market.md/html.
     """
     eng = engine()
     if as_of is None:
@@ -733,13 +714,15 @@ def render_market_volatility(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    from render import cleanup_publish_artifacts
+
+    cleanup_publish_artifacts(out_dir)
     for old in out_dir.glob("05_volatility_*.png"):
         try:
             old.unlink()
         except OSError:
             pass
 
-    # ATR·모멘텀·캔들 MA120 워밍업 + 250거래일
     need = VOL_WINDOW + max(ATR_N, max(MOMENTUM_PERIODS), MA_WARMUP) + 10
     dates = _trading_dates(eng, as_of, need)
     if len(dates) < ATR_N + 5:
@@ -810,18 +793,27 @@ def render_market_volatility(
         idx = _load_index(eng, INDEX_CODES[market], load_start, as_of)
         mom = _compute_momentum_speed(idx).reindex(plot_dates)
 
+        last_v = float(vol.dropna().iloc[-1]) if vol is not None and vol.dropna().size else np.nan
+        day_ix = float("nan")
+        try:
+            if ohlc is not None and not ohlc.empty:
+                day_ix = float(ohlc["Close"].iloc[-1])
+        except Exception:
+            day_ix = float("nan")
         p_sc = _plot_scatter(
             snap,
             market,
             as_of,
             out_dir / f"05_volatility_{mkt_l}_scatter.png",
             day_all=day_all,
+            index_close=day_ix,
+            day_vol=last_v,
         )
         p_tr = _plot_vol_trend(
-            vol, idx, market, as_of, out_dir / f"05_volatility_{mkt_l}_trend.png"
+            vol, ohlc, market, as_of, out_dir / f"05_volatility_{mkt_l}_trend.png"
         )
         p_mo = _plot_momentum_speed(
-            mom, idx, market, as_of, out_dir / f"05_volatility_{mkt_l}_momentum.png"
+            mom, ohlc, market, as_of, out_dir / f"05_volatility_{mkt_l}_momentum.png"
         )
         paths.extend([p_cd, p_sc, p_tr, p_mo])
         sec_arts = [
@@ -857,7 +849,6 @@ def render_market_volatility(
         articles.extend(sec_arts)
         sections.append({"title": sec_title, "articles": sec_arts})
         n_pts = 0 if snap is None else len(snap)
-        last_v = float(vol.dropna().iloc[-1]) if vol is not None and vol.dropna().size else np.nan
         last_s = f"{last_v:.4f}" if np.isfinite(last_v) else "-"
         summaries.append(
             f"{market} 캔들 {n_bars}일, 산점도 {n_pts}종, 변동성 {last_s} (유효일 {nn})"
@@ -875,23 +866,17 @@ def render_market_volatility(
         metrics["total_stocks"] = "-"
 
     text = (
-        f"{as_of} 마켓 변동성. "
-        f"캔들: 지수 OHLC + MA20/50/120 (최근 {VOL_WINDOW}거래일, MA 워밍업 {MA_WARMUP}일). "
-        f"산점도: ATR14/종가≥{ATR_OC_MAX} 제외, 평균·중앙값·P80·P20 수직선, 거래대금 상위{SCATTER_TOP_TV} 라벨. "
-        f"추이: 시총가중 ATR14/종가 + Vol SMA20 + 지수(우축). "
-        f"모멘텀 속도: ROC(N)%÷N (%/일) 20·50일 + 지수(우축). "
+        f"{as_of} 마켓 변동성 (Plotly). "
+        f"캔들: 지수 OHLC + MA20/50/120 + MACD·이격도·BB Width (최근 {VOL_WINDOW}거래일). "
+        f"산점도: ATR14/종가≥{ATR_OC_MAX} 제외, 거래대금 상위{SCATTER_TOP_TV} 라벨. "
+        f"추이: 시총가중 ATR14/종가 + Vol SMA10/20 + 지수 캔들(우축). "
+        f"모멘텀 속도: ROC(N)%÷N (%/일) 20·50일 + 지수 캔들(우축). "
         + " / ".join(summaries)
     )
     md_path, html_path = _write_volatility_docs(
         out_dir, as_of, text, sections, metrics=metrics
     )
-    try:
-        from render import capture_html_report
-
-        capture = capture_html_report(html_path, "volatility")
-    except Exception as e:
-        log.warning("변동성 풀페이지 캡처 실패: %s", e)
-        capture = {"full": None, "sections": [], "jpeg": None}
+    cleanup_publish_artifacts(out_dir)
     log.info("변동성 문서: %s / %s (%s)", out_dir, md_path.name, html_path.name)
     return {
         "paths": paths,
@@ -901,6 +886,5 @@ def render_market_volatility(
         "as_of": as_of,
         "md": md_path,
         "html": html_path,
-        "capture": capture,
         "out_dir": out_dir,
     }

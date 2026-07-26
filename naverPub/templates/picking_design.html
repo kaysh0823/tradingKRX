@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="{{DATE}} Picking 통합 랭킹" />
-  <title>Picking | {{DATE}}</title>
+  <meta name="description" content="{{DATE}} 종목 선정 장기·단기 모멘텀 랭킹" />
+  <title>종목 선정 | {{DATE}}</title>
   <style>
 {{BASE_CSS}}
   </style>
@@ -14,11 +14,11 @@
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark">PK</div>
-        <span>Picking Daily</span>
+        <span>종목 선정</span>
       </div>
       <nav class="nav" aria-label="페이지 목차">
         <a href="#overview">Overview</a>
-        <a href="#pick">Top50</a>
+        <a href="#pick">모멘텀 Top50</a>
         <a href="#screening">스크리닝 차트</a>
         <a href="#methodology">Methodology</a>
       </nav>
@@ -27,18 +27,18 @@
       <div class="hero-grid">
         <div>
           <div class="eyebrow">Daily Market Intelligence</div>
-          <h1>Picking<br />통합 랭킹</h1>
+          <h1>종목 선정</h1>
           <div class="hero-date">{{DATE_KR}} · KOSPI + KOSDAQ</div>
           <p class="hero-summary">
-            에너지배율·RS·주가위치·Talent 네 지표의 Top50 순위를 점수로 환산해 합산합니다.
-            시장을 가리지 않고 당일 모멘텀·상대강도·가격위치·재능 신호가 겹치는 종목을 가려냅니다.
+            에너지배율·RS·주가위치·Talent Top50 순위 환산점수에 장기·단기 가중치를 곱해
+            두 가지 가중합 순위를 만듭니다. 종가 기준 신고가 여부도 함께 표시합니다.
           </p>
         </div>
         <aside class="hero-note">
           <strong>읽는 순서</strong>
           <p>
-            ① picking 점수 Top50 표 → ② 스크리닝 패턴 3개 이상 종목 차트 →
-            ③ 신고가(50·120·250일) 여부 확인
+            ① 장기 모멘텀 Top50 → ② 단기 모멘텀 Top50 →
+            ③ 스크리닝 패턴 3개 이상 종목 차트
           </p>
         </aside>
       </div>
@@ -52,29 +52,30 @@
       <article class="metric b">
         <div class="metric-label">선정 종목</div>
         <div class="metric-value">{{PICK_COUNT}}</div>
-        <div class="metric-meta">합산 점수 &gt; 0 Top50</div>
+        <div class="metric-meta">장기 / 단기 Top50</div>
       </article>
       <article class="metric c">
-        <div class="metric-label">1위</div>
+        <div class="metric-label">장기 1위</div>
         <div class="metric-value">{{PICK_TOP}}</div>
         <div class="metric-meta">{{PICK_TOP_SCORE}}점</div>
       </article>
       <article class="metric d">
-        <div class="metric-label">스크리닝 통과</div>
-        <div class="metric-value">{{SCREEN_COUNT}}</div>
-        <div class="metric-meta">패턴 3개 이상</div>
+        <div class="metric-label">단기 1위</div>
+        <div class="metric-value">{{PICK_SHORT_TOP}}</div>
+        <div class="metric-meta">{{PICK_SHORT_SCORE}}점 · 스크리닝 {{SCREEN_COUNT}}</div>
       </article>
     </section>
     <section class="section" id="pick">
       <div class="section-head">
         <div>
           <div class="section-kicker">Section 01</div>
-          <h2>Picking Top50</h2>
+          <h2>장기·단기 모멘텀</h2>
           <p class="section-desc">
-            네 지표 Top50 순위 환산점수의 합산 순위입니다. 지표 칸은 원본 값(에너지·RS120·주가위치·talent), 신고가여부는 최장 달성 구간입니다.
+            지표 칸은 원본 값(에너지·RS120·주가위치·talent), picking점수는 유형별 가중합,
+            신고가여부는 종가 기준 최장 달성 구간입니다.
           </p>
         </div>
-        <div class="market-badge" style="color: var(--violet)"><i></i>Unified</div>
+        <div class="market-badge" style="color: var(--violet)"><i></i>Long · Short</div>
       </div>
       <div class="chart-grid">
 {{PICK_CARD_HTML}}
@@ -87,7 +88,7 @@
           <h2>스크리닝 통과 차트</h2>
           <p class="section-desc">
             51번 Picking 스크리닝에서 서로 다른 패턴 3개 이상에 선정된 종목입니다.
-            패턴 수 많은 순·동률 시 picking점수 순으로 정렬합니다.
+            패턴 수 많은 순·동률 시 장기 picking점수 순으로 정렬합니다.
           </p>
         </div>
         <div class="market-badge" style="color: var(--cyan)"><i></i>Screen · {{SCREEN_COUNT}}</div>
@@ -102,15 +103,19 @@
       <div class="method-grid">
         <div class="method-item">
           <b>배점</b>
-          <span>지표별 1위 250점 · 50위 200점. 선형 보간 score = 250 − (순위−1)×(50/49). Top50 밖은 0점.</span>
+          <span>지표별 1위 250점 · 50위 50점. 선형 보간 score = 250 − (순위−1)×(200/49). Top50 밖은 0점.</span>
         </div>
         <div class="method-item">
-          <b>지표 재사용</b>
-          <span>에너지배율(거래대금 상위50→3일배율), RS·주가위치·Talent(시총 5,000억↑)의 시장별 Top50 순위를 그대로 사용합니다.</span>
+          <b>장기 모멘텀</b>
+          <span>추세추종 가중합: RS 0.50 / 주가위치 0.30 / talent 0.10 / 에너지배율 0.10.</span>
+        </div>
+        <div class="method-item">
+          <b>단기 모멘텀</b>
+          <span>급등 가중합: 주가위치 0.40 / RS 0.20 / talent 0.20 / 에너지배율 0.20.</span>
         </div>
         <div class="method-item">
           <b>표 표시</b>
-          <span>지표 칸은 원값(3일 에너지배율, rs_120, 주가위치 0~1, talent 지수). Top50 밖은 -. picking점수만 환산 합산·그라데이션.</span>
+          <span>지표 칸은 원값. Top50 밖은 -. picking점수는 유형별 가중합·그라데이션. 4지표 Top50에 한 번도 못 든 종목은 제외.</span>
         </div>
         <div class="method-item">
           <b>스크리닝 차트</b>
@@ -118,12 +123,12 @@
         </div>
         <div class="method-item">
           <b>신고가여부</b>
-          <span>당일 고가가 직전 50·120·250거래일 고가 최고를 넘으면 최장 구간(예: 250일)을 표기, 아니면 -.</span>
+          <span>당일 종가가 직전 50·120·250거래일 종가 최고를 넘으면 최장 구간(예: 250일)을 표기, 아니면 -.</span>
         </div>
       </div>
     </section>
     <footer>
-      <span>Picking Daily · {{DATE}}</span>
+      <span>종목 선정 · {{DATE}}</span>
       <span>본 자료는 정보 제공 목적이며 투자 판단의 최종 책임은 투자자에게 있습니다.</span>
     </footer>
   </main>

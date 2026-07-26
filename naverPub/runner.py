@@ -172,18 +172,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         screen_pass = None
 
-    from notify import count_sec_pngs
+    from notify import count_top_pngs
 
-    sec_counts = count_sec_pngs(root)
+    png_counts = count_top_pngs(root)
     summary = (
         f"naverPub {as_of_dash} 완료\n"
         f"출력 루트: {root}\n"
         f"폴더: {', '.join(out_paths)}\n"
         f"스크리닝 통과: {screen_pass if screen_pass is not None else '-'}\n"
-        f"_sec: tickers={sec_counts.get('tickers', 0)} "
-        f"martket={sec_counts.get('martket', 0)} "
-        f"pick={sec_counts.get('pick', 0)} "
-        f"etfs={sec_counts.get('etfs', 0)}"
+        f"PNG: tickers={png_counts.get('tickers', 0)} "
+        f"martket={png_counts.get('martket', 0)} "
+        f"pick={png_counts.get('pick', 0)} "
+        f"etfs={png_counts.get('etfs', 0)}"
     )
     log.info(summary)
     if errors:

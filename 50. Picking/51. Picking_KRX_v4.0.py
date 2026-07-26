@@ -4206,4 +4206,4 @@ def create_charts_for_selected_stocks(selected_stock_list, rs_df, money, risk, e
 export_screening_summary_html(selected_df, indicators_data, engine)
 
 # 2) 선별 종목 차트 생성
-# create_charts_for_selected_stocks(selected_stock36, rs_df, money, risk, engine)
+# create_charts_for_selected_stocks(selected_stock35, rs_df, money, risk, engine)

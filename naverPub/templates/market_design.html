@@ -18,12 +18,12 @@
       </div>
       <nav class="nav" aria-label="페이지 목차">
         <a href="#overview">Overview</a>
+        <a href="#tv">거래대금</a>
         <a href="#energy">에너지</a>
         <a href="#rs">RS</a>
         <a href="#pos">주가위치</a>
         <a href="#talent">Talent</a>
         <a href="#high">신고가</a>
-        <a href="#low">신저가</a>
         <a href="#methodology">Methodology</a>
       </nav>
     </header>
@@ -35,13 +35,13 @@
           <div class="hero-date">{{DATE_KR}} · KOSPI / KOSDAQ</div>
           <p class="hero-summary">
             지표별로 코스피·코스닥을 나란히 비교합니다.
-            에너지배율, RS, 주가위치, Talent, 신고가·신저가를 시장 내 기준으로 점검합니다.
+            거래대금, 에너지배율, RS, 주가위치, Talent, 신고가를 시장 내 기준으로 점검합니다.
           </p>
         </div>
         <aside class="hero-note">
           <strong>읽는 순서</strong>
           <p>
-            ① 에너지배율 → ② RS → ③ 주가위치 → ④ Talent → ⑤ 신고가 → ⑥ 신저가.
+            ① 거래대금순위 → ② 에너지배율 → ③ RS → ④ 주가위치 → ⑤ Talent → ⑥ 신고가.
             각 지표 안에서 코스피 다음 코스닥 순입니다.
           </p>
         </aside>
@@ -75,16 +75,20 @@
       <h2 style="font-size:30px">분석 기준</h2>
       <div class="method-grid">
         <div class="method-item">
+          <b>거래대금순위</b>
+          <span>시장별 당일 거래대금 내림차순 Top50. 당일·3일 상승률(기준일종가/3거래일전종가−1) 병기.</span>
+        </div>
+        <div class="method-item">
           <b>에너지배율</b>
-          <span>시장별 당일 거래대금 상위 50종. (거래대금 시장비중)÷(시총 시장비중). 3일·당일 배율.</span>
+          <span>시장별 당일 거래대금 상위 50종. (거래대금 시장비중)÷(시총 시장비중)에 tanh(등락%/15) 방향가중. 당일=당일등락, 3일=3거래일 누적수익률. 정렬은 방향반영 3일배율. 현재가 옆 당일·3일 상승률 병기.</span>
         </div>
         <div class="method-item">
           <b>RS</b>
-          <span>시총 5,000억 이상. 시장 내 rs_20·50·120·200 백분위 평균으로 순위.</span>
+          <span>시총 5,000억 이상. 시장 내 rs_20·50·120·200 백분위 및 평균(rs_avg)으로 순위. 당일·3일 상승률 병기.</span>
         </div>
         <div class="method-item">
           <b>주가위치</b>
-          <span>시총 5,000억 이상. (현재가−120일최저)/(120일최고−최저). 고가·저가 기준, 0~1.</span>
+          <span>시총 5,000억 이상. 정렬은 120일 고·저가 위치. 20·50일은 종가 최고·최저 기준 위치(0~1)를 추가 표시.</span>
         </div>
         <div class="method-item">
           <b>Talent</b>
@@ -92,11 +96,7 @@
         </div>
         <div class="method-item">
           <b>신고가</b>
-          <span>시장별 최장 구간 신고가. 구간대비(%)는 구간 최저가 대비 상승률.</span>
-        </div>
-        <div class="method-item">
-          <b>신저가</b>
-          <span>시장별 최장 구간 신저가. 구간대비(%)는 구간 최고가 대비 하락률.</span>
+          <span>당일 종가가 직전 50·120·200일 종가 최고를 경신. 최장 구간만 표기. 구간대비(%)는 구간 종가 최저 대비 상승률.</span>
         </div>
       </div>
     </section>

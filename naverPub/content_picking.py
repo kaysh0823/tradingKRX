@@ -1,9 +1,9 @@
 """
-Picking: 에너지배율·RS·주가위치·talent Top50 순위 점수를 합산한 통합 랭킹.
+종목 선정: 에너지배율·RS·주가위치·talent Top50 순위 점수를 가중 합산한 이중 랭킹.
 
-배점(합산용): 1위=250, 50위=200, 선형 보간
-  score = 250 - (rank-1) * (50/49)
-표 표시: 4지표 컬럼은 원본 값 (Top50 밖 '-'), picking점수는 환산 점수 합.
+배점: 1위=250, 50위=50, 선형 보간
+  score = 250 - (rank-1) * (200/49)
+표 표시: 4지표 컬럼은 원본 값, picking점수는 유형별 가중합.
 """
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ from content_market import MARKETS, build_all_market
 log = logging.getLogger("naverPub.content_picking")
 
 SCORE_TOP = 250.0
-SCORE_BOTTOM = 200.0
+SCORE_BOTTOM = 50.0
 TOP_N = 50
-SCORE_STEP = (SCORE_TOP - SCORE_BOTTOM) / (TOP_N - 1)  # 50/49
+SCORE_STEP = (SCORE_TOP - SCORE_BOTTOM) / (TOP_N - 1)  # 200/49
 
 # (market_key, display_col, raw_source_cols 우선순위, round_digits)
 METRIC_SPECS = (
@@ -30,6 +30,29 @@ METRIC_SPECS = (
     ("rs", "RS", ("rs_120", "rs_avg"), 2),
     ("pos", "주가위치", ("주가위치",), 2),
     ("talent", "talent", ("talent 지수",), 3),
+)
+
+METRIC_COLS = ("에너지배율", "RS", "주가위치", "talent")
+
+# 장기모멘텀형(추세추종) / 단기모멘텀형(급등)
+WEIGHT_SETS: dict[str, dict[str, float]] = {
+    "long": {
+        "RS": 0.50,
+        "주가위치": 0.30,
+        "talent": 0.10,
+        "에너지배율": 0.10,
+    },
+    "short": {
+        "주가위치": 0.40,
+        "RS": 0.20,
+        "talent": 0.20,
+        "에너지배율": 0.20,
+    },
+}
+
+PICK_TYPE_META = (
+    ("long", "장기 모멘텀", "추세추종 · RS 0.50 / 주가위치 0.30 / talent 0.10 / 에너지 0.10"),
+    ("short", "단기 모멘텀", "급등 · 주가위치 0.40 / RS 0.20 / talent 0.20 / 에너지 0.20"),
 )
 
 PICK_COLS = [
@@ -47,7 +70,7 @@ PICK_COLS = [
 
 
 def rank_to_score(rank: int) -> float:
-    """1→250, 50→200. 범위 밖은 0."""
+    """1→250, 50→50. 범위 밖은 0."""
     try:
         r = int(rank)
     except (TypeError, ValueError):
@@ -89,7 +112,7 @@ def _raw_metric_value(row: pd.Series, source_cols: tuple[str, ...]):
 
 
 def _high_label_map(market: dict) -> dict[str, str]:
-    """티커 → '250일' 등 (최장 신고가 구간)."""
+    """티커 → '250일' 등 (최장 종가 신고가 구간)."""
     out: dict[str, str] = {}
     for mkt in MARKETS:
         hdf = (market.get(mkt) or {}).get("high")
@@ -114,18 +137,8 @@ def _high_label_map(market: dict) -> dict[str, str]:
     return out
 
 
-def build_picking_rank(
-    as_of: Optional[date] = None,
-    market: Optional[dict] = None,
-    top_n: int = TOP_N,
-) -> pd.DataFrame:
-    """
-    시장별 4지표 Top50 순위 → 환산점수 합산 → 통합 TopN.
-    표 컬럼(에너지배율/RS/주가위치/talent)에는 원본 값을 넣음.
-    """
-    if market is None:
-        market = build_all_market(as_of)
-
+def _collect_metric_bag(market: dict) -> dict[str, dict]:
+    """시장별 4지표 Top50 → 티커별 환산점수·원값 가방."""
     bag: dict[str, dict] = {}
 
     for mkt in MARKETS:
@@ -157,10 +170,6 @@ def build_picking_rank(
                         "RS": np.nan,
                         "주가위치": np.nan,
                         "talent": np.nan,
-                        "_dig_에너지배율": 2,
-                        "_dig_RS": 2,
-                        "_dig_주가위치": 2,
-                        "_dig_talent": 3,
                     }
                 sc_key = f"_sc_{disp_col}"
                 prev_sc = float(bag[tk].get(sc_key) or 0.0)
@@ -174,13 +183,34 @@ def build_picking_rank(
                     bag[tk]["종목명"] = row.get("종목명")
                 if row.get("현재가") is not None and pd.notna(row.get("현재가")):
                     bag[tk]["현재가"] = row.get("현재가")
+    return bag
 
-    high_map = _high_label_map(market)
+
+def build_picking_rank(
+    as_of: Optional[date] = None,
+    market: Optional[dict] = None,
+    top_n: int = TOP_N,
+    weight_key: str = "long",
+    bag: Optional[dict[str, dict]] = None,
+    high_map: Optional[dict[str, str]] = None,
+) -> pd.DataFrame:
+    """
+    유형별 가중합 TopN.
+    4지표 중 한 번도 Top50에 못 든 종목은 bag에 없어 자동 제외.
+    """
+    if market is None and bag is None:
+        market = build_all_market(as_of)
+    if bag is None:
+        bag = _collect_metric_bag(market or {})
+    if high_map is None:
+        high_map = _high_label_map(market or {})
+
+    weights = WEIGHT_SETS.get(weight_key) or WEIGHT_SETS["long"]
     rows = []
     for d in bag.values():
-        total = float(
-            d["_sc_에너지배율"] + d["_sc_RS"] + d["_sc_주가위치"] + d["_sc_talent"]
-        )
+        total = 0.0
+        for col in METRIC_COLS:
+            total += float(d.get(f"_sc_{col}") or 0.0) * float(weights.get(col, 0.0))
         if total <= 0:
             continue
         rows.append(
@@ -214,7 +244,20 @@ def build_all_picking(
     as_of: Optional[date] = None,
     market: Optional[dict] = None,
 ) -> dict[str, pd.DataFrame]:
-    """렌더용: {'pick': DataFrame}."""
-    df = build_picking_rank(as_of=as_of, market=market)
-    log.info("Picking Top%d: %d종", TOP_N, len(df))
-    return {"pick": df}
+    """렌더용: {'long': DataFrame, 'short': DataFrame}."""
+    if market is None:
+        market = build_all_market(as_of)
+    bag = _collect_metric_bag(market)
+    high_map = _high_label_map(market)
+    out: dict[str, pd.DataFrame] = {}
+    for key, title, _cap in PICK_TYPE_META:
+        df = build_picking_rank(
+            as_of=as_of,
+            market=market,
+            weight_key=key,
+            bag=bag,
+            high_map=high_map,
+        )
+        out[key] = df
+        log.info("%s Top%d: %d종", title, TOP_N, len(df))
+    return out

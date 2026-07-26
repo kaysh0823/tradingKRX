@@ -11,8 +11,11 @@ timedatectl   # Time zone: Asia/Seoul 확인
 
 sudo apt update
 sudo apt install -y python3.11 python3.11-venv python3-pip \
-  mysql-server git fonts-nanum fonts-nanum-coding
+  mysql-server git fonts-nanum fonts-nanum-coding fontconfig
 fc-list | grep -i nanum   # NanumGothic 확인
+# Plotly/kaleido PNG(변동성 차트)도 동일 한글 폰트를 씀.
+# FONT_FAMILY=NanumGothic (.env) + fonts-nanum 설치 후 fc-cache -fv 권장.
+# requirements는 kaleido==0.2.1(내장 Chromium) 고정 — VPS에서도 별도 Chrome 불필요.
 ```
 
 ## 2. MySQL
@@ -37,6 +40,7 @@ cd /opt/naverPub
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# 주요 패키지: pandas, numpy, playwright, plotly+kaleido(변동성 PNG), beautifulsoup4, …
 playwright install chromium
 # Linux에 시스템 의존성 부족 시:
 # playwright install-deps chromium
@@ -165,9 +169,9 @@ systemctl list-timers | grep naverpub
 
 | 파일 | 설명 |
 |------|------|
-| `YYYYMMDD/tickers/` | 시장 스냅샷 (에너지·신고저가·Talent·RS) + `market.md/html` |
+| `YYYYMMDD/tickers/` | 시장 스냅샷 (에너지·신고저가·Talent·RS) + `stocks.md/html` |
 | `YYYYMMDD/etfs/` | 액티브 ETF PDF 구성 + `etf.md/html` |
-| `YYYYMMDD/martket/` | 마켓 변동성 그래프 + `volatility.md/html` |
+| `YYYYMMDD/martket/` | 마켓 변동성 그래프 + `market.md/html` |
 
 단독 실행: `python runner.py --force --daily-only` / `--etf-only`
 
