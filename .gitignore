@@ -7,3 +7,6 @@ __pycache__/
 venv/
 .env
 *.log
+
+# naverPub는 독립 git 저장소 ? 루트에서 추적하지 않음
+naverPub/

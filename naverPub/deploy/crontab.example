@@ -1,5 +1,0 @@
-# naverPub — 매 평일 16:00 KST
-# crontab -e 에 추가 (서버 TZ가 Asia/Seoul 이거나 CRON_TZ 사용)
-
-CRON_TZ=Asia/Seoul
-0 16 * * 1-5 /opt/naverPub/deploy/run_daily.sh >> /opt/naverPub/logs/cron.log 2>&1
