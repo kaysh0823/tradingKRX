@@ -7,6 +7,6 @@ __pycache__/
 venv/
 .env
 *.log
-
-# naverPub´Â µ¶¸³ git ÀúÀå¼Ò ? ·çÆ®¿¡¼­ ÃßÀûÇÏÁö ¾ÊÀ½
 naverPub/
+
+# archive/ ëŠ” êµ¬ë²„ì „ ì¶”ì  ìœ ì§€ â€” ignore í•˜ì§€ ì•ŠìŒ (archive/README.md)
