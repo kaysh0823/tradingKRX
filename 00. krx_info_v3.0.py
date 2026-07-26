@@ -33,7 +33,7 @@ engine = create_engine('mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/k
 
 ### KRX 정보데이터시스템 CSV 자동 다운로드
 # 기존: 수동으로 CSV 다운로드 후 경로 지정 -> 변경: OTP 발급 후 직접 다운로드
-# http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201050201
+# https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201050201
 
 # 다운로드한 원본 CSV 백업 (False면 저장 안 함)
 SAVE_BACKUP = True
@@ -46,7 +46,7 @@ KRX_HEADERS = {
 OTP_URL = 'https://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd'
 DOWN_URL = 'https://data.krx.co.kr/comm/fileDn/download_csv/download.cmd'
 
-# 로그인 엔드포인트 (32. ETF_PDF_v1.0.py 와 동일)
+# 로그인 엔드포인트 (32. ETF_PDF_v2.0.py 와 동일)
 _KRX_BASE = 'https://data.krx.co.kr'
 LOGIN_PAGE = f'{_KRX_BASE}/contents/MDC/COMS/client/MDCCOMS001.cmd'
 LOGIN_JSP = f'{_KRX_BASE}/contents/MDC/COMS/client/view/login.jsp?site=mdc'
@@ -220,7 +220,7 @@ _save_backup(etf_csv, 'etf', biz_day)
 
 
 ### 코스피 업종 분류 가져오기 from KRX 세부안내 업종분류 현황
-## http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201050201
+## https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201050201
 
 sector_stk = pd.read_csv(io.BytesIO(kospi_csv), encoding='EUC-KR')
 sector_ksq = pd.read_csv(io.BytesIO(kosdaq_csv), encoding='EUC-KR')

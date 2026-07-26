@@ -50,15 +50,15 @@ def _script_dir():
             if "ETF_PDF" in p.replace("\\", "/"):
                 return os.path.dirname(os.path.abspath(p))
         wd = os.getcwd()
-        for name in ("32. ETF_PDF_v2.0.py", "ETF_PDF_v2.0.py", "32. ETF_PDF_v1.0.py"):
+        for name in ("32. ETF_PDF_v2.0.py", "ETF_PDF_v2.0.py"):
             if os.path.isfile(os.path.join(wd, name)):
                 return wd
         etf_dir = os.path.join(wd, "30. ETF")
-        for name in ("32. ETF_PDF_v2.0.py", "ETF_PDF_v2.0.py", "32. ETF_PDF_v1.0.py"):
+        for name in ("32. ETF_PDF_v2.0.py", "ETF_PDF_v2.0.py"):
             if os.path.isfile(os.path.join(etf_dir, name)):
                 return etf_dir
         etf_dir2 = os.path.join(wd, "ETF")
-        for name in ("32. ETF_PDF_v2.0.py", "ETF_PDF_v2.0.py", "32. ETF_PDF_v1.0.py"):
+        for name in ("32. ETF_PDF_v2.0.py", "ETF_PDF_v2.0.py"):
             if os.path.isfile(os.path.join(etf_dir2, name)):
                 return etf_dir2
         return wd

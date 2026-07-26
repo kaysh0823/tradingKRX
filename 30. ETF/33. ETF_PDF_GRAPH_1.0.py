@@ -651,7 +651,7 @@ def main():
     print("ETF PDF 비중 스냅샷 표 생성...")
     df = load_pdf_from_db(START_DATE, END_DATE, ETF_FILTER)
     if df.empty:
-        print("⚠️ krx_etf_pdf에 데이터가 없습니다. 32. ETF_PDF_v1.0.py 로 먼저 수집하세요.")
+        print("⚠️ krx_etf_pdf에 데이터가 없습니다. 32. ETF_PDF_v2.0.py 로 먼저 수집하세요.")
         return
 
     print(

@@ -11,7 +11,7 @@ alwaysApply: false
 - 수동 다운로드 CSV 파일 경로(`data_XXXX_YYYYMMDD.csv`) 하드코딩 금지.
 
 ## 로그인 필수 (미로그인 시 OTP 응답이 'LOGOUT', 다운로드 0 bytes)
-`30. ETF/32. ETF_PDF_v1.0.py`의 `krx_login()` 검증된 구현을 그대로 재사용한다.
+`30. ETF/32. ETF_PDF_v2.0.py`의 `krx_login()` 검증된 구현을 그대로 재사용한다.
 
 - 로그인 페이지 GET (JSESSIONID 발급): `https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd`
   → 이어서 `https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc` GET
@@ -26,15 +26,15 @@ requests로 아래 2단계 POST 호출. Referer 헤더 필수(없으면 403).
 
 **호스트는 반드시 `data.krx.co.kr` (`.go.kr` 아님 — DNS 해석 실패함)**
 
-1. OTP 발급: `http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd`
+1. OTP 발급: `https://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd`
    - data: `{'locale': 'ko_KR', 'name': 'fileDown', 'csvxls_isNo': 'false', 'url': <bld>, ...화면별 파라미터}`
-2. CSV 다운로드: `http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd`
+2. CSV 다운로드: `https://data.krx.co.kr/comm/fileDn/download_csv/download.cmd`
    - data: `{'code': <1단계 응답 텍스트>}`
 
 공통 헤더:
 ```python
 headers = {
-    'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd',
+    'Referer': 'https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
 }
 ```

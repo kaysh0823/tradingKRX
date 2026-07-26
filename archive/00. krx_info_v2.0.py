@@ -58,7 +58,7 @@ ratio_path = 'C:/Users/hachi/OneDrive/00. Code/KRX/KRX_Data' + '/data_2107_20260
 etf_path = 'C:/Users/hachi/OneDrive/00. Code/KRX/KRX_Data' + '/data_2142_20260711.csv'
 
 ### 코스피 업종 분류 가져오기 from KRX 세부안내 업종분류 현황
-## http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201050201
+## https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201050201
 # kospi_path = 'C:/Users/hachi/OneDrive/00. Code/KRX/KRX_Data' + '/data_1926_20251119.csv'
 # kosdaq_path = 'C:/Users/hachi/OneDrive/00. Code/KRX/KRX_Data' + '/data_3242_20251119.csv'
 # etf_path = 'C:/Users/hachi/OneDrive/00. Code/KRX/KRX_Data' + '/data_4233_20251120.csv'
