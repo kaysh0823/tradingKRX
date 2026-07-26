@@ -1,3 +1,123 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+def _find_repo_root():
+    """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""
+    markers = ("env_config.py", ".env", ".git")
+
+    def _is_root(p: Path) -> bool:
+        return any((p / m).exists() for m in markers)
+
+    def _walk_up(start: Path):
+        try:
+            start = Path(start).expanduser().resolve()
+        except Exception:
+            return None
+        if not start.exists():
+            return None
+        if start.is_file():
+            start = start.parent
+        for p in [start, *start.parents]:
+            if _is_root(p):
+                return p
+        return None
+
+    tried = []
+    seen = set()
+    _nl = chr(10)
+    _hint = _nl + "REPO_ROOT 환경변수를 리포 루트로 지정하거나 F5로 실행하세요"
+
+    env_root = os.environ.get("REPO_ROOT", "").strip()
+    if env_root:
+        er = Path(env_root).expanduser()
+        try:
+            er = er.resolve()
+        except Exception as e:
+            raise RuntimeError(
+                "REPO_ROOT 경로를 해석할 수 없습니다: {!r} ({}){}".format(
+                    env_root, e, _hint
+                )
+            ) from e
+        tried.append(str(er))
+        if not er.is_dir():
+            raise RuntimeError(
+                "REPO_ROOT 가 디렉터리가 아닙니다: {}{}".format(er, _hint)
+            )
+        if _is_root(er):
+            return er
+        found = _walk_up(er)
+        if found:
+            return found
+        raise RuntimeError(
+            "REPO_ROOT={} 에서 마커(env_config.py / .env / .git)를 찾지 못했습니다.{}".format(
+                er, _hint
+            )
+        )
+
+    starts = []
+    try:
+        here = Path(__file__).resolve()
+        starts.append(here if here.is_dir() else here.parent)
+    except NameError:
+        pass
+    try:
+        import inspect
+        for fi in inspect.stack():
+            fn = getattr(fi, "filename", None) or ""
+            if not fn or fn.startswith("<"):
+                continue
+            try:
+                p = Path(fn).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() == ".py" and p.is_file():
+                starts.append(p.parent)
+    except Exception:
+        pass
+    starts.append(Path.cwd())
+    for item in sys.path:
+        if not item or item == ".":
+            continue
+        try:
+            p = Path(item)
+            if p.is_dir():
+                starts.append(p)
+        except Exception:
+            continue
+
+    for c in starts:
+        try:
+            key = str(Path(c).expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(key)
+        found = _walk_up(Path(c))
+        if found:
+            return found
+
+    raise RuntimeError(
+        "프로젝트 루트를 찾지 못했습니다 (env_config.py / .env / .git)."
+        + _nl
+        + "탐색 후보:"
+        + _nl
+        + "  - "
+        + (_nl + "  - ").join(tried)
+        + _hint
+    )
+
+_ROOT = _find_repo_root()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from env_config import load_project_env, require_env, db_url, db_connect_kwargs
+load_project_env()
+from indicators_core import atr_wilder, energy_ratio, rs_avg, talent_up_count
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
@@ -17,8 +137,6 @@ KRX 마켓 분석/대시보드 출력 전용 스크립트.
 분석 테이블(`krx_analysis_*`)은 달력 실행일이 아니라 **`ref_trade_date`(해당 리포트가 사용한 데이터의 기준 거래일)** 로 구분합니다.
 구 스키마(`report_date` 컬럼)가 남아 있으면 `--drop-analysis-tables`로 해당 테이블만 제거한 뒤 재실행하면 됩니다.
 """
-
-from __future__ import annotations
 
 import argparse
 import html
@@ -49,7 +167,7 @@ except Exception:
     pass
 
 
-DEFAULT_DB_URL = "mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db"
+DEFAULT_DB_URL = db_url()
 DEFAULT_OUTPUT_BASE_DIR = r"C:\Users\hachi\OneDrive\01. Trading\picking\KRX"
 
 # kor_stock_db: 일별 리포트 표 스냅샷 (KRX_market_analysis 산출물)
@@ -557,7 +675,7 @@ def _load_energy_ratio_lag_maps(
     chunk: int = 400,
 ) -> dict[int, dict[str, float]]:
     """
-    D-{lag} 에너지배율 맵: (당일 거래대금÷시장 당일 거래대금×100)÷(시총÷시장시총×100).
+    D-{lag} 에너지배율 맵 (정본): 순수비율 × (1+tanh(당일등락률%/15)).
     lag=1 → D-1, lag=2 → D-2. 시총은 ticker_mcap(최신 기준) 사용.
     """
     out: dict[int, dict[str, float]] = {int(L): {} for L in lags}
@@ -646,6 +764,25 @@ def _load_energy_ratio_lag_maps(
     except Exception:
         return out
 
+    chg_by_date: dict[tuple[str, str], float] = {}
+    try:
+        if date_strs and tickers:
+            _cut = (min(lag_dates.values()) - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+            _end = max(lag_dates.values()).strftime("%Y-%m-%d")
+            for i in range(0, len(tickers), chunk):
+                ct = tickers[i : i + chunk]
+                pht = ",".join(["%s"] * len(ct))
+                q_ch = f"""
+                    SELECT ticker, date, close FROM krx_ohlcv
+                    WHERE date >= %s AND date <= %s AND ticker IN ({pht})
+                    ORDER BY ticker, date
+                """
+                chdf = pd.read_sql_query(q_ch, con=engine, params=tuple([_cut, _end] + ct))
+                if not chdf.empty:
+                    chg_by_date.update(_build_ticker_date_chg_map(chdf))
+    except Exception:
+        chg_by_date = {}
+
     for L, dts in lag_dates.items():
         dkey = dts.strftime("%Y-%m-%d")
         m: dict[str, float] = {}
@@ -670,7 +807,8 @@ def _load_energy_ratio_lag_maps(
             mcap_pct = mc_f / tot_mcap * 100.0
             if mcap_pct <= 0 or not np.isfinite(mcap_pct):
                 continue
-            er = tv_pct / mcap_pct
+            ret = chg_by_date.get((tk, dkey))
+            er = energy_ratio(tv_pct, mcap_pct, ret)
             if np.isfinite(er):
                 m[tk] = float(er)
         out[int(L)] = m
@@ -734,17 +872,13 @@ def _mj_html_energy_top50_by_market(
     tot_tv3 = float(total_tv_3d)
     d["tv_pct"] = np.where(tot_tv > 0, d["trading_value"] / tot_tv * 100.0, np.nan)
     d["mcap_pct"] = np.where((tot_mcap > 0) & d["mcap"].notna(), d["mcap"].astype(float) / tot_mcap * 100.0, np.nan)
-    d["energy_ratio"] = np.where(
-        np.isfinite(d["tv_pct"]) & np.isfinite(d["mcap_pct"]) & (d["mcap_pct"].astype(float) > 0),
-        d["tv_pct"].astype(float) / d["mcap_pct"].astype(float),
-        np.nan,
-    )
+    _ret1 = d["ticker"].astype(str).map(chg_map)
+    if "chg_pct" in d.columns:
+        _ret1 = _ret1.fillna(pd.to_numeric(d["chg_pct"], errors="coerce"))
+    d["energy_ratio"] = energy_ratio(d["tv_pct"], d["mcap_pct"], _ret1)
     d["tv_3d_pct"] = np.where(tot_tv3 > 0, d["tv_3d"].astype(float) / tot_tv3 * 100.0, np.nan)
-    d["energy_ratio_3d"] = np.where(
-        np.isfinite(d["tv_3d_pct"]) & np.isfinite(d["mcap_pct"]) & (d["mcap_pct"].astype(float) > 0),
-        d["tv_3d_pct"].astype(float) / d["mcap_pct"].astype(float),
-        np.nan,
-    )
+    _ret3 = pd.to_numeric(d.get("ret_3d_pct"), errors="coerce") if "ret_3d_pct" in d.columns else pd.Series(np.nan, index=d.index)
+    d["energy_ratio_3d"] = energy_ratio(d["tv_3d_pct"], d["mcap_pct"], _ret3)
     d = d.sort_values("energy_ratio_3d", ascending=False, na_position="last").head(50).reset_index(drop=True)
     d["tv_rank_prev"] = d["ticker"].astype(str).map(prev_tv_by_ticker)
     d["energy_ratio_d1"] = d["ticker"].astype(str).map(energy_d1_map)
@@ -1134,19 +1268,11 @@ def _krx_chg_pct_td(v, digits: int = 1) -> str:
 
 
 def _talent_days_from_ohlcv(g: pd.DataFrame, window: int, thr: float = 0.10) -> float:
-    """최근 window 거래일 중 (종가 ≥ 시가×(1+thr))인 날 수(일)."""
-    if g is None or g.empty:
+    """최근 window 거래일 중 (전일종가 대비 등락률 ≥ thr)인 날 수 — indicators_core."""
+    if g is None or g.empty or "close" not in g.columns:
         return np.nan
     g = g.sort_values("date")
-    if len(g) > window:
-        g = g.tail(window)
-    op = pd.to_numeric(g.get("open"), errors="coerce")
-    cl = pd.to_numeric(g.get("close"), errors="coerce")
-    m = op.notna() & cl.notna() & (op.astype(float) > 0)
-    if not m.any():
-        return np.nan
-    r = (cl[m].astype(float) / op[m].astype(float)) - 1.0
-    return float((r >= thr).sum())
+    return talent_up_count(g["close"], window, thr=thr)
 
 
 def _talent_pct_from_ohlcv(g: pd.DataFrame, window: int, thr: float = 0.10) -> float:
@@ -1491,9 +1617,9 @@ def _load_latest_rs_rank_map(engine) -> dict[str, int]:
 
 
 def _load_latest_rs_rank_and_score_maps(engine) -> tuple[dict[str, int], dict[str, float]]:
-    """RS 순위(1=최상위) 및 RS 점수(RS10·20·50·120 평균, 백분위)."""
+    """RS 순위(1=최상위) 및 RS 점수(rs_20·50·120·200 평균 — 정본)."""
     q = """
-        SELECT r.ticker, r.market_type, r.rs_10d, r.rs_20d, r.rs_50d, r.rs_120d
+        SELECT r.ticker, r.market_type, r.rs_10d, r.rs_20d, r.rs_50d, r.rs_120d, r.rs_200d
         FROM krx_relative_strength r
         INNER JOIN (SELECT MAX(date) AS d FROM krx_relative_strength) latest
             ON r.date = latest.d
@@ -1506,9 +1632,10 @@ def _load_latest_rs_rank_and_score_maps(engine) -> tuple[dict[str, int], dict[st
         return {}, {}
     df["ticker"] = df["ticker"].astype(str)
     df["market_type"] = df["market_type"].astype(str).str.upper()
-    for c in ("rs_10d", "rs_20d", "rs_50d", "rs_120d"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["_rs_avg"] = df[["rs_10d", "rs_20d", "rs_50d", "rs_120d"]].mean(axis=1, skipna=True)
+    for c in ("rs_10d", "rs_20d", "rs_50d", "rs_120d", "rs_200d"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["_rs_avg"] = rs_avg(frame=df, cols=("rs_20d", "rs_50d", "rs_120d", "rs_200d"))
     df["_rs_rank"] = df.groupby("market_type")["_rs_avg"].rank(ascending=False, method="min")
     rank_out: dict[str, int] = {}
     score_out: dict[str, float] = {}
@@ -1593,10 +1720,10 @@ def write_rs_high_list_html(
 ) -> tuple[str | None, set[str]]:
     """
     krx_relative_strength 최신 일자 기준, rs_10d >= 90 인 종목만.
-    시장별 순위: RS10·20·50·120d 산술평균(내부 _rs_avg, 표시 없음) 내림차순.
-    RS200d는 조회·표시 없음. 테마는 krx_theme_stock 기준.
-    에너지배율은 D-0·D-1·D-2 세 칼럼: 각각 krx_ohlcv 최신일·그 전날·그전날(거래일 기준)의
-    (당일 거래대금÷시장 당일 거래대금×100)÷(시총÷시장시총×100). 시총은 최신 krx_ticker 기준일.
+    시장별 순위: rs_20·50·120·200d 산술평균(내부 _rs_avg, 표시 없음) 내림차순.
+    테마는 krx_theme_stock 기준.
+    에너지배율은 D-0·D-1·D-2 세 칼럼: 순수비율 × (1+tanh(당일등락률%/15)).
+    시총은 최신 krx_ticker 기준일.
     신고가여부: D-0 종가 > D-1 말 기준 N일 최고 종가인 경우 최장 N만 표시(200/120/50일 신고가).
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
@@ -1615,6 +1742,7 @@ def write_rs_high_list_html(
             r.rs_20d,
             r.rs_50d,
             r.rs_120d,
+            r.rs_200d,
             t.종목명 AS name,
             t.시가총액 AS mcap,
             o.close AS last_close,
@@ -1670,12 +1798,12 @@ def write_rs_high_list_html(
         return out_path, set()
 
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    for c in ("rs_10d", "rs_20d", "rs_50d", "rs_120d"):
+    for c in ("rs_10d", "rs_20d", "rs_50d", "rs_120d", "rs_200d"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    _rs_cols = ["rs_10d", "rs_20d", "rs_50d", "rs_120d"]
-    df["_rs_avg"] = df[_rs_cols].mean(axis=1, skipna=True)
+    _rs_cols = ["rs_20d", "rs_50d", "rs_120d", "rs_200d"]
+    df["_rs_avg"] = rs_avg(frame=df, cols=("rs_20d", "rs_50d", "rs_120d", "rs_200d"))
 
     df["mcap"] = pd.to_numeric(df.get("mcap"), errors="coerce")
     df["last_close"] = pd.to_numeric(df.get("last_close"), errors="coerce")
@@ -1787,6 +1915,7 @@ def write_rs_high_list_html(
                 r.rs_20d,
                 r.rs_50d,
                 r.rs_120d,
+                r.rs_200d,
                 t.종목명 AS name,
                 t.시가총액 AS mcap
             FROM krx_relative_strength r
@@ -1800,10 +1929,10 @@ def write_rs_high_list_html(
         if df_rs_mkt is not None and not df_rs_mkt.empty:
             df_rs_mkt["ticker"] = df_rs_mkt["ticker"].astype(str)
             df_rs_mkt["market_type"] = df_rs_mkt["market_type"].astype(str).str.strip().str.upper()
-            for c in _rs_cols:
+            for c in ("rs_10d", "rs_20d", "rs_50d", "rs_120d", "rs_200d"):
                 if c in df_rs_mkt.columns:
                     df_rs_mkt[c] = pd.to_numeric(df_rs_mkt[c], errors="coerce")
-            df_rs_mkt["_rs_avg"] = df_rs_mkt[_rs_cols].mean(axis=1, skipna=True)
+            df_rs_mkt["_rs_avg"] = rs_avg(frame=df_rs_mkt, cols=("rs_20d", "rs_50d", "rs_120d", "rs_200d"))
             df_rs_mkt["rs_mkt_rank"] = df_rs_mkt.groupby("market_type")["_rs_avg"].rank(ascending=False, method="min")
             df_rs_mkt["mcap"] = pd.to_numeric(df_rs_mkt.get("mcap"), errors="coerce")
             df_rs_mkt = df_rs_mkt.merge(th_df, on="ticker", how="left")
@@ -1864,6 +1993,26 @@ def write_rs_high_list_html(
         s = str(market_type).strip().upper()
         return "1001" if s == "KOSPI" else "2001"
 
+    _chg_td_map: dict[tuple[str, str], float] = {}
+    try:
+        if _tickers_all and any(x is not None for x in (_d0, _d1, _d2)):
+            _dates_need = [d for d in (_d0, _d1, _d2) if d is not None]
+            _cut_ch = (min(_dates_need) - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+            _end_ch = max(_dates_need).strftime("%Y-%m-%d")
+            for _i in range(0, len(_tickers_all), _chunk):
+                _chunk_t = _tickers_all[_i : _i + _chunk]
+                _pht = ",".join(["%s"] * len(_chunk_t))
+                q_ch = f"""
+                    SELECT ticker, date, close FROM krx_ohlcv
+                    WHERE date >= %s AND date <= %s AND ticker IN ({_pht})
+                    ORDER BY ticker, date
+                """
+                _ch = pd.read_sql_query(q_ch, con=engine, params=tuple([_cut_ch, _end_ch] + _chunk_t))
+                if not _ch.empty:
+                    _chg_td_map.update(_build_ticker_date_chg_map(_ch))
+    except Exception:
+        pass
+
     def _energy_ratio_for_day(row, trade_date):
         if trade_date is None:
             return np.nan
@@ -1879,8 +2028,8 @@ def write_rs_high_list_html(
         mcap_pct = float(mc) / total_mcap * 100.0
         if mcap_pct <= 0 or not np.isfinite(mcap_pct):
             return np.nan
-        er = tv_pct / mcap_pct
-        return float(er) if np.isfinite(er) else np.nan
+        ret = _chg_td_map.get((str(row["ticker"]), dkey))
+        return energy_ratio(tv_pct, mcap_pct, ret)
 
     df["energy_ratio_d0"] = df.apply(lambda r: _energy_ratio_for_day(r, _d0), axis=1)
     df["energy_ratio_d1"] = df.apply(lambda r: _energy_ratio_for_day(r, _d1), axis=1)
@@ -1897,7 +2046,7 @@ def write_rs_high_list_html(
     if not df_rs_q100.empty:
         df_rs_q100["신고가여부"] = df_rs_q100["ticker"].astype(str).map(gh_flag_map).fillna("")
 
-    # Talent 20/50/120: 최근 N거래일 중 (종가 ≥ 시가×1.10) 비중(%) + 당일·5일 상승률
+    # Talent 20/50/120: 전일종가 대비 +10% 일수 (indicators_core) + 당일·5일 상승률
     _TALENT_UP = 0.10
     talent20_map: dict[str, float] = {}
     talent50_map: dict[str, float] = {}
@@ -2378,6 +2527,7 @@ def write_rs_high_list_html(
                     r.rs_20d,
                     r.rs_50d,
                     r.rs_120d,
+                    r.rs_200d,
                     t.종목명 AS name
                 FROM krx_relative_strength r
                 LEFT JOIN krx_ticker t
@@ -2396,9 +2546,10 @@ def write_rs_high_list_html(
                 _rs20["market_type"] = _rs20["market_type"].astype(str).str.upper()
                 _rs20["date"] = pd.to_datetime(_rs20["date"], errors="coerce")
                 _rs20 = _rs20.dropna(subset=["date"]).copy()
-                for c in ("rs_10d", "rs_20d", "rs_50d", "rs_120d"):
-                    _rs20[c] = pd.to_numeric(_rs20.get(c), errors="coerce")
-                _rs20["_rs_avg"] = _rs20[["rs_10d", "rs_20d", "rs_50d", "rs_120d"]].mean(axis=1, skipna=True)
+                for c in ("rs_10d", "rs_20d", "rs_50d", "rs_120d", "rs_200d"):
+                    if c in _rs20.columns:
+                        _rs20[c] = pd.to_numeric(_rs20.get(c), errors="coerce")
+                _rs20["_rs_avg"] = rs_avg(frame=_rs20, cols=("rs_20d", "rs_50d", "rs_120d", "rs_200d"))
                 _rs20["name"] = _rs20.get("name", "").fillna("").astype(str)
 
                 _rs20_chg_map: dict[tuple[str, str], float] = {}
@@ -2588,7 +2739,7 @@ def write_rs_high_list_html(
   <h1>Talent 리스트</h1>
   <div class="note">
     기준일: <strong>{ref_d}</strong> (<code>krx_relative_strength</code> / OHLCV 최신 구간).<br/>
-    Talent(일) = 최근 N거래일 중 (종가 ≥ 시가×1.10)인 <strong>날 수</strong>. 칼럼: <strong>Talent20</strong>·<strong>Talent50</strong>·<strong>Talent120</strong>.<br/>
+    Talent(일) = 최근 N거래일 중 (전일종가 대비 등락률 ≥ +10%)인 <strong>날 수</strong>. 칼럼: <strong>Talent20</strong>·<strong>Talent50</strong>·<strong>Talent120</strong>.<br/>
     RS 고분위(rs_10d≥90) 유니버스의 Talent120 평균 {_fmt_talent_stat(talent_mean_all)} / 상위5% {_fmt_talent_stat(talent_p95_all)} 입니다.<br/>
     <strong>당일 상승률(%)</strong>·<strong>5일 상승률(%)</strong>은 테마 옆 칼럼입니다.<br/>
     <strong>1절 요약표</strong>: 코스피·코스닥 각 RS 시장순위 상위 100(최대 200종)을 합친 뒤 Talent120(일)가 높은 순으로 상위 50만 표시합니다. RS시장순위는 거래대금 순위 오른쪽에 둡니다.<br/>
@@ -5445,6 +5596,13 @@ def run_market_dashboard(
                 if np.isfinite(_c5) and _c5 != 0 and np.isfinite(_c0):
                     chg_pct_5d = (_c0 - _c5) / _c5 * 100.0
 
+            ret_3d_pct = np.nan
+            if len(g) >= 4:
+                _c0 = float(cl_s.iloc[-1])
+                _c3 = float(cl_s.iloc[-4])
+                if np.isfinite(_c3) and _c3 != 0 and np.isfinite(_c0):
+                    ret_3d_pct = (_c0 - _c3) / _c3 * 100.0
+
             _tail3 = g.tail(min(3, max(len(g), 0)))
             _tv3 = (
                 float(
@@ -5459,14 +5617,7 @@ def run_market_dashboard(
 
             _talent_120 = np.nan
             try:
-                _tail120 = g.tail(min(120, max(len(g), 0)))
-                if "open" in _tail120.columns and "close" in _tail120.columns:
-                    _op = pd.to_numeric(_tail120["open"], errors="coerce")
-                    _cl = pd.to_numeric(_tail120["close"], errors="coerce")
-                    _m = _op.notna() & _cl.notna() & (_op.astype(float) > 0)
-                    if _m.any():
-                        _r = (_cl[_m].astype(float) / _op[_m].astype(float)) - 1.0
-                        _talent_120 = float((_r >= 0.10).sum())
+                _talent_120 = talent_up_count(g["close"], 120, thr=0.10)
             except Exception:
                 _talent_120 = np.nan
 
@@ -5481,20 +5632,18 @@ def run_market_dashboard(
                         "chg_pct": chg_pct,
                         "chg_pct_5d": chg_pct_5d,
                         "chg_pct_3d": chg_pct_5d,
+                        "ret_3d_pct": ret_3d_pct,
                         "tv_3d": _tv3,
                         "talent_120": _talent_120,
                         "sma10": sma10,
                         "sma20": sma20,
                     }
                 )
-            hi = g["high"].astype(float).values
-            lo = g["low"].astype(float).values
-            cl = g["close"].astype(float).values
-            atr = talib.ATR(hi, lo, cl, timeperiod=14)
-            last_atr = atr[-1]
-            last_c = cl[-1]
+            atr_s = atr_wilder(g["high"], g["low"], g["close"], 14)
+            last_atr = float(atr_s.iloc[-1]) if len(atr_s) and np.isfinite(atr_s.iloc[-1]) else np.nan
+            last_c = float(cl_s.iloc[-1])
             vol = float(pd.to_numeric(g["volume"], errors="coerce").iloc[-1])
-            ratio = (last_atr / last_c) if last_c and not np.isnan(last_atr) and last_c != 0 else np.nan
+            ratio = (last_atr / last_c) if last_c and np.isfinite(last_atr) and last_c != 0 else np.nan
             return pd.Series(
                 {
                     "last_date": g["date"].iloc[-1],
@@ -5505,6 +5654,7 @@ def run_market_dashboard(
                     "chg_pct": chg_pct,
                     "chg_pct_5d": chg_pct_5d,
                     "chg_pct_3d": chg_pct_5d,
+                    "ret_3d_pct": ret_3d_pct,
                     "tv_3d": _tv3,
                     "talent_120": _talent_120,
                     "sma10": sma10,
@@ -5839,22 +5989,18 @@ def run_market_dashboard(
             df["신고가여부"] = df["ticker"].astype(str).map(_hf_map).fillna("")
             df["tv_pct"] = np.where(total_tv > 0, df["trading_value"] / total_tv * 100.0, np.nan)
             df["mcap_pct"] = np.where((total_mcap > 0) & df["mcap"].notna(), df["mcap"].astype(float) / total_mcap * 100.0, np.nan)
-            df["energy_ratio"] = np.where(
-                np.isfinite(df["tv_pct"]) & np.isfinite(df["mcap_pct"]) & (df["mcap_pct"].astype(float) > 0),
-                df["tv_pct"].astype(float) / df["mcap_pct"].astype(float),
-                np.nan,
+            df["energy_ratio"] = energy_ratio(
+                df["tv_pct"], df["mcap_pct"], pd.to_numeric(df.get("chg_pct"), errors="coerce")
             )
             df["tv_3d_pct"] = np.where(
                 total_tv_3d > 0,
                 pd.to_numeric(df["tv_3d"], errors="coerce").astype(float) / float(total_tv_3d) * 100.0,
                 np.nan,
             )
-            df["energy_ratio_3d"] = np.where(
-                np.isfinite(df["tv_3d_pct"])
-                & np.isfinite(df["mcap_pct"])
-                & (df["mcap_pct"].astype(float) > 0),
-                df["tv_3d_pct"].astype(float) / df["mcap_pct"].astype(float),
-                np.nan,
+            df["energy_ratio_3d"] = energy_ratio(
+                df["tv_3d_pct"],
+                df["mcap_pct"],
+                pd.to_numeric(df.get("ret_3d_pct"), errors="coerce"),
             )
 
             def _fmt_int(v):
@@ -6501,7 +6647,7 @@ def run_market_dashboard(
     <strong>당일 상승률(%)</strong>: 최신 종가 ÷ 직전 거래일 종가 − 1.
     <strong>5일 상승률(%)</strong>: 최신 종가 ÷ 5거래일 전 종가 − 1.<br/>
     3일·D-0·D-1·D-2 에너지배율 표는 <a href="{html.escape(os.path.basename(out_energy))}"><code>{html.escape(os.path.basename(out_energy))}</code></a>를 참고하세요.
-    Talent(일) = 최근 120거래일 중 (종가 ≥ 시가×1.10)인 날 수이며, 거래대금 상위 100 내 요약은 코스피 평균 {_fmt_talent_stat(_st_k.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_k.get('talent_p95'))}, 코스닥 평균 {_fmt_talent_stat(_st_q.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_q.get('talent_p95'))} 입니다.<br/>
+    Talent(일) = 최근 120거래일 중 (전일종가 대비 등락률 ≥ +10%)인 날 수이며, 거래대금 상위 100 내 요약은 코스피 평균 {_fmt_talent_stat(_st_k.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_k.get('talent_p95'))}, 코스닥 평균 {_fmt_talent_stat(_st_q.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_q.get('talent_p95'))} 입니다.<br/>
     ATR14/종가 vs 시가총액 분포는 <a href="{html.escape(os.path.basename(out_ad))}"><code>{html.escape(os.path.basename(out_ad))}</code></a> <strong>11페이지</strong>를 참고하세요.<br/>
     일별 거래대금 Top20 표는 코스피·코스닥 각각 <strong>해당 시장 종목만</strong> 대상으로 당일 거래대금(종가×거래량) 기준 상위 20입니다. 행 날짜는 두 시장 OHLCV가 공통으로 갖는 최근 20거래일입니다.<br/>
     <strong>표 정렬</strong>: 거래대금 상위 100·일별 Top20 표에서 칼럼 헤더를 클릭하면 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
@@ -6565,7 +6711,7 @@ def run_market_dashboard(
     3일 에너지배율 = 최근 3거래일 거래대금 합의 전체비중 ÷ 시총 전체비중(동일 시총 기준).<br/>
     <strong>D-0</strong> = 당일 에너지배율, <strong>D-1</strong>·<strong>D-2</strong> = 직전·그전 거래일 에너지배율.
     글자색: 3 이상 빨강, 1.5~3 미만 노랑, 0.7~1.5 미만 초록, 0.3~0.7 미만 파랑, 0.3 미만·결측은 회색.<br/>
-    <strong>당일·5일 상승률</strong>은 테마 옆 칼럼입니다. Talent(일) = 120거래일 중 +10% 이상 장중 상승 마감 일수.<br/>
+    <strong>당일·5일 상승률</strong>은 테마 옆 칼럼입니다. Talent(일) = 120거래일 중 전일종가 대비 +10% 이상 일수.<br/>
     <strong>신고가 여부</strong>: 당일(D-0) 종가가 전일(D-1) 기준 N일 최고 종가를 상향 돌파하면
     <strong>200일 신고가</strong> / <strong>120일 신고가</strong> / <strong>50일 신고가</strong> 중 <strong>가장 긴 기간 하나만</strong> 표시합니다.<br/>
     거래대금 상위 100·일별 Top20은 <a href="{html.escape(os.path.basename(out_tv))}"><code>{html.escape(os.path.basename(out_tv))}</code></a>를 참고하세요.<br/>

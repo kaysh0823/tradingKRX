@@ -6,6 +6,126 @@ KRX 종목 스크리닝·차트 (완전 단일 파일)
 @author: hachi
 """
 
+
+import os
+import sys
+from pathlib import Path
+
+def _find_repo_root():
+    """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""
+    markers = ("env_config.py", ".env", ".git")
+
+    def _is_root(p: Path) -> bool:
+        return any((p / m).exists() for m in markers)
+
+    def _walk_up(start: Path):
+        try:
+            start = Path(start).expanduser().resolve()
+        except Exception:
+            return None
+        if not start.exists():
+            return None
+        if start.is_file():
+            start = start.parent
+        for p in [start, *start.parents]:
+            if _is_root(p):
+                return p
+        return None
+
+    tried = []
+    seen = set()
+    _nl = chr(10)
+    _hint = _nl + "REPO_ROOT 환경변수를 리포 루트로 지정하거나 F5로 실행하세요"
+
+    env_root = os.environ.get("REPO_ROOT", "").strip()
+    if env_root:
+        er = Path(env_root).expanduser()
+        try:
+            er = er.resolve()
+        except Exception as e:
+            raise RuntimeError(
+                "REPO_ROOT 경로를 해석할 수 없습니다: {!r} ({}){}".format(
+                    env_root, e, _hint
+                )
+            ) from e
+        tried.append(str(er))
+        if not er.is_dir():
+            raise RuntimeError(
+                "REPO_ROOT 가 디렉터리가 아닙니다: {}{}".format(er, _hint)
+            )
+        if _is_root(er):
+            return er
+        found = _walk_up(er)
+        if found:
+            return found
+        raise RuntimeError(
+            "REPO_ROOT={} 에서 마커(env_config.py / .env / .git)를 찾지 못했습니다.{}".format(
+                er, _hint
+            )
+        )
+
+    starts = []
+    try:
+        here = Path(__file__).resolve()
+        starts.append(here if here.is_dir() else here.parent)
+    except NameError:
+        pass
+    try:
+        import inspect
+        for fi in inspect.stack():
+            fn = getattr(fi, "filename", None) or ""
+            if not fn or fn.startswith("<"):
+                continue
+            try:
+                p = Path(fn).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() == ".py" and p.is_file():
+                starts.append(p.parent)
+    except Exception:
+        pass
+    starts.append(Path.cwd())
+    for item in sys.path:
+        if not item or item == ".":
+            continue
+        try:
+            p = Path(item)
+            if p.is_dir():
+                starts.append(p)
+        except Exception:
+            continue
+
+    for c in starts:
+        try:
+            key = str(Path(c).expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(key)
+        found = _walk_up(Path(c))
+        if found:
+            return found
+
+    raise RuntimeError(
+        "프로젝트 루트를 찾지 못했습니다 (env_config.py / .env / .git)."
+        + _nl
+        + "탐색 후보:"
+        + _nl
+        + "  - "
+        + (_nl + "  - ").join(tried)
+        + _hint
+    )
+
+_ROOT = _find_repo_root()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from env_config import load_project_env, require_env, db_url, db_connect_kwargs
+load_project_env()
+from indicators_core import atr_wilder, energy_ratio, rs_avg, talent_up_share
+
+
 import os
 import pymysql
 import pandas as pd
@@ -209,11 +329,11 @@ def get_indicators(d, tradeHist=None):
         
         d = pd.concat([d, minmax_df], axis=1)
         
-        atr4 = talib.ATR(d.high, d.low, d.close, timeperiod=4)
-        atr14 = talib.ATR(d.high, d.low, d.close, timeperiod=14)
-        atr10 = talib.ATR(d.high, d.low, d.close, timeperiod=10)
-        atr20 = talib.ATR(d.high, d.low, d.close, timeperiod=20)
-        atr30 = talib.ATR(d.high, d.low, d.close, timeperiod=30)
+        atr4 = atr_wilder(d.high, d.low, d.close, 4)
+        atr14 = atr_wilder(d.high, d.low, d.close, 14)
+        atr10 = atr_wilder(d.high, d.low, d.close, 10)
+        atr20 = atr_wilder(d.high, d.low, d.close, 20)
+        atr30 = atr_wilder(d.high, d.low, d.close, 30)
         # d['atr120'] = talib.ATR(d.high, d.low, d.close, timeperiod=120)
         # d['atr56'] = talib.ATR(d.high, d.low, d.close, timeperiod=56)
         
@@ -296,7 +416,7 @@ def get_indicators(d, tradeHist=None):
         # CSI — Pine: cs=(close-sma(close,L))/atr(L); csi=sma(cs,2); fast=ema(cs,10); slow=ema(cs,20)
         _L = _CSI_LENGTH
         _csi_sma = talib.SMA(d.close, timeperiod=_L)
-        _csi_atr = talib.ATR(d.high, d.low, d.close, timeperiod=_L)
+        _csi_atr = atr_wilder(d.high, d.low, d.close, _L)
         cs = (d.close - _csi_sma) / _csi_atr.replace(0, np.nan)
         d["csi"] = talib.SMA(cs, timeperiod=2)
         d["csi_fast"] = talib.EMA(cs, timeperiod=10)
@@ -479,8 +599,8 @@ audit_ticker = ['006620', '001705', '005440', '272210', '298040', '322000', '329
 
 audit_ticker = []
 ### 서버 접속
-engine = create_engine('mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db')
-conn_str = 'mysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db'
+engine = create_engine(db_url())
+conn_str = db_url().replace('mysql+pymysql://', 'mysql://', 1)
 
 ### 티커를 가져옴
 query = """
@@ -2004,7 +2124,7 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
     
     # 최신 날짜의 RS 데이터 가져오기
     query_rs = """
-        SELECT ticker, market_type, rs_10d, rs_20d, rs_50d
+        SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, rs_120d, rs_200d
         FROM krx_relative_strength
         WHERE date = %s;
     """
@@ -2014,7 +2134,7 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
         print("⚠️ 경고: RS 데이터가 없습니다. 최신 날짜로 다시 시도합니다.")
         # 최신 날짜로 다시 조회
         query_rs_all = """
-            SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, date
+            SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, rs_120d, rs_200d, date
             FROM krx_relative_strength
             ORDER BY date DESC
             LIMIT 10000;
@@ -2024,7 +2144,7 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
             latest_date = rs_data_all.iloc[0]['date']
             print(f"실제 최신 날짜: {latest_date}")
             rs_data = rs_data_all[rs_data_all['date'] == latest_date].copy()
-            rs_data = rs_data[['ticker', 'market_type', 'rs_10d', 'rs_20d', 'rs_50d']]
+            rs_data = rs_data[['ticker', 'market_type', 'rs_10d', 'rs_20d', 'rs_50d', 'rs_120d', 'rs_200d']]
     
     if len(rs_data) > 0:
         print(f"RS 데이터 로드 완료: {len(rs_data)}개 종목")
@@ -2036,15 +2156,13 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
         # ticker를 인덱스로 설정
         if len(rs_kospi_df) > 0:
             rs_kospi_df = rs_kospi_df.set_index('ticker')
-            # DB의 rs_10d를 rs10_score로, rs_20d를 rs20_score로, rs_50d를 rs50_score로 매핑
             rs_kospi_df['rs10_score'] = rs_kospi_df['rs_10d']
             rs_kospi_df['rs20_score'] = rs_kospi_df['rs_20d']
             rs_kospi_df['rs50_score'] = rs_kospi_df['rs_50d']
-            # rs_score 계산 (3개 기간의 평균)
-            rs_kospi_df['rs_score'] = round((rs_kospi_df['rs10_score'] + 
-                                            rs_kospi_df['rs20_score'] + 
-                                            rs_kospi_df['rs50_score']) / 3, 2)
-            # 불필요한 컬럼 제거
+            # rs_score = mean(rs_20,50,120,200) — 정본
+            rs_kospi_df['rs_score'] = rs_avg(
+                frame=rs_kospi_df, cols=('rs_20d', 'rs_50d', 'rs_120d', 'rs_200d')
+            ).round(2)
             rs_kospi_df = rs_kospi_df[['rs10_score', 'rs20_score', 'rs50_score', 'rs_score']]
             print(f"코스피 RS 데이터: {len(rs_kospi_df)}개 종목")
         else:
@@ -2053,15 +2171,12 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
         
         if len(rs_kosdaq_df) > 0:
             rs_kosdaq_df = rs_kosdaq_df.set_index('ticker')
-            # DB의 rs_10d를 rs10_score로, rs_20d를 rs20_score로, rs_50d를 rs50_score로 매핑
             rs_kosdaq_df['rs10_score'] = rs_kosdaq_df['rs_10d']
             rs_kosdaq_df['rs20_score'] = rs_kosdaq_df['rs_20d']
             rs_kosdaq_df['rs50_score'] = rs_kosdaq_df['rs_50d']
-            # rs_score 계산 (3개 기간의 평균)
-            rs_kosdaq_df['rs_score'] = round((rs_kosdaq_df['rs10_score'] + 
-                                             rs_kosdaq_df['rs20_score'] + 
-                                             rs_kosdaq_df['rs50_score']) / 3, 2)
-            # 불필요한 컬럼 제거
+            rs_kosdaq_df['rs_score'] = rs_avg(
+                frame=rs_kosdaq_df, cols=('rs_20d', 'rs_50d', 'rs_120d', 'rs_200d')
+            ).round(2)
             rs_kosdaq_df = rs_kosdaq_df[['rs10_score', 'rs20_score', 'rs50_score', 'rs_score']]
             print(f"코스닥 RS 데이터: {len(rs_kosdaq_df)}개 종목")
         else:
@@ -2190,8 +2305,8 @@ if len(selected_df) > 0:
     print("💾 데이터베이스에 저장 중...")
     print("=" * 80)
 
-    con = pymysql.connect(user='root',
-    passwd='GloriaDahn03240701',
+    con = pymysql.connect(user=require_env('DB_USER'),
+    passwd=require_env('DB_PASSWORD'),
     host='127.0.0.1',
     db='kor_stock_db',
     charset='utf8')
@@ -3545,8 +3660,8 @@ def _resolve_indicators_df(indicators_data, ticker):
 
 def _energy_ratio_tradingkis_style(engine, tickers):
     """
-    (거래대금 시장비중) / (시총 시장비중). tradingKIS_test / KRX_market_analysis와 동일 식.
-    최신 krx_ohlcv 일자 기준 당일 거래대금 사용.
+    정본 에너지배율: (tv비중/mcap비중)×(1+tanh(당일등락률%/15)).
+    최신 krx_ohlcv 일자 기준.
     """
     out = {str(t).zfill(6): np.nan for t in tickers}
     if engine is None or not tickers:
@@ -3613,6 +3728,38 @@ def _energy_ratio_tradingkis_style(engine, tickers):
             tdf = pd.read_sql_query(q_tv, con=engine, params=tuple([d0] + chunk))
             for _, rr in tdf.iterrows():
                 tv_t[str(rr["ticker"]).zfill(6)] = float(rr["tv"] or 0)
+        chg_map = {}
+        try:
+            drows = pd.read_sql_query(
+                "SELECT DISTINCT date FROM krx_ohlcv ORDER BY date DESC LIMIT 2",
+                con=engine,
+            )
+            dl = pd.to_datetime(drows["date"], errors="coerce").dropna().sort_values(ascending=False).tolist()
+            if len(dl) >= 2:
+                d0s, d1s = dl[0].strftime("%Y-%m-%d"), dl[1].strftime("%Y-%m-%d")
+                for i0 in range(0, len(ut), _chunk):
+                    chunk = ut[i0 : i0 + _chunk]
+                    _pc = ",".join(["%s"] * len(chunk))
+                    q_ch = f"""
+                        SELECT ticker, date, close FROM krx_ohlcv
+                        WHERE date IN (%s, %s) AND ticker IN ({_pc})
+                    """
+                    cdf = pd.read_sql_query(q_ch, con=engine, params=tuple([d0s, d1s] + chunk))
+                    if cdf.empty:
+                        continue
+                    cdf["ticker"] = cdf["ticker"].astype(str).str.zfill(6)
+                    cdf["date"] = pd.to_datetime(cdf["date"], errors="coerce")
+                    cdf["close"] = pd.to_numeric(cdf["close"], errors="coerce")
+                    for tk0, g0 in cdf.groupby("ticker"):
+                        g0 = g0.sort_values("date")
+                        if len(g0) < 2:
+                            continue
+                        c0 = float(g0["close"].iloc[-1])
+                        c1 = float(g0["close"].iloc[-2])
+                        if np.isfinite(c0) and np.isfinite(c1) and c1 != 0:
+                            chg_map[str(tk0)] = (c0 - c1) / c1 * 100.0
+        except Exception:
+            chg_map = {}
         for tk in ut:
             sec = ticker_sec.get(tk)
             tv_s = tv_t.get(tk)
@@ -3627,7 +3774,8 @@ def _energy_ratio_tradingkis_style(engine, tickers):
             mcap_pct = mc / total_mcap * 100.0
             if mcap_pct <= 0:
                 continue
-            er = tv_pct / mcap_pct
+            ret = chg_map.get(tk)
+            er = energy_ratio(tv_pct, mcap_pct, ret)
             out[tk] = float(er) if np.isfinite(er) else np.nan
     except Exception:
         pass
@@ -3766,21 +3914,13 @@ def _flag_120d_close_high(df):
 
 def _talent_pct(df, window=120, thr=0.10):
     """
-    최근 window거래일 중 (종가/시가 - 1) >= thr 인 날 비중(%).
-    KRX_market_analysis의 Talent(종가 ≥ 시가×1.10)와 동일 정의.
+    최근 window거래일 중 전일종가 대비 등락률 ≥ thr 인 날 비중(%).
+    indicators_core.talent_up_share × 100.
     """
-    if df is None or len(df) < 1:
+    if df is None or len(df) < 1 or "close" not in df.columns:
         return np.nan
-    g = df.tail(window) if len(df) > window else df
-    if "open" not in g.columns or "close" not in g.columns:
-        return np.nan
-    op = pd.to_numeric(g["open"], errors="coerce")
-    cl = pd.to_numeric(g["close"], errors="coerce")
-    m = op.notna() & cl.notna() & (op.astype(float) > 0)
-    if not m.any():
-        return np.nan
-    r = (cl[m].astype(float) / op[m].astype(float)) - 1.0
-    return float((r >= thr).mean() * 100.0)
+    share = talent_up_share(df["close"], window, thr=thr)
+    return float(share * 100.0) if np.isfinite(share) else np.nan
 
 
 def export_screening_summary_html(
