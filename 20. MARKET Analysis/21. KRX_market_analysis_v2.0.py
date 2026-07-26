@@ -1611,7 +1611,7 @@ def _mj_fast_top100_tickers_from_db(engine, quiet: bool = False) -> set[str]:
 
 
 def _load_latest_rs_rank_map(engine) -> dict[str, int]:
-    """최신 krx_relative_strength 기준: 시장별(RS10·20·50·120 평균) 내림차순 RS 순위(1=최상위)."""
+    """최신 krx_relative_strength 기준: 시장별(rs_20·50·120·200 평균) 내림차순 RS 순위(1=최상위)."""
     rank_map, _ = _load_latest_rs_rank_and_score_maps(engine)
     return rank_map
 
@@ -2673,7 +2673,7 @@ def write_rs_high_list_html(
   <h1>RS 고분위 리스트</h1>
   <div class="note">
     기준일: <strong>{ref_d}</strong> (<code>krx_relative_strength</code> 최신 <code>date</code>).<br/>
-    조건: <code>rs_10d</code> &gt;= <strong>90</strong> (백분위). 순위: 시장별 <strong>RS10·20·50·120d 산술평균 내림차순</strong>(평균 컬럼 미표시). RS200d는 미사용.<br/>
+    조건: <code>rs_10d</code> &gt;= <strong>90</strong> (백분위). 순위: 시장별 <strong>rs_20·50·120·200d 산술평균 내림차순</strong>(평균 컬럼 미표시).<br/>
     테마는 <code>krx_theme_stock</code> 기준입니다.<br/>
     <strong>당일 상승률(%)</strong>: 최신 종가 ÷ 직전 거래일 종가 − 1. <strong>5일 상승률(%)</strong>: 최신 종가 ÷ 5거래일 전 종가 − 1.<br/>
     Talent(20/50/120일) 표는 동일 폴더 <a href="{html.escape(os.path.basename(out_talent_path))}"><code>{html.escape(os.path.basename(out_talent_path))}</code></a>를 참고하세요.<br/>
@@ -2694,7 +2694,7 @@ def write_rs_high_list_html(
   <section>
     <h2>2. 코스피 — 최근 20거래일 일별 RS Top20</h2>
     <div class="note" style="margin: 0 0 10px 0;">
-      해당 시장 전체 유니버스에서 일별 RS10·20·50·120d 산술평균 상위 20입니다. 각 칸은 <code>종목명(티커)</code>와 RS10·AVG 요약입니다.<br/>
+      해당 시장 전체 유니버스에서 일별 rs_20·50·120·200d 산술평균 상위 20입니다. 각 칸은 <code>종목명(티커)</code>와 RS10·AVG 요약입니다.<br/>
       <strong>볼드</strong>: 전일 Top20에 있던 종목이 당일에도 포함된 경우(시장별 표에만 적용).
     </div>
     <div class="rs20-wrap">
@@ -2755,7 +2755,7 @@ def write_rs_high_list_html(
   <section>
     <h2>1. 코스피·코스닥 RS 시장순위 상위 100 합산 (Talent120 높은 순, 상위 50)</h2>
     <p style="margin:0 0 10px 0;font-size:12px;color:#555;line-height:1.55;">
-      코스피·코스닥 전체 종목 각각에서 RS10·20·50·120d 산술평균의 시장 내 순위 1~100위에 드는 종목만 모은 유니버스(최대 200종)를 Talent120(일) 내림차순으로 정렬해 상위 50만 표시합니다.
+      코스피·코스닥 전체 종목 각각에서 rs_20·50·120·200d 산술평균의 시장 내 순위 1~100위에 드는 종목만 모은 유니버스(최대 200종)를 Talent120(일) 내림차순으로 정렬해 상위 50만 표시합니다.
     </p>
     {_table_rows_rs_merged_talent_top50(df_rs_talent_top50)}
   </section>
@@ -2794,7 +2794,7 @@ def write_rs_high_list_html(
         except Exception:
             pass
 
-        print(f"완료: RS 고분위 리스트 HTML 저장: {out_path} (총 {len(df)}건, rs_10d>=90, RS10·20·50·120 평균 순)")
+        print(f"완료: RS 고분위 리스트 HTML 저장: {out_path} (총 {len(df)}건, rs_10d>=90, rs_20·50·120·200 평균 순)")
         print(f"완료: Talent 리스트 HTML 저장: {out_talent_path} (Talent20/50/120)")
     return out_path, set(df["ticker"].astype(str).tolist())
 
@@ -4339,12 +4339,12 @@ def write_volatility_spread_top100_html(
         html_h1 = "방향 우세 — 거래대금 Top100 ∩ RS Top100 유니버스"
         univ_line = (
             "<strong>유니버스</strong>: 당일 거래대금(종가×거래량) 기준 코스피·코스닥 각 Top100 보통주 중, "
-            "<code>krx_relative_strength</code> 최신일 RS10·20·50·120 평균의 <strong>시장별 RS 순위 상위 100</strong>에 드는 종목만 "
+            "<code>krx_relative_strength</code> 최신일 rs_20·50·120·200 평균의 <strong>시장별 RS 순위 상위 100</strong>에 드는 종목만 "
             "교집합으로 포함합니다(시장별 최대 100종, 실제 행 수는 교집합 크기). "
             "시장별로 CLV·순방향변동·DRB 기준 방향 우세 순으로 정렬합니다.<br/>"
         )
         rs_detail_line = (
-            "RS순위·RS점수: <code>krx_relative_strength</code> 최신일 RS10·20·50·120 평균의 시장별 순위(1=최상위) 및 평균 점수(백분위). "
+            "RS순위·RS점수: <code>krx_relative_strength</code> 최신일 rs_20·50·120·200 평균의 시장별 순위(1=최상위) 및 평균 점수(백분위). "
             "유니버스가 RS 상위 100과의 교집합이므로 표에 보이는 종목의 RS순위는 모두 100 이내입니다.<br/>"
         )
     else:
@@ -4355,7 +4355,7 @@ def write_volatility_spread_top100_html(
             "시장별로 CLV·순방향변동·DRB 기준 방향 우세 순으로 정렬합니다(각 최대 100종목).<br/>"
         )
         rs_detail_line = (
-            "RS순위·RS점수: <code>krx_relative_strength</code> 최신일 기준(시장별 RS10·20·50·120 평균의 순위·백분위). "
+            "RS순위·RS점수: <code>krx_relative_strength</code> 최신일 기준(시장별 rs_20·50·120·200 평균의 순위·백분위). "
             "RS 테이블이 비어 있으면 교집합 필터는 적용하지 않으며, 해당 칼럼은 비울 수 있습니다.<br/>"
         )
 
@@ -6797,7 +6797,7 @@ def _announce_krx_reports_from_disk(len_rs: int, len_bo: int) -> None:
     if len_rs == 0:
         print(f"완료: RS 리스트 HTML 저장(0건): {p_rs}")
     else:
-        print(f"완료: RS 고분위 리스트 HTML 저장: {p_rs} (총 {len_rs}건, rs_10d>=90, RS10·20·50·120 평균 순)")
+        print(f"완료: RS 고분위 리스트 HTML 저장: {p_rs} (총 {len_rs}건, rs_10d>=90, rs_20·50·120·200 평균 순)")
     _open_if_file(p_rs)
     if os.path.isfile(p_talent):
         print(f"완료: Talent 리스트 HTML 저장: {p_talent}")
