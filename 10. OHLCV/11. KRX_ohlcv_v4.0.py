@@ -6,6 +6,7 @@ Created on Tue Jul 16 15:35:14 2024
 
 v4.0: OHLCV + KRX 종목/ETF 정보(krx_info_v3.0) 통합.
        본 파일만 실행하면 종목·ETF 적재 후 OHLCV 수집까지 수행.
+       일봉 원천: KRX MDCSTAT01501 일자 CSV (전종목 1요청/일). 종목별 크롤링 금지.
 """
 
 
@@ -468,6 +469,8 @@ def get_krx_csv(session, bld, params, retries=3):
     for attempt in range(1, retries + 1):
         try:
             otp = session.post(OTP_URL, data=otp_params, timeout=30).text
+            if 'LOGOUT' in str(otp).upper():
+                raise RuntimeError('OTP=LOGOUT — 로그인 세션이 없습니다.')
             res = session.post(DOWN_URL, data={'code': otp}, timeout=30)
             res.raise_for_status()
 
@@ -484,6 +487,284 @@ def get_krx_csv(session, bld, params, retries=3):
             time.sleep(1 if attempt < retries else 0)
 
     raise RuntimeError(f'KRX CSV 다운로드 실패 (bld={bld}): {last_err}')
+
+
+# ---------------------------------------------------------------------------
+# 전종목 일봉 OHLCV — KRX [12001] MDCSTAT01501 (일자 CSV 1회 = 전종목)
+# ---------------------------------------------------------------------------
+BLD_STOCK_OHLCV = 'dbms/MDC/STAT/standard/MDCSTAT01501'
+OHLCV_FULL_BACKFILL = False  # True: 과거 N년 캘린더 루프, False: DB 최신일+1 ~ biz_day
+OHLCV_BACKFILL_YEARS = 3
+
+
+def _krx_num_series(s):
+    """숫자 파싱. 단독 '-' 만 결측, 부호(-1.23)는 유지."""
+    t = s.astype(str).str.replace(',', '', regex=False).str.strip()
+    t = t.mask(t.isin(['-', '', 'nan', 'None', 'NaN', '<NA>']))
+    return pd.to_numeric(t, errors='coerce')
+
+
+def _krx_pad_ticker(s):
+    t = s.astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+    num = t.str.fullmatch(r'\d+', na=False)
+    return t.where(~num, t.str.zfill(6))
+
+
+def parse_krx_stock_ohlcv_day_csv(df, day_str):
+    """KRX MDCSTAT01501 CSV → krx_ohlcv 적재용 DataFrame."""
+    d = df.copy()
+    d.columns = d.columns.str.replace(' ', '')
+    rename = {
+        '종목코드': 'ticker',
+        '종목명': 'name',
+        '시장구분': 'market',
+        '시가': 'open',
+        '고가': 'high',
+        '저가': 'low',
+        '종가': 'close',
+        '거래량': 'volume',
+        '거래대금': 'trading_value',
+        '시가총액': 'mcap',
+        '등락률': 'chg_pct',
+    }
+    d = d.rename(columns={k: v for k, v in rename.items() if k in d.columns})
+    if 'ticker' not in d.columns or 'close' not in d.columns:
+        raise ValueError(f"OHLCV CSV에 ticker/close 없음: {list(d.columns)}")
+    d['ticker'] = _krx_pad_ticker(d['ticker'])
+    for c in ('open', 'high', 'low', 'close', 'volume', 'trading_value', 'mcap', 'chg_pct'):
+        if c in d.columns:
+            d[c] = _krx_num_series(d[c])
+        else:
+            d[c] = np.nan
+    if 'name' not in d.columns:
+        d['name'] = None
+    if 'market' not in d.columns:
+        d['market'] = None
+    else:
+        d['market'] = d['market'].astype(str).str.strip()
+        d.loc[d['market'].str.contains('코스닥|KOSDAQ', case=False, na=False), 'market'] = 'KOSDAQ'
+        d.loc[d['market'].str.contains('유가|KOSPI', case=False, na=False), 'market'] = 'KOSPI'
+    d['date'] = datetime.strptime(day_str, '%Y%m%d').date()
+    cols = [
+        'ticker', 'date', 'name', 'market',
+        'open', 'high', 'low', 'close', 'volume',
+        'trading_value', 'mcap', 'chg_pct',
+    ]
+    return d[cols].dropna(subset=['ticker', 'close'])
+
+
+def download_krx_stock_ohlcv_day(session, day_str):
+    """전종목 시세 CSV (MDCSTAT01501). (DataFrame, raw_bytes) 반환. 휴장이면 빈 DF."""
+    content = get_krx_csv(
+        session,
+        BLD_STOCK_OHLCV,
+        {'mktId': 'ALL', 'trdDd': day_str, 'share': '1', 'money': '1'},
+    )
+    try:
+        raw = pd.read_csv(BytesIO(content), encoding='EUC-KR')
+    except Exception:
+        return pd.DataFrame(), content
+    if raw is None or len(raw) == 0:
+        return pd.DataFrame(), content
+    return parse_krx_stock_ohlcv_day_csv(raw, day_str), content
+
+
+def ensure_krx_ohlcv_extra_columns(mycursor, con):
+    """
+    krx_ohlcv에 name/market/trading_value/mcap/chg_pct 가 없으면 ADD COLUMN.
+    기존 OHLC·volume 스키마는 유지.
+    """
+    extras = [
+        ('name', 'VARCHAR(100) NULL'),
+        ('market', 'VARCHAR(20) NULL'),
+        ('trading_value', 'BIGINT NULL'),
+        ('mcap', 'BIGINT NULL'),
+        ('chg_pct', 'DOUBLE NULL'),
+    ]
+    mycursor.execute(
+        """
+        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'krx_ohlcv'
+        """
+    )
+    have = {r[0] for r in mycursor.fetchall()}
+    for col, typ in extras:
+        if col not in have:
+            try:
+                mycursor.execute(f'ALTER TABLE krx_ohlcv ADD COLUMN `{col}` {typ}')
+                con.commit()
+                print(f'  · krx_ohlcv.{col} 컬럼 추가')
+            except Exception as e:
+                print(f'  ⚠️ krx_ohlcv.{col} 추가 실패(무시): {e}')
+                con.rollback()
+    mycursor.execute(
+        """
+        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'krx_ohlcv'
+        """
+    )
+    return {r[0] for r in mycursor.fetchall()}
+
+
+def resolve_ohlcv_collect_dates(mycursor, biz_day, full_backfill=False, years=3):
+    """
+    수집 대상 YYYYMMDD 리스트 (캘린더일; 휴장은 CSV 빈 응답으로 스킵).
+    증분: MAX(date)+1 ~ biz_day. 백필: biz_day-years ~ biz_day.
+    """
+    end = datetime.strptime(str(biz_day), '%Y%m%d').date()
+    if full_backfill:
+        start = (pd.Timestamp(end) - pd.DateOffset(years=int(years))).date()
+    else:
+        mycursor.execute('SELECT MAX(`date`) FROM krx_ohlcv')
+        row = mycursor.fetchone()
+        last = row[0] if row else None
+        if last is None:
+            start = (pd.Timestamp(end) - pd.DateOffset(years=int(years))).date()
+        else:
+            if isinstance(last, datetime):
+                last = last.date()
+            elif isinstance(last, pd.Timestamp):
+                last = last.date()
+            start = last + timedelta(days=1)
+    if start > end:
+        return []
+    return [d.strftime('%Y%m%d') for d in pd.date_range(start, end, freq='D')]
+
+
+def upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols, batch_size=1000):
+    """하루치 전종목 DF를 krx_ohlcv에 upsert. 반환: 적재 행 수."""
+    if day_df is None or day_df.empty:
+        return 0
+    value_cols = ['open', 'high', 'low', 'close', 'volume']
+    opt_cols = [c for c in ('name', 'market', 'trading_value', 'mcap', 'chg_pct') if c in table_cols]
+    cols = ['ticker', 'date'] + value_cols + opt_cols
+    use = day_df[[c for c in cols if c in day_df.columns]].copy()
+    for c in value_cols + [x for x in opt_cols if x in ('trading_value', 'mcap', 'chg_pct')]:
+        if c in use.columns:
+            use[c] = pd.to_numeric(use[c], errors='coerce')
+    use = use.dropna(subset=['ticker', 'close'])
+    if use.empty:
+        return 0
+
+    col_sql = ', '.join(f'`{c}`' for c in cols)
+    ph = ', '.join(['%s'] * len(cols))
+    upd = ', '.join(f'`{c}`=new.`{c}`' for c in cols if c not in ('ticker', 'date'))
+    sql = f"""
+    INSERT INTO krx_ohlcv ({col_sql})
+    VALUES ({ph}) AS new
+    ON DUPLICATE KEY UPDATE {upd}
+    """
+    rows = []
+    for r in use.itertuples(index=False):
+        tup = []
+        for v in r:
+            if isinstance(v, float) and (math.isnan(v) or pd.isna(v)):
+                tup.append(None)
+            elif pd.isna(v) if not isinstance(v, (bytes, bytearray)) else False:
+                tup.append(None)
+            else:
+                tup.append(v)
+        rows.append(tuple(tup))
+    saved = 0
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        mycursor.executemany(sql, batch)
+        con.commit()
+        saved += len(batch)
+    return saved
+
+
+def collect_krx_ohlcv_by_days(session, mycursor, con, dates, ticker_filter=None):
+    """
+    거래일(캘린더) 루프로 MDCSTAT01501 일자 CSV 수집·upsert.
+    ticker_filter: 보통주 종목코드 set이면 해당 티커만 적재(None이면 CSV 전종목).
+    """
+    table_cols = ensure_krx_ohlcv_extra_columns(mycursor, con)
+    total_rows = 0
+    ok_days = 0
+    empty_days = 0
+    error_days = []
+    for day in tqdm(dates, desc='KRX 일봉 CSV'):
+        try:
+            day_df, raw = download_krx_stock_ohlcv_day(session, day)
+            if day_df is None or day_df.empty:
+                empty_days += 1
+                continue
+            if ticker_filter is not None:
+                day_df = day_df[day_df['ticker'].isin(ticker_filter)]
+            n = upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols)
+            total_rows += n
+            ok_days += 1
+            _save_krx_csv_backup(raw, 'ohlcv_all', day)
+        except Exception as e:
+            error_days.append(day)
+            print(f'  ⚠️ {day} OHLCV 수집 실패: {e}')
+            print(traceback.format_exc())
+    print(
+        f'  · 일봉 CSV 완료: 거래일적재={ok_days}, 휴장/빈응답={empty_days}, '
+        f'실패={len(error_days)}, 행={total_rows}'
+    )
+    return {'ok_days': ok_days, 'empty_days': empty_days, 'error_days': error_days, 'rows': total_rows}
+
+
+def build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=50):
+    """
+    krx_ohlcv 일봉 → 주봉(금요일 기준 W-FRI) 리샘플 후 krx_ohlcv_week upsert.
+    종목별 네이버 요청 없이 DB만 사용.
+    """
+    query = """
+        INSERT INTO krx_ohlcv_week (ticker, date, open, high, low, close, volume)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) AS new
+        ON DUPLICATE KEY UPDATE
+        open=new.open, high=new.high, low=new.low, close=new.close, volume=new.volume
+    """
+    commit_counter = 0
+    error_list = []
+    for ticker in tqdm(ticker_codes, desc='주봉(일봉→리샘플)'):
+        try:
+            mycursor.execute(
+                """
+                SELECT `date`, open, high, low, close, volume
+                FROM krx_ohlcv WHERE ticker=%s ORDER BY `date`
+                """,
+                (ticker,),
+            )
+            rows = mycursor.fetchall()
+            if not rows:
+                continue
+            price = pd.DataFrame(rows, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+            price['date'] = pd.to_datetime(price['date'])
+            price = price.set_index('date').sort_index()
+            for c in ('open', 'high', 'low', 'close', 'volume'):
+                price[c] = pd.to_numeric(price[c], errors='coerce')
+            week = price.resample('W-FRI').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+            }).dropna(subset=['close'])
+            if week.empty:
+                continue
+            week = week.reset_index()
+            week['ticker'] = ticker
+            week = week[['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']]
+            args = fetch_ohlcv_args_only_changed(
+                mycursor, 'krx_ohlcv_week', ticker, week, ['open', 'high', 'low', 'close', 'volume']
+            )
+            if args:
+                mycursor.executemany(query, args)
+                commit_counter += 1
+                if commit_counter >= batch_size:
+                    con.commit()
+                    commit_counter = 0
+        except Exception:
+            error_list.append(ticker)
+            print(ticker)
+            print(traceback.format_exc())
+    if commit_counter > 0:
+        con.commit()
+    return error_list
 
 
 def _save_krx_csv_backup(content, name, day_str):
@@ -915,10 +1196,15 @@ ticker_list = pd.read_sql(query, con=engine)
 ticker_codes = ticker_list['종목코드'].tolist()
 
 
-### 일봉
+### 일봉 — KRX MDCSTAT01501 일자 CSV (전종목 1요청/일). 종목별 크롤링 금지.
 
-print(' - 일봉 데이터를 저장합니다.')
+print(' - 일봉 데이터를 저장합니다. (KRX CSV MDCSTAT01501)')
+print(f'   모드: {"전체 백필" if OHLCV_FULL_BACKFILL else "증분(daily)"}')
 
+fr = (datetime.strptime(biz_day, '%Y%m%d') + relativedelta(years=-OHLCV_BACKFILL_YEARS)).strftime("%Y%m%d")
+to = datetime.strptime(biz_day, '%Y%m%d').strftime("%Y%m%d")
+
+# 참조 CSV 정합용 upsert (기본 OHLC 스키마)
 query = """
         insert into krx_ohlcv (ticker, date, open, high, low, close, volume)
     values (%s, %s, %s, %s, %s, %s, %s) as new
@@ -926,57 +1212,28 @@ query = """
     open=new.open, high=new.high, low=new.low, close=new.close, volume=new.volume;
 """
 
-## 오류 방생시 저장할 리스트 생성
-
+batch_size = 50
 error_list = []
 
-# 날짜 계산을 루프 밖으로 이동
-fr = (datetime.strptime(biz_day, '%Y%m%d') + relativedelta(years=-3)).strftime("%Y%m%d")
-to = datetime.strptime(biz_day, '%Y%m%d').strftime("%Y%m%d")
+ohlcv_dates = resolve_ohlcv_collect_dates(
+    mycursor, biz_day, full_backfill=OHLCV_FULL_BACKFILL, years=OHLCV_BACKFILL_YEARS
+)
+print(f'   수집 대상 캘린더일: {len(ohlcv_dates)}일'
+      + (f' ({ohlcv_dates[0]}~{ohlcv_dates[-1]})' if ohlcv_dates else ' (없음)'))
 
-# 전 종목 주가 다운로드 및 지표 생성
-batch_size = 50  # executemany N회(종목 단위) 적재 후 커밋
-commit_counter = 0
+krx_ohlcv_session = rq.Session()
+krx_ohlcv_session.headers.update(KRX_INFO_HEADERS)
+if not krx_login(krx_ohlcv_session):
+    raise RuntimeError('KRX 로그인 실패(일봉). 환경변수 KRX_ID / KRX_PW 를 확인하세요.')
 
-# 세션 재사용 (HTTP 연결 재사용으로 속도 향상)
-session = rq.Session()
-session.headers.update({'User-Agent': 'Mozilla/5.0'})
-
-for ticker in tqdm(ticker_codes):
-
-    try:
-        url = f'''https://api.finance.naver.com/siseJson.naver?symbol={ticker}&requestType=1&startTime={fr}&endTime={to}&timeframe=day'''
-        
-        data = session.get(url, timeout=5).content
-        data_price = pd.read_csv(BytesIO(data))
-        
-        price = data_price.iloc[:, 0:6]
-        price.columns = ['date', 'open', 'high', 'low', 'close', 'volume']
-        price = price.dropna()
-        price['date'] = price['date'].str.extract('(\\d+)')
-        price['date'] = pd.to_datetime(price['date'])
-        price['ticker'] = ticker
-        
-        price = price[['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']]
-        
-        args = fetch_ohlcv_args_only_changed(
-            mycursor, 'krx_ohlcv', ticker, price, ['open', 'high', 'low', 'close', 'volume']
-        )
-        if args:
-            mycursor.executemany(query, args)
-            commit_counter += 1
-            if commit_counter >= batch_size:
-                con.commit()
-                commit_counter = 0
-    
-    except:
-        print(ticker)
-        error_list.append(ticker)
-        print(traceback.format_exc())
-
-# 남은 데이터 커밋
-if commit_counter > 0:
-    con.commit()
+ticker_filter = set(str(t).zfill(6) if str(t).isdigit() else str(t) for t in ticker_codes)
+if ohlcv_dates:
+    ohlcv_stats = collect_krx_ohlcv_by_days(
+        krx_ohlcv_session, mycursor, con, ohlcv_dates, ticker_filter=ticker_filter
+    )
+    error_list = list(ohlcv_stats.get('error_days') or [])
+else:
+    print('   (이미 biz_day까지 적재됨 — 일봉 CSV 스킵)')
 
 print(' - 일봉 참조 CSV 정합')
 try:
@@ -987,8 +1244,8 @@ except Exception as e:
     print(f'⚠️ 일봉 참조 CSV 정합 중 오류: {e}')
     print(traceback.format_exc())
 
-session.close()
-    
+krx_ohlcv_session.close()
+
 
 
 ### 투자자별 매매동향
@@ -1664,65 +1921,12 @@ if ENABLE_KIS_INVESTOR_TRADE_KIS:
             print(f"실패 종목: {error_list_kis_investor}")
 
 
-### 주봉
+### 주봉 — 일봉(krx_ohlcv) W-FRI 리샘플 (종목별 외부 요청 없음)
 
-print(' - 주봉 데이터를 저장합니다.')
-
-query = """
-    insert into krx_ohlcv_week (ticker, date, open, high, low, close, volume)
-    values (%s, %s, %s, %s, %s, %s, %s) as new
-    on duplicate key update
-    open=new.open, high=new.high, low=new.low, close=new.close, volume=new.volume;
-"""
-
-## 오류 방생시 저장할 리스트 생성
-
-error_list = []
-
-# 전 종목 주가 다운로드 및 지표 생성
-commit_counter = 0
-
-# 세션 재사용
-session = rq.Session()
-session.headers.update({'User-Agent': 'Mozilla/5.0'})
-
-for ticker in tqdm(ticker_codes):
-
-    try:
-        url = f'''https://api.finance.naver.com/siseJson.naver?symbol={ticker}&requestType=1&startTime={fr}&endTime={to}&timeframe=week'''
-        
-        data = session.get(url, timeout=5).content
-        data_price = pd.read_csv(BytesIO(data))
-        
-        price = data_price.iloc[:, 0:6]
-        price.columns = ['date', 'open', 'high', 'low', 'close', 'volume']
-        price = price.dropna()
-        price['date'] = price['date'].str.extract('(\\d+)')
-        price['date'] = pd.to_datetime(price['date'])
-        price['ticker'] = ticker
-        
-        price = price[['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']]
-        
-        args = fetch_ohlcv_args_only_changed(
-            mycursor, 'krx_ohlcv_week', ticker, price, ['open', 'high', 'low', 'close', 'volume']
-        )
-        if args:
-            mycursor.executemany(query, args)
-            commit_counter += 1
-            if commit_counter >= batch_size:
-                con.commit()
-                commit_counter = 0
-    
-    except:
-        print(ticker)
-        error_list.append(ticker)
-        print(traceback.format_exc())
-
-# 남은 데이터 커밋
-if commit_counter > 0:
-    con.commit()
-
-session.close()
+print(' - 주봉 데이터를 저장합니다. (일봉 DB → W-FRI 리샘플)')
+error_list = build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=batch_size)
+if error_list:
+    print(f'⚠️ 주봉 리샘플 실패 종목 수: {len(error_list)}')
 con.close()
 
 

@@ -2,8 +2,134 @@
 """
 ETF OHLCV 데이터 수집 스크립트
 
-서버에서 ETF 기본 정보를 가져오고, 네이버 금융에서 OHLCV 데이터를 수집하는 모듈
+서버에서 ETF 기본 정보를 가져오고, KRX 정보데이터시스템(MDCSTAT04301)
+일자 CSV로 전 ETF OHLCV를 수집·적재한다. (종목별 크롤링 금지)
 """
+
+
+import os
+import sys
+from pathlib import Path
+
+os.environ["REPO_ROOT"] = r"C:\Users\hachi\OneDrive\02. Project\tradingKRX"
+
+def _find_repo_root():
+    """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""
+    markers = ("env_config.py", ".env", ".git")
+
+    def _is_root(p: Path) -> bool:
+        return any((p / m).exists() for m in markers)
+
+    def _walk_up(start: Path):
+        try:
+            start = Path(start).expanduser().resolve()
+        except Exception:
+            return None
+        if not start.exists():
+            return None
+        if start.is_file():
+            start = start.parent
+        for p in [start, *start.parents]:
+            if _is_root(p):
+                return p
+        return None
+
+    tried = []
+    seen = set()
+    _nl = chr(10)
+    _hint = _nl + "REPO_ROOT 환경변수를 리포 루트로 지정하거나 F5로 실행하세요"
+
+    env_root = os.environ.get("REPO_ROOT", "").strip()
+    if env_root:
+        er = Path(env_root).expanduser()
+        try:
+            er = er.resolve()
+        except Exception as e:
+            raise RuntimeError(
+                "REPO_ROOT 경로를 해석할 수 없습니다: {!r} ({}){}".format(
+                    env_root, e, _hint
+                )
+            ) from e
+        tried.append(str(er))
+        if not er.is_dir():
+            raise RuntimeError(
+                "REPO_ROOT 가 디렉터리가 아닙니다: {}{}".format(er, _hint)
+            )
+        if _is_root(er):
+            return er
+        found = _walk_up(er)
+        if found:
+            return found
+        raise RuntimeError(
+            "REPO_ROOT={} 에서 마커(env_config.py / .env / .git)를 찾지 못했습니다.{}".format(
+                er, _hint
+            )
+        )
+
+    starts = []
+    try:
+        here = Path(__file__).resolve()
+        starts.append(here if here.is_dir() else here.parent)
+    except NameError:
+        pass
+    try:
+        import inspect
+        for fi in inspect.stack():
+            fn = getattr(fi, "filename", None) or ""
+            if not fn or fn.startswith("<"):
+                continue
+            try:
+                p = Path(fn).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() == ".py" and p.is_file():
+                starts.append(p.parent)
+    except Exception:
+        pass
+    starts.append(Path.cwd())
+    for item in sys.path:
+        if not item or item == ".":
+            continue
+        try:
+            p = Path(item)
+            if p.is_dir():
+                starts.append(p)
+        except Exception:
+            continue
+
+    for c in starts:
+        try:
+            key = str(Path(c).expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(key)
+        found = _walk_up(Path(c))
+        if found:
+            return found
+
+    raise RuntimeError(
+        "프로젝트 루트를 찾지 못했습니다 (env_config.py / .env / .git)."
+        + _nl
+        + "탐색 후보:"
+        + _nl
+        + "  - "
+        + (_nl + "  - ").join(tried)
+        + _hint
+    )
+
+_ROOT = _find_repo_root()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from env_config import load_project_env, require_env, db_url, db_connect_kwargs
+from krx_naver_ohlcv import (
+    get_index_ohlcv_from_naver,
+    index_close_series_from_naver,
+)
+load_project_env()
+
 
 import pymysql
 import pandas as pd
@@ -13,6 +139,7 @@ from bs4 import BeautifulSoup
 import re
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
+from io import BytesIO
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import traceback
@@ -36,29 +163,180 @@ try:
 except Exception:
     pass
 
-try:
-    from pykrx import stock
-    PYKRX_AVAILABLE = True
-except ImportError:
-    PYKRX_AVAILABLE = False
-    print("⚠️ pykrx 라이브러리가 설치되지 않았습니다. pip install pykrx로 설치해주세요.")
-
-# pykrx는 스레드 비안전 + 네트워크 타임아웃 없음 → 동시 호출 시 행 발생
-_PYKRX_LOCK = threading.Lock()
-_PYKRX_TIMEOUT_SEC = 60
-_FETCH_RESULT_TIMEOUT_SEC = 300  # 종목당 수집 상한 (pykrx+네이버)
+_FETCH_RESULT_TIMEOUT_SEC = 300  # (레거시) 폴백 워커용
 _FETCH_BATCH_SIZE = 48
 _FETCH_MAX_WORKERS = 6
 
 
-# 서버 설정 (KRX_ohlcv_v2.1.py 참조)
-DB_CONFIG = {
-    'user': 'root',
-    'passwd': 'GloriaDahn03240701',
-    'host': '127.0.0.1',
-    'db': 'kor_stock_db',
-    'charset': 'utf8'
+# 서버 설정 (.env)
+DB_CONFIG = db_connect_kwargs()
+
+# ---------------------------------------------------------------------------
+# KRX OTP CSV (MDCSTAT04301) — naverPub/krx_client 로직 이식 (import 불가)
+# ---------------------------------------------------------------------------
+_KRX_BASE = 'https://data.krx.co.kr'
+KRX_ETF_OHLCV_HEADERS = {
+    'Referer': 'https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201050201',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
 }
+OTP_URL = f'{_KRX_BASE}/comm/fileDn/GenerateOTP/generate.cmd'
+DOWN_URL = f'{_KRX_BASE}/comm/fileDn/download_csv/download.cmd'
+LOGIN_PAGE = f'{_KRX_BASE}/contents/MDC/COMS/client/MDCCOMS001.cmd'
+LOGIN_JSP = f'{_KRX_BASE}/contents/MDC/COMS/client/view/login.jsp?site=mdc'
+LOGIN_URL = f'{_KRX_BASE}/contents/MDC/COMS/client/MDCCOMS001D1.cmd'
+_LOGIN_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+)
+BLD_ETF_OHLCV = 'dbms/MDC/STAT/standard/MDCSTAT04301'
+
+
+def krx_login(session):
+    """KRX_ID / KRX_PW 환경변수로 로그인."""
+    uid, upw = require_env('KRX_ID'), require_env('KRX_PW')
+    session.get(LOGIN_PAGE, headers={'User-Agent': _LOGIN_UA}, timeout=15)
+    session.get(LOGIN_JSP, headers={'User-Agent': _LOGIN_UA, 'Referer': LOGIN_PAGE}, timeout=15)
+    payload = {
+        'mbrNm': '', 'telNo': '', 'di': '', 'certType': '',
+        'mbrId': uid, 'pw': upw,
+    }
+    h = {'User-Agent': _LOGIN_UA, 'Referer': LOGIN_PAGE}
+    data = session.post(LOGIN_URL, data=payload, headers=h, timeout=15).json()
+    code = data.get('_error_code', '')
+    if code == 'CD010':
+        print('⚠️ 비밀번호 변경이 필요합니다. krx.co.kr 에서 변경 후 재시도하세요.')
+        return False
+    if code == 'CD011':
+        payload['skipDup'] = 'Y'
+        data = session.post(LOGIN_URL, data=payload, headers=h, timeout=15).json()
+        code = data.get('_error_code', '')
+    if code == 'CD001':
+        print('· KRX 로그인 성공')
+        return True
+    print(f"⚠️ 로그인 실패: {code} / {data.get('_error_message', '')}")
+    return False
+
+
+def get_krx_csv(session, bld, params, retries=3):
+    """OTP 발급 후 CSV bytes. csvxls_isNo=false 고정."""
+    otp_params = {
+        'locale': 'ko_KR',
+        'name': 'fileDown',
+        'csvxls_isNo': 'false',
+        'url': bld,
+    }
+    otp_params.update(params)
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            otp = session.post(OTP_URL, data=otp_params, timeout=30).text
+            if 'LOGOUT' in str(otp).upper():
+                raise RuntimeError('OTP=LOGOUT — 로그인 세션이 없습니다.')
+            res = session.post(DOWN_URL, data={'code': otp}, timeout=30)
+            res.raise_for_status()
+            if len(res.content) < 100:
+                raise ValueError(f'응답이 비정상적으로 짧음 ({len(res.content)} bytes)')
+            time.sleep(1)
+            return res.content
+        except Exception as e:
+            last_err = e
+            print(f'KRX 다운로드 실패 ({bld}, {attempt}/{retries}): {e}')
+            time.sleep(1 if attempt < retries else 0)
+    raise RuntimeError(f'KRX CSV 다운로드 실패 (bld={bld}): {last_err}')
+
+
+def _etf_num_series(s):
+    t = s.astype(str).str.replace(',', '', regex=False).str.strip()
+    t = t.mask(t.isin(['-', '', 'nan', 'None', 'NaN', '<NA>']))
+    return pd.to_numeric(t, errors='coerce')
+
+
+def _etf_pad_ticker(s):
+    t = s.astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+    num = t.str.fullmatch(r'\d+', na=False)
+    return t.where(~num, t.str.zfill(6))
+
+
+def parse_krx_etf_ohlcv_day_csv(df, day_str):
+    """KRX MDCSTAT04301 CSV → ETF OHLCV 적재용 DF."""
+    d = df.copy()
+    d.columns = d.columns.str.replace(' ', '')
+    rename = {
+        '종목코드': 'ticker',
+        '종목명': 'name',
+        '시가': 'open',
+        '고가': 'high',
+        '저가': 'low',
+        '종가': 'close',
+        '거래량': 'volume',
+        '거래대금': 'trading_value',
+        '순자산가치': 'nav',
+        '순자산가치(NAV)': 'nav',
+        '시가총액': 'mcap',
+        '등락률': 'chg_pct',
+    }
+    d = d.rename(columns={k: v for k, v in rename.items() if k in d.columns})
+    if 'ticker' not in d.columns or 'close' not in d.columns:
+        raise ValueError(f"ETF CSV에 ticker/close 없음: {list(d.columns)}")
+    d['ticker'] = _etf_pad_ticker(d['ticker'])
+    for c in ('open', 'high', 'low', 'close', 'volume', 'trading_value', 'nav', 'mcap', 'chg_pct'):
+        if c in d.columns:
+            d[c] = _etf_num_series(d[c])
+        else:
+            d[c] = np.nan
+    if 'name' not in d.columns:
+        d['name'] = None
+    d['date'] = datetime.strptime(day_str, '%Y%m%d').date()
+    cols = [
+        'ticker', 'date', 'name', 'open', 'high', 'low', 'close', 'volume',
+        'trading_value', 'nav', 'mcap', 'chg_pct',
+    ]
+    return d[cols].dropna(subset=['ticker', 'close'])
+
+
+def download_krx_etf_ohlcv_day(session, day_str):
+    """전 ETF 시세 CSV (MDCSTAT04301)."""
+    content = get_krx_csv(
+        session,
+        BLD_ETF_OHLCV,
+        {'trdDd': day_str, 'share': '1', 'money': '1'},
+    )
+    try:
+        raw = pd.read_csv(BytesIO(content), encoding='EUC-KR')
+    except Exception:
+        try:
+            raw = pd.read_csv(BytesIO(content), encoding='cp949')
+        except Exception:
+            return pd.DataFrame(), content
+    if raw is None or len(raw) == 0:
+        return pd.DataFrame(), content
+    return parse_krx_etf_ohlcv_day_csv(raw, day_str), content
+
+
+def resolve_etf_ohlcv_collect_dates(biz_day, full_backfill=False, backfill_years=3):
+    """증분: 전역 MAX(date)+1~biz_day. 백필: biz_day-years~biz_day. YYYYMMDD 리스트."""
+    end = _as_date(biz_day)
+    if end is None:
+        return []
+    if full_backfill:
+        start = end - relativedelta(years=int(backfill_years))
+    else:
+        try:
+            con = pymysql.connect(**DB_CONFIG)
+            cur = con.cursor()
+            cur.execute('SELECT MAX(`date`) FROM krx_etf_ohlcv')
+            row = cur.fetchone()
+            con.close()
+            last = _as_date(row[0]) if row else None
+        except Exception:
+            last = None
+        if last is None:
+            start = end - relativedelta(years=int(backfill_years))
+        else:
+            start = last + timedelta(days=1)
+    if start > end:
+        return []
+    return [d.strftime('%Y%m%d') for d in pd.date_range(start, end, freq='D')]
 
 # OHLCV 기본 조회·모멘텀: 최소 거래일 수 및 캘린더 룩백(주말·공휴일 여유)
 MIN_OHLCV_TRADING_DAYS = 125
@@ -71,7 +349,7 @@ MOMENTUM_END_BARS_OFFSET = 5  # 하위 호환: T-5 lag와 동일
 OHLCV_LOOKBACK_CALENDAR_DAYS = (MIN_OHLCV_TRADING_DAYS * 365) // 252 + 60
 
 # SQLAlchemy 엔진 생성
-engine = create_engine(f"mysql+pymysql://{DB_CONFIG['user']}:{DB_CONFIG['passwd']}@{DB_CONFIG['host']}:3306/{DB_CONFIG['db']}")
+engine = create_engine(db_url())
 
 
 def get_etf_info_all_columns(criteria_date=None):
@@ -493,491 +771,263 @@ def save_etf_ohlcv_by_ticker(ticker, ohlcv_df, batch_size=50):
     return save_etf_ohlcv_to_db(ohlcv_df, batch_size=batch_size)
 
 
-def get_etf_ohlcv_from_pykrx(ticker, start_date=None, end_date=None):
+
+
+def _as_date(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, pd.Timestamp):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip().replace("-", "").replace(".", "")
+    if len(s) >= 8 and s[:8].isdigit():
+        return datetime.strptime(s[:8], "%Y%m%d").date()
+    return pd.to_datetime(v, errors="coerce").date()
+
+
+def resolve_etf_biz_day():
     """
-    pykrx 라이브러리를 사용하여 ETF OHLCV 데이터를 가져옵니다.
-    
-    Args:
-        ticker (str): ETF 티커 코드 (6자리)
-        start_date (str, optional): 시작일 (YYYYMMDD 형식). None이면 3년 전
-        end_date (str, optional): 종료일 (YYYYMMDD 형식). None이면 오늘
-    
-    Returns:
-        pandas.DataFrame: OHLCV 데이터 (ticker, date, open, high, low, close, volume)
+    기준 영업일: krx_index_ohlcv(1001) 최신일 → 없으면 krx_etf_ohlcv 최신일 → 오늘.
     """
-    if not PYKRX_AVAILABLE:
-        return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-    
     try:
-        # 날짜 설정
-        if end_date is None:
-            end_date = date.today().strftime('%Y%m%d')
-        else:
-            if isinstance(end_date, str) and len(end_date) == 10:  # YYYY-MM-DD 형식
-                end_date = end_date.replace('-', '')
-        
-        if start_date is None:
-            # 3년 전 날짜 계산
-            start_date_obj = datetime.strptime(end_date, '%Y%m%d') - relativedelta(years=3)
-            start_date = start_date_obj.strftime('%Y%m%d')
-        else:
-            if isinstance(start_date, str) and len(start_date) == 10:  # YYYY-MM-DD 형식
-                start_date = start_date.replace('-', '')
-        
-        # pykrx: 락으로 직렬화 + 타임아웃 (미설정 시 워커가 영구 대기할 수 있음)
-        with _PYKRX_LOCK:
-            with ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(stock.get_market_ohlcv_by_date, start_date, end_date, ticker)
-                try:
-                    df = _fut.result(timeout=_PYKRX_TIMEOUT_SEC)
-                except FuturesTimeoutError:
-                    print(f"  ⚠️ pykrx 타임아웃({_PYKRX_TIMEOUT_SEC}s): {ticker}")
-                    return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-        
-        if df.empty:
-            return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # 컬럼명 확인 및 변환
-        df = df.reset_index()
-        
-        # 날짜 컬럼명 확인 (보통 '날짜' 또는 'date')
-        date_col = None
-        for col in ['날짜', 'date', 'Date']:
-            if col in df.columns:
-                date_col = col
-                break
-        
-        if date_col is None and len(df.columns) > 0:
-            # 첫 번째 컬럼이 날짜일 가능성이 높음
-            date_col = df.columns[0]
-        
-        # 데이터 변환
-        result_df = pd.DataFrame()
-        result_df['date'] = pd.to_datetime(df[date_col]).dt.date if date_col else df.index.date
-        
-        # OHLCV 컬럼명 확인 및 매핑
-        column_mapping = {
-            '시가': 'open', 'Open': 'open', 'OPEN': 'open',
-            '고가': 'high', 'High': 'high', 'HIGH': 'high',
-            '저가': 'low', 'Low': 'low', 'LOW': 'low',
-            '종가': 'close', 'Close': 'close', 'CLOSE': 'close',
-            '거래량': 'volume', 'Volume': 'volume', 'VOLUME': 'volume'
-        }
-        
-        for kr_col, en_col in column_mapping.items():
-            if kr_col in df.columns:
-                result_df[en_col] = df[kr_col]
-            elif en_col.title() in df.columns:
-                result_df[en_col] = df[en_col.title()]
-            elif en_col.upper() in df.columns:
-                result_df[en_col] = df[en_col.upper()]
-        
-        # ticker 추가
-        result_df['ticker'] = ticker
-        
-        # 컬럼 순서 정리
-        result_df = result_df[['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']]
-        
-        # NaN 값 제거
-        result_df = result_df.dropna()
-        
-        return result_df
-        
-    except Exception as e:
-        print(f"  ⚠️ pykrx로 {ticker} 데이터 수집 오류: {e}")
-        return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
+        q = "SELECT MAX(date) AS d FROM krx_index_ohlcv WHERE ticker = '1001'"
+        df = pd.read_sql(q, con=engine)
+        if df is not None and len(df) and pd.notna(df.iloc[0]["d"]):
+            return _as_date(df.iloc[0]["d"])
+    except Exception:
+        pass
+    try:
+        q = "SELECT MAX(date) AS d FROM krx_etf_ohlcv"
+        df = pd.read_sql(q, con=engine)
+        if df is not None and len(df) and pd.notna(df.iloc[0]["d"]):
+            return _as_date(df.iloc[0]["d"])
+    except Exception:
+        pass
+    return date.today()
 
 
-def scrape_etf_ohlcv_from_naver(ticker, max_pages=None, retry_count=2):
-    """
-    네이버 금융 일봉 페이지에서 ETF OHLCV 데이터를 스크래핑합니다.
-    
-    Args:
-        ticker (str): ETF 티커 코드 (6자리)
-        max_pages (int, optional): 최대 페이지 수. None이면 모든 페이지 수집
-        retry_count (int): 실패 시 재시도 횟수
-    
-    Returns:
-        pandas.DataFrame: OHLCV 데이터 (ticker, date, open, high, low, close, volume)
-    """
-    for attempt in range(retry_count + 1):
-        session = rq.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
-        
-        all_data = []
-        
-        try:
-            # 첫 페이지에서 총 페이지 수 확인
-            url = f'https://finance.naver.com/item/sise_day.naver?code={ticker}&page=1'
-            response = session.get(url, timeout=15)
-            
-            # 응답 상태 확인
-            if response.status_code != 200:
-                if attempt < retry_count:
-                    time.sleep(1)
-                    continue
-                return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-            
-            response.encoding = 'euc-kr'
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # 페이지가 존재하는지 확인 (에러 페이지 체크)
-            error_msg = soup.find('div', {'class': 'error'}) or soup.find('div', string=re.compile(r'찾을 수 없|존재하지|오류'))
-            if error_msg:
-                # 데이터가 없는 경우 빈 DataFrame 반환
-                session.close()
-                return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-            
-            # 총 페이지 수 찾기
-            total_pages = 1
-            if max_pages is None:
-                # 페이지네이션에서 마지막 페이지 번호 찾기
-                paging_div = soup.find('td', {'class': 'pgRR'})
-                if paging_div:
-                    last_page_link = paging_div.find('a')
-                    if last_page_link:
-                        href = last_page_link.get('href', '')
-                        page_match = re.search(r'page=(\d+)', href)
-                        if page_match:
-                            total_pages = int(page_match.group(1))
-                else:
-                    # 다른 방법: 페이지네이션 링크들에서 최대값 찾기
-                    paging_links = soup.find_all('a', href=re.compile(r'page=\d+'))
-                    page_numbers = []
-                    for link in paging_links:
-                        href = link.get('href', '')
-                        page_match = re.search(r'page=(\d+)', href)
-                        if page_match:
-                            page_numbers.append(int(page_match.group(1)))
-                    if page_numbers:
-                        total_pages = max(page_numbers)
-            else:
-                total_pages = max_pages
-            
-            # 모든 페이지 순회
-            for page in range(1, total_pages + 1):
-                try:
-                    url = f'https://finance.naver.com/item/sise_day.naver?code={ticker}&page={page}'
-                    response = session.get(url, timeout=10)
-                    response.encoding = 'euc-kr'
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    
-                    # 일봉 테이블 찾기
-                    table = soup.find('table', {'class': 'type_2'})
-                    if not table:
-                        # 다른 클래스명 시도
-                        table = soup.find('table')
-                    
-                    if not table:
-                        break
-                    
-                    rows = table.find_all('tr')
-                    if len(rows) <= 1:  # 헤더만 있으면 데이터 없음
-                        break
-                    
-                    # 데이터 행 처리 (헤더 제외)
-                    page_data_count = 0
-                    for row in rows[1:]:
-                        cols = row.find_all('td')
-                        if len(cols) < 7:  # 최소 7개 열 필요 (날짜, 종가, 전일비, 시가, 고가, 저가, 거래량)
-                            continue
-                        
-                        try:
-                            # 날짜 추출 (0열)
-                            date_text = cols[0].get_text(strip=True)
-                            if not date_text or date_text == '':
-                                continue
-                            
-                            # 날짜 형식 변환 (YYYY.MM.DD -> YYYY-MM-DD)
-                            date_match = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', date_text)
-                            if not date_match:
-                                continue
-                            
-                            date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
-                            date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
-                            
-                            # 종가 추출 (1열)
-                            close_text = cols[1].get_text(strip=True).replace(',', '')
-                            if not close_text or close_text == '':
-                                continue
-                            close = float(close_text)
-                            
-                            # 전일비는 건너뛰기 (2열)
-                            
-                            # 시가 추출 (3열)
-                            open_text = cols[3].get_text(strip=True).replace(',', '')
-                            open_val = float(open_text) if open_text and open_text != '' else close
-                            
-                            # 고가 추출 (4열)
-                            high_text = cols[4].get_text(strip=True).replace(',', '')
-                            high_val = float(high_text) if high_text and high_text != '' else close
-                            
-                            # 저가 추출 (5열)
-                            low_text = cols[5].get_text(strip=True).replace(',', '')
-                            low_val = float(low_text) if low_text and low_text != '' else close
-                            
-                            # 거래량 추출 (6열)
-                            volume_text = cols[6].get_text(strip=True).replace(',', '')
-                            volume = int(volume_text) if volume_text and volume_text != '' else 0
-                            
-                            all_data.append({
-                                'ticker': ticker,
-                                'date': date_obj,
-                                'open': open_val,
-                                'high': high_val,
-                                'low': low_val,
-                                'close': close,
-                                'volume': volume
-                            })
-                            page_data_count += 1
-                            
-                        except Exception as e:
-                            continue
-                    
-                    # 페이지에 데이터가 없으면 중단
-                    if page_data_count == 0:
-                        break
-                    
-                    # 요청 간 딜레이 (서버 부하 방지)
-                    time.sleep(0.1)
-                    
-                except Exception as e:
-                    if page == 1:  # 첫 페이지 오류만 출력
-                        if attempt == retry_count:  # 마지막 시도에서만 출력
-                            pass  # 오류는 상위에서 처리
-                    break
-            
-            if all_data:
-                df = pd.DataFrame(all_data)
-                session.close()
-                return df
-            
-            # 모든 페이지 처리 완료 후 세션 종료
-            session.close()
-            
-            # 데이터가 없으면 빈 DataFrame 반환
-            return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-                
-        except Exception as e:
-            session.close()
-            if attempt < retry_count:
-                time.sleep(2)  # 재시도 전 대기
-                continue
-            # 마지막 시도 실패 시 빈 DataFrame 반환
-            return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-    
-    # 모든 재시도 실패
-    return pd.DataFrame(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-
-
-def _fetch_etf_ohlcv_worker(ticker, max_pages_per_etf=None, retry_count=None):
-    """워커: pykrx → 네이버 fallback으로 OHLCV만 수집 (DB 저장은 메인 스레드)."""
-    ohlcv_df = pd.DataFrame()
-    if PYKRX_AVAILABLE:
-        try:
-            ohlcv_df = get_etf_ohlcv_from_pykrx(ticker)
-        except Exception:
-            pass  # pykrx 실패 시 네이버 금융으로 fallback
-
-    if ohlcv_df.empty:
-        if retry_count is None:
-            ohlcv_df = scrape_etf_ohlcv_from_naver(ticker, max_pages=max_pages_per_etf)
-        else:
-            ohlcv_df = scrape_etf_ohlcv_from_naver(
-                ticker, max_pages=max_pages_per_etf, retry_count=retry_count
+def get_etf_ohlcv_latest_dates(tickers=None):
+    """ticker -> DB 최신 저장일(date). tickers 없으면 전체."""
+    try:
+        if tickers:
+            tickers = [str(t) for t in tickers]
+            ph = ",".join(["%s"] * len(tickers))
+            q = (
+                f"SELECT ticker, MAX(date) AS max_date FROM krx_etf_ohlcv "
+                f"WHERE ticker IN ({ph}) GROUP BY ticker"
             )
-    return ticker, ohlcv_df
+            df = pd.read_sql(q, con=engine, params=tuple(tickers))
+        else:
+            q = "SELECT ticker, MAX(date) AS max_date FROM krx_etf_ohlcv GROUP BY ticker"
+            df = pd.read_sql(q, con=engine)
+        if df is None or df.empty:
+            return {}
+        out = {}
+        for _, row in df.iterrows():
+            d = _as_date(row["max_date"])
+            if d is not None:
+                out[str(row["ticker"])] = d
+        return out
+    except Exception:
+        return {}
 
 
-def collect_etf_ohlcv_data(max_etf=None, max_pages_per_etf=None):
+def collect_etf_ohlcv_data(
+    max_etf=None,
+    max_pages_per_etf=None,
+    full_backfill=False,
+    biz_day=None,
+    backfill_years=3,
+):
     """
-    DB에서 ETF 리스트를 가져와서 모든 ETF의 OHLCV 데이터를 수집하고 DB에 저장합니다.
-    
-    Args:
-        max_etf (int, optional): 최대 수집할 ETF 수. None이면 전체
-        max_pages_per_etf (int, optional): ETF당 최대 페이지 수. None이면 전체
-    
-    Returns:
-        dict: 수집 결과 통계
+    ETF OHLCV 수집·DB 저장 (KRX MDCSTAT04301 일자 CSV).
+
+    기본(full_backfill=False): 전역 MAX(date)+1 ~ biz_day 캘린더 루프.
+    full_backfill=True: 최근 backfill_years년 전체 재수집.
+    하루 CSV = 전 ETF 스냅샷 → 종목별 요청 없음.
+    max_etf/max_pages_per_etf 는 호환용(무시·필터만).
     """
-    # 테이블 확인 (한 번만 출력)
+    _ = max_pages_per_etf  # 레거시 인자 (무시)
     ensure_etf_ohlcv_table(verbose=True)
-    
-    # ETF 리스트 가져오기
+
+    if biz_day is None:
+        biz_day = resolve_etf_biz_day()
+    else:
+        biz_day = _as_date(biz_day)
+    print(f"기준 영업일(biz_day): {biz_day}")
+    print(f"모드: {'전체 백필' if full_backfill else '증분(daily)'} — KRX CSV MDCSTAT04301")
+
     print("ETF 리스트 조회 중...")
     etf_list = get_etf_list_from_db()
-    
     if etf_list.empty:
         print("⚠️ ETF 리스트가 비어있습니다.")
-        return {'success': 0, 'failed': 0, 'total_records': 0, 'error_list': []}
-    
-    # 최대 수집 개수 제한
+        return {
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total_records": 0,
+            "error_list": [],
+            "biz_day": biz_day,
+        }
+
     if max_etf:
         etf_list = etf_list.head(max_etf)
-    
-    print(f"총 {len(etf_list)}개 ETF의 OHLCV 데이터 수집 시작")
-    print(
-        f"  (병렬 workers={_FETCH_MAX_WORKERS}, batch={_FETCH_BATCH_SIZE}, "
-        f"pykrx timeout={_PYKRX_TIMEOUT_SEC}s)"
+
+    tickers = set()
+    for _, r in etf_list.iterrows():
+        t = str(r["ticker"]).strip()
+        tickers.add(t.zfill(6) if t.isdigit() else t)
+
+    dates = resolve_etf_ohlcv_collect_dates(
+        biz_day, full_backfill=full_backfill, backfill_years=backfill_years
     )
-    
-    error_list = []
-    success_count = 0
+    print(f"총 {len(tickers)}개 ETF 필터 — 수집 캘린더일 {len(dates)}"
+          + (f" ({dates[0]}~{dates[-1]})" if dates else " (없음, 스킵)"))
+
+    if not dates:
+        return {
+            "success": 0,
+            "failed": 0,
+            "skipped": len(tickers),
+            "total_records": 0,
+            "error_list": [],
+            "biz_day": biz_day,
+        }
+
+    session = rq.Session()
+    session.headers.update(KRX_ETF_OHLCV_HEADERS)
+    if not krx_login(session):
+        session.close()
+        raise RuntimeError("KRX 로그인 실패. 환경변수 KRX_ID / KRX_PW 를 확인하세요.")
+
+    error_days = []
+    ok_days = 0
+    empty_days = 0
     total_records = 0
-
-    tasks = [
-        (str(row['ticker']), row['etf_name'])
-        for _, row in etf_list.iterrows()
-    ]
-
-    pbar = tqdm(total=len(tasks), desc="ETF OHLCV 수집")
     try:
-        for batch_start in range(0, len(tasks), _FETCH_BATCH_SIZE):
-            batch = tasks[batch_start:batch_start + _FETCH_BATCH_SIZE]
-            with ThreadPoolExecutor(max_workers=_FETCH_MAX_WORKERS) as executor:
-                future_map = {
-                    executor.submit(_fetch_etf_ohlcv_worker, ticker, max_pages_per_etf): (ticker, etf_name)
-                    for ticker, etf_name in batch
-                }
-
-                for fut in as_completed(future_map):
-                    ticker, etf_name = future_map[fut]
-                    try:
-                        _ticker, ohlcv_df = fut.result(timeout=_FETCH_RESULT_TIMEOUT_SEC)
-                        if not ohlcv_df.empty:
-                            # DB 저장은 메인 스레드에서 순차 수행 (커넥션 스레드 안전)
-                            save_result = save_etf_ohlcv_by_ticker(ticker, ohlcv_df)
-
-                            if save_result['success']:
-                                success_count += 1
-                                total_records += save_result['records_saved']
-                            else:
-                                error_list.append(ticker)
-                                if len(error_list) <= 5:
-                                    print(f"  ⚠️ {ticker} ({etf_name}): 저장 실패 - {save_result['error']}")
-                        else:
-                            error_list.append(ticker)
-                            if len(error_list) <= 5:
-                                print(f"  ⚠️ {ticker} ({etf_name}): 데이터 없음")
-
-                    except FuturesTimeoutError:
-                        error_list.append(ticker)
-                        print(
-                            f"  ⚠️ {ticker} ({etf_name}): 수집 타임아웃"
-                            f"({_FETCH_RESULT_TIMEOUT_SEC}s) — 스킵"
-                        )
-                    except Exception as e:
-                        error_list.append(ticker)
-                        if len(error_list) <= 5:
-                            print(f"  ⚠️ {ticker} ({etf_name}) 수집 오류: {e}")
-                            print(traceback.format_exc())
-                    finally:
-                        pbar.update(1)
+        for day in tqdm(dates, desc="ETF OHLCV KRX CSV"):
+            try:
+                day_df, _raw = download_krx_etf_ohlcv_day(session, day)
+                if day_df is None or day_df.empty:
+                    empty_days += 1
+                    continue
+                day_df = day_df[day_df["ticker"].isin(tickers)]
+                if day_df.empty:
+                    empty_days += 1
+                    continue
+                save_df = day_df[["ticker", "date", "open", "high", "low", "close", "volume"]].copy()
+                result = save_etf_ohlcv_to_db(save_df, batch_size=200)
+                if result.get("success"):
+                    ok_days += 1
+                    total_records += int(result.get("records_saved") or 0)
+                else:
+                    error_days.append(day)
+                    print(f"  ⚠️ {day} 저장 실패: {result.get('error')}")
+            except Exception as e:
+                error_days.append(day)
+                print(f"  ⚠️ {day} ETF OHLCV 수집 실패: {e}")
+                print(traceback.format_exc())
     finally:
-        pbar.close()
-    
-    print(f"\n✓ ETF OHLCV 데이터 수집 완료")
-    print(f"  - 성공: {success_count}개 ETF")
-    print(f"  - 실패: {len(error_list)}개 ETF")
+        session.close()
+
+    print(f"\n✓ ETF OHLCV 데이터 수집 완료 (biz_day={biz_day})")
+    print(f"  - 적재 거래일: {ok_days}")
+    print(f"  - 휴장/빈응답: {empty_days}")
+    print(f"  - 실패 일수: {len(error_days)}")
     print(f"  - 총 레코드 수: {total_records}개")
-    
-    if error_list:
-        print(f"\n⚠️ 수집 실패 ETF:")
-        if len(error_list) <= 10:
-            print(f"  {error_list}")
-        else:
-            print(f"  {error_list[:10]} ... (총 {len(error_list)}개)")
-    
+    if error_days:
+        print(f"  실패일: {error_days[:10]}{'...' if len(error_days) > 10 else ''}")
+
     return {
-        'success': success_count,
-        'failed': len(error_list),
-        'total_records': total_records,
-        'error_list': error_list
+        "success": ok_days,
+        "failed": len(error_days),
+        "skipped": empty_days,
+        "total_records": total_records,
+        "error_list": error_days,
+        "biz_day": biz_day,
     }
 
 
-def retry_failed_etf_ohlcv(error_list, max_pages_per_etf=None):
+def retry_failed_etf_ohlcv(
+    error_list,
+    max_pages_per_etf=None,
+    full_backfill=False,
+    biz_day=None,
+    backfill_years=3,
+):
     """
-    실패한 ETF들의 OHLCV 데이터를 재수집합니다.
-    
-    Args:
-        error_list (list): 실패한 ETF 티커 리스트
-        max_pages_per_etf (int, optional): ETF당 최대 페이지 수. None이면 모든 페이지 수집
-    
-    Returns:
-        dict: 수집 결과 통계
+    실패한 '일자'(YYYYMMDD) 재수집. 레거시 티커 리스트가 오면 full 증분 재실행.
     """
+    _ = max_pages_per_etf
     if not error_list:
-        print("재수집할 실패 ETF가 없습니다.")
-        return {'success': 0, 'failed': 0, 'total_records': 0, 'error_list': []}
-    
-    print(f"\n실패한 {len(error_list)}개 ETF 재수집 시작...")
-    
-    # 테이블 확인 (조용히 수행)
+        print("재수집할 실패 항목이 없습니다.")
+        return {"success": 0, "failed": 0, "skipped": 0, "total_records": 0, "error_list": []}
+
+    if biz_day is None:
+        biz_day = resolve_etf_biz_day()
+    else:
+        biz_day = _as_date(biz_day)
+
+    day_like = [str(x).replace("-", "") for x in error_list if str(x).replace("-", "").isdigit() and len(str(x).replace("-", "")) == 8]
+    if not day_like:
+        print("레거시 티커 실패 목록 → 증분/백필 전체 재수집으로 대체")
+        return collect_etf_ohlcv_data(
+            full_backfill=full_backfill, biz_day=biz_day, backfill_years=backfill_years
+        )
+
+    print(f"\n실패한 {len(day_like)}개 일자 ETF OHLCV 재수집... (biz_day={biz_day})")
     ensure_etf_ohlcv_table(verbose=False)
-    
+    etf_list = get_etf_list_from_db()
+    tickers = set()
+    for _, r in etf_list.iterrows():
+        t = str(r["ticker"]).strip()
+        tickers.add(t.zfill(6) if t.isdigit() else t)
+
+    session = rq.Session()
+    session.headers.update(KRX_ETF_OHLCV_HEADERS)
+    if not krx_login(session):
+        session.close()
+        raise RuntimeError("KRX 로그인 실패(재수집).")
+
     error_list_retry = []
     success_count = 0
     total_records = 0
-
-    tickers = [str(t) for t in error_list]
-    pbar = tqdm(total=len(tickers), desc="실패 ETF 재수집")
     try:
-        for batch_start in range(0, len(tickers), _FETCH_BATCH_SIZE):
-            batch = tickers[batch_start:batch_start + _FETCH_BATCH_SIZE]
-            with ThreadPoolExecutor(max_workers=_FETCH_MAX_WORKERS) as executor:
-                future_map = {
-                    executor.submit(
-                        _fetch_etf_ohlcv_worker, ticker, max_pages_per_etf, 3
-                    ): ticker
-                    for ticker in batch
-                }
-
-                for fut in as_completed(future_map):
-                    ticker = future_map[fut]
-                    try:
-                        _ticker, ohlcv_df = fut.result(timeout=_FETCH_RESULT_TIMEOUT_SEC)
-                        if not ohlcv_df.empty:
-                            save_result = save_etf_ohlcv_by_ticker(ticker, ohlcv_df)
-
-                            if save_result['success']:
-                                success_count += 1
-                                total_records += save_result['records_saved']
-                            else:
-                                error_list_retry.append(ticker)
-                        else:
-                            error_list_retry.append(ticker)
-
-                    except FuturesTimeoutError:
-                        error_list_retry.append(ticker)
-                        print(f"  ⚠️ {ticker}: 재수집 타임아웃({_FETCH_RESULT_TIMEOUT_SEC}s) — 스킵")
-                    except Exception as e:
-                        error_list_retry.append(ticker)
-                        print(f"  ⚠️ {ticker} 재수집 오류: {e}")
-                    finally:
-                        pbar.update(1)
+        for day in tqdm(day_like, desc="실패일 ETF 재수집"):
+            try:
+                day_df, _raw = download_krx_etf_ohlcv_day(session, day)
+                if day_df is None or day_df.empty:
+                    error_list_retry.append(day)
+                    continue
+                day_df = day_df[day_df["ticker"].isin(tickers)]
+                save_df = day_df[["ticker", "date", "open", "high", "low", "close", "volume"]].copy()
+                result = save_etf_ohlcv_to_db(save_df, batch_size=200)
+                if result.get("success"):
+                    success_count += 1
+                    total_records += int(result.get("records_saved") or 0)
+                else:
+                    error_list_retry.append(day)
+            except Exception as e:
+                error_list_retry.append(day)
+                print(f"  ⚠️ {day} 재수집 오류: {e}")
     finally:
-        pbar.close()
-    
-    print(f"\n✓ 실패 ETF 재수집 완료")
-    print(f"  - 성공: {success_count}개 ETF")
-    print(f"  - 실패: {len(error_list_retry)}개 ETF")
+        session.close()
+
+    print(f"\n✓ 실패일 ETF 재수집 완료")
+    print(f"  - 성공: {success_count}일")
+    print(f"  - 실패: {len(error_list_retry)}일")
     print(f"  - 총 레코드 수: {total_records}개")
-    
-    if error_list_retry:
-        print(f"\n⚠️ 재수집 실패 ETF ({len(error_list_retry)}개):")
-        if len(error_list_retry) <= 20:
-            print(f"  {error_list_retry}")
-        else:
-            print(f"  {error_list_retry[:20]} ... (총 {len(error_list_retry)}개)")
-    
+
     return {
-        'success': success_count,
-        'failed': len(error_list_retry),
-        'total_records': total_records,
-        'error_list': error_list_retry
+        "success": success_count,
+        "failed": len(error_list_retry),
+        "skipped": 0,
+        "total_records": total_records,
+        "error_list": error_list_retry,
+        "biz_day": biz_day,
     }
 
 
@@ -1647,7 +1697,7 @@ def _momentum_color_class(x):
 def _get_kospi_daily_return_pct_for_ref_date(ref_date):
     """
     ref_date( date ) 당일 종가 대비 직전 거래일 종가 수익률(%).
-    DB krx_index_ohlcv(ticker=1001) 우선, 실패 시 pykrx 보조.
+    DB krx_index_ohlcv(ticker=1001) 우선, 실패 시 네이버 보조.
     """
     if ref_date is None:
         return np.nan
@@ -1676,22 +1726,11 @@ def _get_kospi_daily_return_pct_for_ref_date(ref_date):
     except Exception:
         pass
 
-    if not PYKRX_AVAILABLE:
-        return np.nan
     try:
-        fr = (ref_date - timedelta(days=21)).strftime('%Y%m%d')
-        to = ref_date.strftime('%Y%m%d')
-        idx = stock.get_index_ohlcv_by_date(fr, to, '1001')
-        if idx is None or idx.empty:
+        s = index_close_series_from_naver('1001', ref_date, lookback_calendar_days=40)
+        if s is None or len(s) < 2:
             return np.nan
-        col = '종가' if '종가' in idx.columns else ('close' if 'close' in idx.columns else None)
-        if col is None:
-            return np.nan
-        s = pd.to_numeric(idx[col], errors='coerce').dropna()
-        if len(s) < 2:
-            return np.nan
-        c0 = float(s.iloc[-2])
-        c1 = float(s.iloc[-1])
+        c0 = float(s.iloc[-2]); c1 = float(s.iloc[-1])
         if c0 > 0:
             return (c1 / c0 - 1.0) * 100.0
     except Exception:
@@ -1703,7 +1742,7 @@ def _get_kospi_3d_return_pct_for_ref_date(ref_date):
     """
     ref_date( date ) 당일 종가 대비, ref_date 기준 거래일 역순 3번째 행의 종가 수익률(%).
     (역순 1=당일, 2=직전 거래일, 3=그 직전 거래일 종가를 분모로 사용)
-    DB krx_index_ohlcv(ticker=1001) 우선, 실패 시 pykrx 보조.
+    DB krx_index_ohlcv(ticker=1001) 우선, 실패 시 네이버 보조.
     """
     if ref_date is None:
         return np.nan
@@ -1732,22 +1771,11 @@ def _get_kospi_3d_return_pct_for_ref_date(ref_date):
     except Exception:
         pass
 
-    if not PYKRX_AVAILABLE:
-        return np.nan
     try:
-        fr = (ref_date - timedelta(days=60)).strftime('%Y%m%d')
-        to = ref_date.strftime('%Y%m%d')
-        idx = stock.get_index_ohlcv_by_date(fr, to, '1001')
-        if idx is None or idx.empty:
+        s = index_close_series_from_naver('1001', ref_date, lookback_calendar_days=90)
+        if s is None or len(s) < 3:
             return np.nan
-        col = '종가' if '종가' in idx.columns else ('close' if 'close' in idx.columns else None)
-        if col is None:
-            return np.nan
-        s = pd.to_numeric(idx[col], errors='coerce').dropna()
-        if len(s) < 3:
-            return np.nan
-        c_base = float(s.iloc[-3])
-        c0 = float(s.iloc[-1])
+        c_base = float(s.iloc[-3]); c0 = float(s.iloc[-1])
         if c_base > 0:
             return (c0 / c_base - 1.0) * 100.0
     except Exception:
@@ -1791,22 +1819,11 @@ def _get_kospi_nd_trading_return_pct_for_ref_date(ref_date, n_trading_days: int)
     except Exception:
         pass
 
-    if not PYKRX_AVAILABLE:
-        return np.nan
     try:
-        fr = (ref_date - timedelta(days=max(400, n * 5))).strftime('%Y%m%d')
-        to = ref_date.strftime('%Y%m%d')
-        idx = stock.get_index_ohlcv_by_date(fr, to, '1001')
-        if idx is None or idx.empty:
+        s = index_close_series_from_naver('1001', ref_date, lookback_calendar_days=max(400, n * 5))
+        if s is None or len(s) < limit:
             return np.nan
-        col = '종가' if '종가' in idx.columns else ('close' if 'close' in idx.columns else None)
-        if col is None:
-            return np.nan
-        s = pd.to_numeric(idx[col], errors='coerce').dropna()
-        if len(s) < limit:
-            return np.nan
-        c_n = float(s.iloc[-(n + 1)])
-        c0 = float(s.iloc[-1])
+        c_n = float(s.iloc[-(n + 1)]); c0 = float(s.iloc[-1])
         if c_n > 0:
             return (c0 / c_n - 1.0) * 100.0
     except Exception:
@@ -1817,7 +1834,7 @@ def _get_kospi_nd_trading_return_pct_for_ref_date(ref_date, n_trading_days: int)
 def _get_kospi_close_and_sma_for_ref_date(ref_date, windows=(5, 10, 20)):
     """
     ref_date 이하 코스피(1001) 종가로 기준일(마지막 행) 종가 및 단순이동평균(SMA) 값.
-    DB krx_index_ohlcv 우선, 실패 시 pykrx 보조.
+    DB krx_index_ohlcv 우선, 실패 시 네이버 보조.
 
     Returns:
         dict: 'close', 'ma5', 'ma10', 'ma20' 키 — 값은 float 또는 np.nan
@@ -1855,26 +1872,18 @@ def _get_kospi_close_and_sma_for_ref_date(ref_date, windows=(5, 10, 20)):
         except Exception:
             return None
 
-    def _series_from_pykrx():
-        if not PYKRX_AVAILABLE:
-            return None
+    def _series_from_naver():
         try:
-            fr = (ref_date - timedelta(days=max(400, max_w * 5))).strftime('%Y%m%d')
-            to = ref_date.strftime('%Y%m%d')
-            idx = stock.get_index_ohlcv_by_date(fr, to, '1001')
-            if idx is None or idx.empty:
+            s = index_close_series_from_naver('1001', ref_date, lookback_calendar_days=max(400, max_w * 5))
+            if s is None or s.empty:
                 return None
-            col = '종가' if '종가' in idx.columns else ('close' if 'close' in idx.columns else None)
-            if col is None:
-                return None
-            s = pd.to_numeric(idx[col], errors='coerce').dropna()
             return s if len(s) >= max_w else None
         except Exception:
             return None
 
     s_closes = _series_from_db()
     if s_closes is None:
-        s_closes = _series_from_pykrx()
+        s_closes = _series_from_naver()
     if s_closes is None or s_closes.empty:
         return dict(empty)
 
@@ -1961,49 +1970,29 @@ def _get_kospi_weekly_return_pct_for_ref_ts(ref_ts):
     except Exception:
         pass
 
-    if not PYKRX_AVAILABLE:
-        return np.nan
     try:
-        fr = (week_monday - timedelta(days=7)).strftime('%Y%m%d')
-        to = ref_d.strftime('%Y%m%d')
-        idx = stock.get_index_ohlcv_by_date(fr, to, '1001')
-        if idx is None or idx.empty:
+        df = get_index_ohlcv_from_naver(
+            '1001',
+            (week_monday - timedelta(days=7)).strftime('%Y%m%d'),
+            ref_d.strftime('%Y%m%d'),
+        )
+        if df is None or df.empty:
             return np.nan
-        open_col = '시가' if '시가' in idx.columns else ('open' if 'open' in idx.columns else None)
-        close_col = '종가' if '종가' in idx.columns else ('close' if 'close' in idx.columns else None)
-        if close_col is None and open_col is None:
-            return np.nan
-        cols = []
-        if open_col is not None:
-            cols.append(open_col)
-        if close_col is not None:
-            cols.append(close_col)
-        tmp = idx[cols].copy()
-        tmp['_d'] = pd.to_datetime(tmp.index, errors='coerce').dt.normalize()
-        if open_col is not None:
-            tmp[open_col] = pd.to_numeric(tmp[open_col], errors='coerce')
-        if close_col is not None:
-            tmp[close_col] = pd.to_numeric(tmp[close_col], errors='coerce')
-        # close 우선 기준으로 필터, close가 없으면 open으로 필터
-        val_col = close_col if close_col is not None else open_col
-        tmp = tmp[tmp['_d'].notna() & tmp[val_col].notna()].copy()
+        tmp = df.copy()
+        tmp['_d'] = pd.to_datetime(tmp['date'], errors='coerce').dt.normalize()
+        tmp['open'] = pd.to_numeric(tmp['open'], errors='coerce')
+        tmp['close'] = pd.to_numeric(tmp['close'], errors='coerce')
+        tmp = tmp[tmp['_d'].notna() & tmp['close'].notna()].copy()
         ic = tmp['_d'].dt.isocalendar()
         wk_mask = (ic.year.astype(int) == iso_y) & (ic.week.astype(int) == iso_w)
         wk = tmp.loc[wk_mask].sort_values('_d')
         wk = wk[wk['_d'] <= ref_ts].sort_values('_d')
         if len(wk) < 1:
             return np.nan
-        # open이 있으면 open을 기준으로, 없으면 close로(혹은 open) 기준가를 잡음
-        if open_col is not None:
-            o_first = float(wk.iloc[0][open_col])
-        else:
-            o_first = np.nan
-        if close_col is not None:
-            c_last = float(wk.iloc[-1][close_col])
-        else:
-            c_last = float(wk.iloc[-1][open_col])
+        o_first = float(wk.iloc[0]['open']) if pd.notna(wk.iloc[0]['open']) else np.nan
+        c_last = float(wk.iloc[-1]['close'])
         if not (pd.notna(o_first) and o_first > 0):
-            o_first = float(wk.iloc[0][close_col]) if close_col is not None else np.nan
+            o_first = float(wk.iloc[0]['close'])
         if pd.notna(o_first) and o_first > 0 and pd.notna(c_last):
             return (c_last / o_first - 1.0) * 100.0
     except Exception:
@@ -6425,21 +6414,23 @@ if __name__ == "__main__":
     
     # ETF OHLCV 데이터 수집 (전체)
     print("\n" + "=" * 50)
-    print("ETF OHLCV 데이터 수집 시작")
+    print("ETF OHLCV 데이터 수집 시작 (KRX MDCSTAT04301)")
     print("=" * 50)
     
-    # 전체 ETF 수집 (max_etf=None: 전체, max_pages_per_etf=None: 모든 페이지)
-    print("\n전체 ETF의 OHLCV 데이터 수집을 시작합니다...")
-    print("⚠️ 이 작업은 시간이 오래 걸릴 수 있습니다.")
-    result = collect_etf_ohlcv_data(max_etf=None, max_pages_per_etf=None)
+    # 기본: 증분 수집. 최초 전체 히스토리는 full_backfill=True
+    print("\nETF OHLCV 증분 수집을 시작합니다... (전체 백필: full_backfill=True)")
+    result = collect_etf_ohlcv_data(max_etf=None, full_backfill=False)
     print(f"\n수집 결과: {result}")
-    
-    # 실패한 ETF 재수집
-    if result.get('error_list') and len(result['error_list']) > 0:
+
+    if result.get("error_list") and len(result["error_list"]) > 0:
         print("\n" + "=" * 50)
-        print("실패한 ETF 재수집 시작")
+        print("실패한 일자 ETF 재수집 시작")
         print("=" * 50)
-        retry_result = retry_failed_etf_ohlcv(result['error_list'], max_pages_per_etf=None)
+        retry_result = retry_failed_etf_ohlcv(
+            result["error_list"],
+            full_backfill=False,
+            biz_day=result.get("biz_day"),
+        )
         print(f"\n재수집 결과: {retry_result}")
     
     # ETF 모멘텀 분석
