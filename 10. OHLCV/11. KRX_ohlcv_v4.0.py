@@ -7,6 +7,7 @@ Created on Tue Jul 16 15:35:14 2024
 v4.0: OHLCV + KRX 종목/ETF 정보(krx_info_v3.0) 통합.
        본 파일만 실행하면 종목·ETF 적재 후 OHLCV 수집까지 수행.
        일봉 원천: KRX MDCSTAT01501 일자 CSV (전종목 1요청/일). 종목별 크롤링 금지.
+       투자자별 매매: KRX 12010 MDCSTAT02401 (일자×투자자구분 CSV). frgn.naver 제거.
 """
 
 
@@ -493,8 +494,39 @@ def get_krx_csv(session, bld, params, retries=3):
 # 전종목 일봉 OHLCV — KRX [12001] MDCSTAT01501 (일자 CSV 1회 = 전종목)
 # ---------------------------------------------------------------------------
 BLD_STOCK_OHLCV = 'dbms/MDC/STAT/standard/MDCSTAT01501'
-OHLCV_FULL_BACKFILL = False  # True: 과거 N년 캘린더 루프, False: DB 최신일+1 ~ biz_day
-OHLCV_BACKFILL_YEARS = 3
+# DB 비어 있을 때만: 최근 N거래일 분량(캘린더 여유 포함) 또는 지정 시작일
+OHLCV_INITIAL_TRADING_DAYS = 250
+OHLCV_INITIAL_START = None  # 예: '20240101' — 지정 시 초기 백필 시작일(YYYYMMDD)
+
+
+def _as_plain_date(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, pd.Timestamp):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip().replace('-', '').replace('.', '')
+    if len(s) >= 8 and s[:8].isdigit():
+        return datetime.strptime(s[:8], '%Y%m%d').date()
+    try:
+        return pd.to_datetime(v, errors='coerce').date()
+    except Exception:
+        return None
+
+
+def _calendar_days_for_trading_days(n_trading):
+    """거래일 N ≈ 캘린더일 (주말·공휴일 여유)."""
+    n = max(1, int(n_trading))
+    return (n * 7) // 5 + 40
+
+
+def _calendar_ymd_range(start_d, end_d):
+    if start_d is None or end_d is None or start_d > end_d:
+        return []
+    return [d.strftime('%Y%m%d') for d in pd.date_range(start_d, end_d, freq='D')]
 
 
 def _krx_num_series(s):
@@ -606,35 +638,73 @@ def ensure_krx_ohlcv_extra_columns(mycursor, con):
     return {r[0] for r in mycursor.fetchall()}
 
 
-def resolve_ohlcv_collect_dates(mycursor, biz_day, full_backfill=False, years=3):
+def resolve_ohlcv_collect_plan(
+    mycursor,
+    biz_day,
+    table='krx_ohlcv',
+    initial_trading_days=OHLCV_INITIAL_TRADING_DAYS,
+    initial_start=OHLCV_INITIAL_START,
+):
     """
-    수집 대상 YYYYMMDD 리스트 (캘린더일; 휴장은 CSV 빈 응답으로 스킵).
-    증분: MAX(date)+1 ~ biz_day. 백필: biz_day-years ~ biz_day.
+    DB MAX(date) 기준 자동 증분 수집 플랜.
+    - DB 비어 있음: 최근 initial_trading_days(또는 initial_start) ~ biz_day
+    - MAX == biz_day: 스킵
+    - MAX < biz_day: (MAX+1일) ~ biz_day 캘린더 순회(휴장은 CSV 빈응답으로 스킵)
     """
-    end = datetime.strptime(str(biz_day), '%Y%m%d').date()
-    if full_backfill:
-        start = (pd.Timestamp(end) - pd.DateOffset(years=int(years))).date()
-    else:
-        mycursor.execute('SELECT MAX(`date`) FROM krx_ohlcv')
-        row = mycursor.fetchone()
-        last = row[0] if row else None
-        if last is None:
-            start = (pd.Timestamp(end) - pd.DateOffset(years=int(years))).date()
+    end = _as_plain_date(biz_day)
+    mycursor.execute(f'SELECT MAX(`date`) FROM `{table}`')
+    row = mycursor.fetchone()
+    db_max = _as_plain_date(row[0]) if row else None
+
+    plan = {
+        'mode': 'skip',
+        'table': table,
+        'db_max': db_max,
+        'biz_day': end,
+        'from_date': None,
+        'to_date': end,
+        'dates': [],
+        'message': '',
+    }
+    if end is None:
+        plan['message'] = '기준영업일 없음 — 스킵'
+        return plan
+
+    if db_max is None:
+        if initial_start:
+            start = _as_plain_date(initial_start)
         else:
-            if isinstance(last, datetime):
-                last = last.date()
-            elif isinstance(last, pd.Timestamp):
-                last = last.date()
-            start = last + timedelta(days=1)
-    if start > end:
-        return []
-    return [d.strftime('%Y%m%d') for d in pd.date_range(start, end, freq='D')]
+            start = end - timedelta(days=_calendar_days_for_trading_days(initial_trading_days))
+        plan['mode'] = 'initial'
+        plan['from_date'] = start
+        plan['dates'] = _calendar_ymd_range(start, end)
+        plan['message'] = (
+            f'DB 비어 있음 → 초기 백필 {start}~{end} '
+            f'(캘린더 {len(plan["dates"])}일, 목표≈{initial_trading_days}거래일)'
+        )
+        return plan
+
+    if db_max >= end:
+        plan['mode'] = 'skip'
+        plan['from_date'] = db_max
+        plan['message'] = f'이미 적재됨 (DB 최신={db_max}, 기준일={end}) — 수집 스킵'
+        return plan
+
+    start = db_max + timedelta(days=1)
+    plan['mode'] = 'incremental'
+    plan['from_date'] = start
+    plan['dates'] = _calendar_ymd_range(start, end)
+    plan['message'] = (
+        f'증분 수집 {start}~{end} (DB 최신={db_max}, 캘린더 {len(plan["dates"])}일)'
+    )
+    return plan
 
 
 def upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols, batch_size=1000):
-    """하루치 전종목 DF를 krx_ohlcv에 upsert. 반환: 적재 행 수."""
+    """하루치 전종목 DF를 krx_ohlcv에 upsert. 반환: {total, inserted, updated}."""
+    empty = {'total': 0, 'inserted': 0, 'updated': 0}
     if day_df is None or day_df.empty:
-        return 0
+        return empty
     value_cols = ['open', 'high', 'low', 'close', 'volume']
     opt_cols = [c for c in ('name', 'market', 'trading_value', 'mcap', 'chg_pct') if c in table_cols]
     cols = ['ticker', 'date'] + value_cols + opt_cols
@@ -644,7 +714,23 @@ def upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols, batch_size=1000):
             use[c] = pd.to_numeric(use[c], errors='coerce')
     use = use.dropna(subset=['ticker', 'close'])
     if use.empty:
-        return 0
+        return empty
+
+    day = use['date'].iloc[0]
+    if isinstance(day, pd.Timestamp):
+        day = day.date()
+    tickers = [str(t) for t in use['ticker'].tolist()]
+    existing = set()
+    for i in range(0, len(tickers), 500):
+        chunk = tickers[i:i + 500]
+        ph = ','.join(['%s'] * len(chunk))
+        mycursor.execute(
+            f'SELECT ticker FROM krx_ohlcv WHERE `date`=%s AND ticker IN ({ph})',
+            (day, *chunk),
+        )
+        existing.update(str(r[0]) for r in mycursor.fetchall())
+    inserted = sum(1 for t in tickers if t not in existing)
+    updated = len(tickers) - inserted
 
     col_sql = ', '.join(f'`{c}`' for c in cols)
     ph = ', '.join(['%s'] * len(cols))
@@ -660,18 +746,16 @@ def upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols, batch_size=1000):
         for v in r:
             if isinstance(v, float) and (math.isnan(v) or pd.isna(v)):
                 tup.append(None)
-            elif pd.isna(v) if not isinstance(v, (bytes, bytearray)) else False:
+            elif not isinstance(v, (bytes, bytearray)) and pd.isna(v):
                 tup.append(None)
             else:
                 tup.append(v)
         rows.append(tuple(tup))
-    saved = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         mycursor.executemany(sql, batch)
         con.commit()
-        saved += len(batch)
-    return saved
+    return {'total': len(rows), 'inserted': inserted, 'updated': updated}
 
 
 def collect_krx_ohlcv_by_days(session, mycursor, con, dates, ticker_filter=None):
@@ -681,6 +765,8 @@ def collect_krx_ohlcv_by_days(session, mycursor, con, dates, ticker_filter=None)
     """
     table_cols = ensure_krx_ohlcv_extra_columns(mycursor, con)
     total_rows = 0
+    inserted_rows = 0
+    updated_rows = 0
     ok_days = 0
     empty_days = 0
     error_days = []
@@ -692,8 +778,10 @@ def collect_krx_ohlcv_by_days(session, mycursor, con, dates, ticker_filter=None)
                 continue
             if ticker_filter is not None:
                 day_df = day_df[day_df['ticker'].isin(ticker_filter)]
-            n = upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols)
-            total_rows += n
+            stats = upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols)
+            total_rows += stats['total']
+            inserted_rows += stats['inserted']
+            updated_rows += stats['updated']
             ok_days += 1
             _save_krx_csv_backup(raw, 'ohlcv_all', day)
         except Exception as e:
@@ -702,9 +790,16 @@ def collect_krx_ohlcv_by_days(session, mycursor, con, dates, ticker_filter=None)
             print(traceback.format_exc())
     print(
         f'  · 일봉 CSV 완료: 거래일적재={ok_days}, 휴장/빈응답={empty_days}, '
-        f'실패={len(error_days)}, 행={total_rows}'
+        f'실패={len(error_days)}, 행={total_rows} (신규={inserted_rows}, 갱신={updated_rows})'
     )
-    return {'ok_days': ok_days, 'empty_days': empty_days, 'error_days': error_days, 'rows': total_rows}
+    return {
+        'ok_days': ok_days,
+        'empty_days': empty_days,
+        'error_days': error_days,
+        'rows': total_rows,
+        'inserted': inserted_rows,
+        'updated': updated_rows,
+    }
 
 
 def build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=50):
@@ -1196,13 +1291,24 @@ ticker_list = pd.read_sql(query, con=engine)
 ticker_codes = ticker_list['종목코드'].tolist()
 
 
-### 일봉 — KRX MDCSTAT01501 일자 CSV (전종목 1요청/일). 종목별 크롤링 금지.
+### 일봉 — KRX MDCSTAT01501 일자 CSV (전종목 1요청/일). DB MAX(date) 자동 증분.
 
-print(' - 일봉 데이터를 저장합니다. (KRX CSV MDCSTAT01501)')
-print(f'   모드: {"전체 백필" if OHLCV_FULL_BACKFILL else "증분(daily)"}')
+print(' - 일봉 데이터를 저장합니다. (KRX CSV MDCSTAT01501, DB 자동 증분)')
 
-fr = (datetime.strptime(biz_day, '%Y%m%d') + relativedelta(years=-OHLCV_BACKFILL_YEARS)).strftime("%Y%m%d")
-to = datetime.strptime(biz_day, '%Y%m%d').strftime("%Y%m%d")
+ohlcv_plan = resolve_ohlcv_collect_plan(mycursor, biz_day)
+print(f'   {ohlcv_plan["message"]}')
+print(
+    f'   DB 최신={ohlcv_plan["db_max"]}, 기준일={ohlcv_plan["biz_day"]}, '
+    f'모드={ohlcv_plan["mode"]}'
+)
+
+# 참조 CSV 정합 구간: 수집 대상 또는 최근 초기 룩백
+_ref_from = ohlcv_plan['from_date'] or (
+    _as_plain_date(biz_day) - timedelta(days=_calendar_days_for_trading_days(OHLCV_INITIAL_TRADING_DAYS))
+)
+_ref_to = ohlcv_plan['to_date'] or _as_plain_date(biz_day)
+fr = _ref_from.strftime('%Y%m%d')
+to = _ref_to.strftime('%Y%m%d')
 
 # 참조 CSV 정합용 upsert (기본 OHLC 스키마)
 query = """
@@ -1214,12 +1320,7 @@ query = """
 
 batch_size = 50
 error_list = []
-
-ohlcv_dates = resolve_ohlcv_collect_dates(
-    mycursor, biz_day, full_backfill=OHLCV_FULL_BACKFILL, years=OHLCV_BACKFILL_YEARS
-)
-print(f'   수집 대상 캘린더일: {len(ohlcv_dates)}일'
-      + (f' ({ohlcv_dates[0]}~{ohlcv_dates[-1]})' if ohlcv_dates else ' (없음)'))
+ohlcv_dates = ohlcv_plan['dates']
 
 krx_ohlcv_session = rq.Session()
 krx_ohlcv_session.headers.update(KRX_INFO_HEADERS)
@@ -1227,13 +1328,21 @@ if not krx_login(krx_ohlcv_session):
     raise RuntimeError('KRX 로그인 실패(일봉). 환경변수 KRX_ID / KRX_PW 를 확인하세요.')
 
 ticker_filter = set(str(t).zfill(6) if str(t).isdigit() else str(t) for t in ticker_codes)
-if ohlcv_dates:
+if ohlcv_plan['mode'] == 'skip' or not ohlcv_dates:
+    print('   (이미 적재됨 — 일봉 CSV 스킵)')
+else:
+    print(
+        f'   대상 구간: {ohlcv_dates[0]}~{ohlcv_dates[-1]} '
+        f'(캘린더 {len(ohlcv_dates)}일, 휴장은 응답으로 스킵)'
+    )
     ohlcv_stats = collect_krx_ohlcv_by_days(
         krx_ohlcv_session, mycursor, con, ohlcv_dates, ticker_filter=ticker_filter
     )
     error_list = list(ohlcv_stats.get('error_days') or [])
-else:
-    print('   (이미 biz_day까지 적재됨 — 일봉 CSV 스킵)')
+    print(
+        f'   요약: 수집거래일={ohlcv_stats.get("ok_days", 0)}, '
+        f'신규행={ohlcv_stats.get("inserted", 0)}, 갱신행={ohlcv_stats.get("updated", 0)}'
+    )
 
 print(' - 일봉 참조 CSV 정합')
 try:
@@ -1248,231 +1357,349 @@ krx_ohlcv_session.close()
 
 
 
-### 투자자별 매매동향
+### 투자자별 매매동향 — KRX 12010 (MDCSTAT02401) 일자×투자자구분 CSV
 
-print(' - 투자자별 매매동향 데이터를 저장합니다.')
+print(' - 투자자별 매매동향 데이터를 저장합니다. (KRX 12010 MDCSTAT02401)')
 
-# 네이버 frgn.naver「외국인·기관 순매매 거래량」표와 동일 컬럼 구성
-create_table_query = """
-CREATE TABLE IF NOT EXISTS krx_investor_trading (
-    ticker VARCHAR(10) NOT NULL,
-    date DATE NOT NULL,
-    `종가` BIGINT DEFAULT NULL,
-    `전일비` VARCHAR(64) DEFAULT NULL,
-    `등락률` DECIMAL(10,4) DEFAULT NULL,
-    `거래량` BIGINT DEFAULT NULL,
-    `기관_순매매량` BIGINT DEFAULT NULL,
-    `외국인_순매매량` BIGINT DEFAULT NULL,
-    `외국인_보유주수` BIGINT DEFAULT NULL,
-    `외국인_보유율` DECIMAL(10,4) DEFAULT NULL,
-    PRIMARY KEY (ticker, date),
-    INDEX idx_date (date),
-    INDEX idx_ticker (ticker)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-"""
+# ---------------------------------------------------------------------------
+# 스펙 캡처(2026-08-01 실측 OTP CSV, 추측 아님):
+#   menuId=MDC0201020303 / screen=[12010] 투자자별 순매수상위종목
+#   bld=dbms/MDC/STAT/standard/MDCSTAT02401
+#   OTP params: strtDd,endDd,mktId=ALL,invstTpCd,share=1,money=1,csvxls_isNo=false
+#   CSV: 종목코드,종목명,거래량_매도/매수/순매수,거래대금_매도/매수/순매수
+#   invstTpCd 13종: 아래 목록(실측 다운로드 성공으로 확인)
+#   커버리지: 당일 해당 투자자 거래 종목(순매도 포함). 무거래 종목 누락 가능.
+#   예) 20260731 OHLCV=2644 vs 전체=2743 / 외국인=2625 / 은행=79
+# ---------------------------------------------------------------------------
+BLD_INVESTOR_NET = 'dbms/MDC/STAT/standard/MDCSTAT02401'
+KRX_INVST_TP_CD = [
+    ('1000', '금융투자'),
+    ('2000', '보험'),
+    ('3000', '투신'),
+    ('3100', '사모'),
+    ('4000', '은행'),
+    ('5000', '기타금융'),
+    ('6000', '연기금등'),
+    ('7050', '기관합계'),
+    ('7100', '기타법인'),
+    ('8000', '개인'),
+    ('9000', '외국인'),
+    ('9001', '기타외국인'),
+    ('9999', '전체'),
+]
+INVESTOR_KRX_INITIAL_TRADING_DAYS = 250
+INVESTOR_KRX_INITIAL_START = None  # 예: '20240101'
+INVESTOR_KRX_REFERER = (
+    'https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020303'
+)
 
-try:
-    mycursor.execute(create_table_query)
+
+def ensure_krx_investor_trade_krx_table(mycursor, con):
+    mycursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS krx_investor_trade_krx (
+            `date` DATE NOT NULL,
+            ticker VARCHAR(10) NOT NULL,
+            invst_tp_cd VARCHAR(8) NOT NULL,
+            invst_tp_nm VARCHAR(32) NULL,
+            sell_qty BIGINT NULL,
+            buy_qty BIGINT NULL,
+            net_qty BIGINT NULL,
+            sell_val BIGINT NULL,
+            buy_val BIGINT NULL,
+            net_val BIGINT NULL,
+            PRIMARY KEY (`date`, ticker, invst_tp_cd),
+            INDEX idx_ticker_date (ticker, `date`),
+            INDEX idx_invst_date (invst_tp_cd, `date`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
     con.commit()
-    print("✓ 투자자별 매매동향 테이블 확인 완료")
-except Exception as e:
-    print(f"⚠️ 테이블 생성 확인 중 오류: {e}")
 
-# 기존 DB에 예전 스키마만 있을 때: 네이버 표에 맞는 컬럼 추가
-def _ensure_krx_investor_trading_columns():
-    try:
-        mycursor.execute("SHOW COLUMNS FROM krx_investor_trading")
-        have = {row[0] for row in mycursor.fetchall()}
-    except Exception as e:
-        print(f"⚠️ krx_investor_trading 컬럼 확인 실패: {e}")
-        return
-    adds = [
-        ("종가", "BIGINT DEFAULT NULL"),
-        ("전일비", "VARCHAR(64) DEFAULT NULL"),
-        ("등락률", "DECIMAL(10,4) DEFAULT NULL"),
-        ("거래량", "BIGINT DEFAULT NULL"),
-        ("기관_순매매량", "BIGINT DEFAULT NULL"),
-        ("외국인_순매매량", "BIGINT DEFAULT NULL"),
-        ("외국인_보유주수", "BIGINT DEFAULT NULL"),
-        ("외국인_보유율", "DECIMAL(10,4) DEFAULT NULL"),
-    ]
-    for col, ddl in adds:
+
+def ensure_krx_investor_trading_wide_table(mycursor, con):
+    """기존 와이드 호환 테이블. 외국인_보유율은 12010에 없어 미갱신."""
+    mycursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS krx_investor_trading (
+            ticker VARCHAR(10) NOT NULL,
+            date DATE NOT NULL,
+            `종가` BIGINT DEFAULT NULL,
+            `전일비` VARCHAR(64) DEFAULT NULL,
+            `등락률` DECIMAL(10,4) DEFAULT NULL,
+            `거래량` BIGINT DEFAULT NULL,
+            `기관_순매매량` BIGINT DEFAULT NULL,
+            `외국인_순매매량` BIGINT DEFAULT NULL,
+            `외국인_보유주수` BIGINT DEFAULT NULL,
+            `외국인_보유율` DECIMAL(10,4) DEFAULT NULL,
+            PRIMARY KEY (ticker, date),
+            INDEX idx_date (date),
+            INDEX idx_ticker (ticker)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    con.commit()
+    mycursor.execute('SHOW COLUMNS FROM krx_investor_trading')
+    have = {row[0] for row in mycursor.fetchall()}
+    for col, ddl in [
+        ('종가', 'BIGINT DEFAULT NULL'),
+        ('전일비', 'VARCHAR(64) DEFAULT NULL'),
+        ('등락률', 'DECIMAL(10,4) DEFAULT NULL'),
+        ('거래량', 'BIGINT DEFAULT NULL'),
+        ('기관_순매매량', 'BIGINT DEFAULT NULL'),
+        ('외국인_순매매량', 'BIGINT DEFAULT NULL'),
+        ('외국인_보유주수', 'BIGINT DEFAULT NULL'),
+        ('외국인_보유율', 'DECIMAL(10,4) DEFAULT NULL'),
+    ]:
         if col not in have:
             try:
                 mycursor.execute(
-                    "ALTER TABLE krx_investor_trading ADD COLUMN `{}` {}".format(col, ddl)
+                    f'ALTER TABLE krx_investor_trading ADD COLUMN `{col}` {ddl}'
                 )
                 con.commit()
-                print(f"✓ krx_investor_trading 컬럼 추가: {col}")
+                print(f'  · krx_investor_trading.{col} 추가')
             except Exception as e:
-                print(f"⚠️ 컬럼 추가 실패 `{col}`: {e}")
-
-_ensure_krx_investor_trading_columns()
-
-query_investor = """
-    insert into krx_investor_trading (
-        ticker, date, `종가`, `전일비`, `등락률`, `거래량`,
-        `기관_순매매량`, `외국인_순매매량`, `외국인_보유주수`, `외국인_보유율`
-    )
-    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) as new
-    on duplicate key update
-    `종가`=new.`종가`, `전일비`=new.`전일비`, `등락률`=new.`등락률`, `거래량`=new.`거래량`,
-    `기관_순매매량`=new.`기관_순매매량`, `외국인_순매매량`=new.`외국인_순매매량`,
-    `외국인_보유주수`=new.`외국인_보유주수`, `외국인_보유율`=new.`외국인_보유율`;
-"""
-
-error_list_investor = []
-commit_counter_investor = 0
-
-# 세션 재사용
-session = rq.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-})
-
-# 네이버 frgn 표는 페이지당 약 20거래일 → page 순회로 최대 일수만큼 수집
-INVESTOR_MAX_TRADING_DAYS = 250
+                print(f'  ⚠️ 컬럼 추가 실패 {col}: {e}')
+                con.rollback()
 
 
-def _investor_ticker_key(t):
-    """종목코드 정규화 (DB·URL·건수 맵 키 통일)."""
-    p = str(t).strip()
-    return p.zfill(6) if p.isdigit() else p
-
-def parse_investor_trading_data(html_content, ticker):
-    """네이버 frgn.naver「외국인·기관 순매매 거래량」표 파싱 (2행 헤더 + 9열 데이터)."""
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        investor_data = []
-
-        def extract_unsigned_int(text):
-            if not text:
-                return None
-            text = str(text).replace(',', '').strip()
-            m = re.search(r'(\d+)', text)
-            return int(m.group(1)) if m else None
-
-        def extract_signed_int(text):
-            """순매매량 등: +1,074,644 / -9,595,937 / ▼ 표기"""
-            if not text:
-                return None
-            raw = str(text).replace(',', '').strip()
-            is_neg = (
-                raw.startswith('-')
-                or '▼' in raw
-                or '↓' in raw
-                or '하락' in raw
+def resolve_investor_krx_collect_plan(mycursor, biz_day):
+    end = _as_plain_date(biz_day)
+    mycursor.execute('SELECT MAX(`date`) FROM krx_investor_trade_krx')
+    row = mycursor.fetchone()
+    db_max = _as_plain_date(row[0]) if row else None
+    plan = {
+        'mode': 'skip',
+        'db_max': db_max,
+        'biz_day': end,
+        'from_date': None,
+        'dates': [],
+        'message': '',
+    }
+    if end is None:
+        plan['message'] = '기준영업일 없음 — 스킵'
+        return plan
+    if db_max is None:
+        start = (
+            _as_plain_date(INVESTOR_KRX_INITIAL_START)
+            if INVESTOR_KRX_INITIAL_START
+            else end - timedelta(
+                days=_calendar_days_for_trading_days(INVESTOR_KRX_INITIAL_TRADING_DAYS)
             )
-            is_pos = raw.startswith('+') or '▲' in raw or '↑' in raw or '상승' in raw
-            m = re.search(r'(\d+)', raw)
-            if not m:
-                return None
-            n = int(m.group(1))
-            if is_neg:
-                return -n
-            if is_pos:
-                return n
-            return -n if raw.startswith('-') else n
+        )
+        plan['mode'] = 'initial'
+        plan['from_date'] = start
+        plan['dates'] = _calendar_ymd_range(start, end)
+        plan['message'] = (
+            f'DB 비어 있음 → 초기 백필 {start}~{end} '
+            f'(캘린더 {len(plan["dates"])}일 × 투자자 {len(KRX_INVST_TP_CD)}종)'
+        )
+        return plan
+    if db_max >= end:
+        plan['mode'] = 'skip'
+        plan['from_date'] = db_max
+        plan['message'] = f'이미 적재됨 (DB 최신={db_max}, 기준일={end}) — 수집 스킵'
+        return plan
+    start = db_max + timedelta(days=1)
+    plan['mode'] = 'incremental'
+    plan['from_date'] = start
+    plan['dates'] = _calendar_ymd_range(start, end)
+    plan['message'] = (
+        f'증분 수집 {start}~{end} (DB 최신={db_max}, '
+        f'캘린더 {len(plan["dates"])}일 × {len(KRX_INVST_TP_CD)} CSV/일)'
+    )
+    return plan
 
-        def extract_percent(text):
-            if not text:
-                return None
-            t = str(text).replace(',', '').replace('%', '').strip()
-            m = re.search(r'-?\d+\.?\d*', t)
-            return float(m.group(0)) if m else None
 
-        def is_target_table(table):
-            summary = (table.get('summary') or '')
-            if '순매매' in summary and '외국인' in summary and '기관' in summary:
-                return True
-            rows = table.find_all('tr')
-            if len(rows) < 2:
-                return False
-            h0 = [c.get_text(strip=True) for c in rows[0].find_all(['th', 'td'])]
-            if len(h0) < 7:
-                return False
-            return h0[0] == '날짜' and '종가' in h0 and '기관' in h0 and '외국인' in h0
+def parse_krx_investor_net_csv(df, day_str, invst_tp_cd, invst_tp_nm):
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    d = df.copy()
+    d.columns = d.columns.str.replace(' ', '')
+    rename = {
+        '종목코드': 'ticker',
+        '종목명': 'name',
+        '거래량_매도': 'sell_qty',
+        '거래량_매수': 'buy_qty',
+        '거래량_순매수': 'net_qty',
+        '거래대금_매도': 'sell_val',
+        '거래대금_매수': 'buy_val',
+        '거래대금_순매수': 'net_val',
+    }
+    d = d.rename(columns={k: v for k, v in rename.items() if k in d.columns})
+    if 'ticker' not in d.columns:
+        raise ValueError(f'12010 CSV에 종목코드 없음: {list(d.columns)}')
+    d['ticker'] = _krx_pad_ticker(d['ticker'])
+    for c in ('sell_qty', 'buy_qty', 'net_qty', 'sell_val', 'buy_val', 'net_val'):
+        if c in d.columns:
+            d[c] = _krx_num_series(d[c])
+        else:
+            d[c] = np.nan
+    d['date'] = datetime.strptime(day_str, '%Y%m%d').date()
+    d['invst_tp_cd'] = str(invst_tp_cd)
+    d['invst_tp_nm'] = invst_tp_nm
+    cols = [
+        'date', 'ticker', 'invst_tp_cd', 'invst_tp_nm',
+        'sell_qty', 'buy_qty', 'net_qty', 'sell_val', 'buy_val', 'net_val',
+    ]
+    return d[cols].dropna(subset=['ticker'])
 
-        for table in soup.find_all('table'):
-            if not is_target_table(table):
-                continue
-            rows = table.find_all('tr')
-            for row in rows:
-                cols = row.find_all(['td', 'th'])
-                if len(cols) < 9:
+
+def download_krx_investor_net_csv(session, day_str, invst_tp_cd):
+    content = get_krx_csv(
+        session,
+        BLD_INVESTOR_NET,
+        {
+            'strtDd': day_str,
+            'endDd': day_str,
+            'mktId': 'ALL',
+            'invstTpCd': str(invst_tp_cd),
+            'share': '1',
+            'money': '1',
+        },
+    )
+    try:
+        raw = pd.read_csv(BytesIO(content), encoding='EUC-KR')
+    except Exception:
+        return pd.DataFrame(), content
+    return raw, content
+
+
+def upsert_krx_investor_trade_krx(mycursor, con, day_df, batch_size=1000):
+    if day_df is None or day_df.empty:
+        return 0
+    sql = """
+    INSERT INTO krx_investor_trade_krx
+      (`date`, ticker, invst_tp_cd, invst_tp_nm,
+       sell_qty, buy_qty, net_qty, sell_val, buy_val, net_val)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) AS new
+    ON DUPLICATE KEY UPDATE
+      invst_tp_nm=new.invst_tp_nm,
+      sell_qty=new.sell_qty, buy_qty=new.buy_qty, net_qty=new.net_qty,
+      sell_val=new.sell_val, buy_val=new.buy_val, net_val=new.net_val
+    """
+    rows = []
+    for r in day_df.itertuples(index=False):
+        tup = []
+        for v in r:
+            if isinstance(v, float) and (math.isnan(v) or pd.isna(v)):
+                tup.append(None)
+            elif not isinstance(v, (bytes, bytearray)) and pd.isna(v):
+                tup.append(None)
+            else:
+                tup.append(v)
+        rows.append(tuple(tup))
+    for i in range(0, len(rows), batch_size):
+        mycursor.executemany(sql, rows[i:i + batch_size])
+        con.commit()
+    return len(rows)
+
+
+def upsert_investor_trading_wide_from_day(mycursor, con, by_invst_net_qty):
+    """기관합계(7050)·외국인(9000) net_qty → krx_investor_trading."""
+    inst = by_invst_net_qty.get('7050') or {}
+    frgn = by_invst_net_qty.get('9000') or {}
+    tickers = set(inst) | set(frgn)
+    if not tickers:
+        return 0
+    sql = """
+    INSERT INTO krx_investor_trading (ticker, date, `기관_순매매량`, `외국인_순매매량`)
+    VALUES (%s, %s, %s, %s) AS new
+    ON DUPLICATE KEY UPDATE
+      `기관_순매매량`=COALESCE(new.`기관_순매매량`, `기관_순매매량`),
+      `외국인_순매매량`=COALESCE(new.`외국인_순매매량`, `외국인_순매매량`)
+    """
+    rows = []
+    for tk in tickers:
+        d_i, n_i = inst.get(tk, (None, None))
+        d_f, n_f = frgn.get(tk, (None, None))
+        day = d_i or d_f
+        if day is None:
+            continue
+        rows.append((tk, day, n_i, n_f))
+    for i in range(0, len(rows), 1000):
+        mycursor.executemany(sql, rows[i:i + 1000])
+        con.commit()
+    return len(rows)
+
+
+def collect_krx_investor_trade_by_days(session, mycursor, con, dates, ohlcv_universe_n=None):
+    total_rows = 0
+    ok_days = 0
+    empty_days = 0
+    error_items = []
+    for day in tqdm(dates, desc='KRX 12010 투자자 CSV'):
+        day_any = False
+        wide_maps = {}
+        day_counts = {}
+        for invst_cd, invst_nm in KRX_INVST_TP_CD:
+            try:
+                raw, content = download_krx_investor_net_csv(session, day, invst_cd)
+                if raw is None or len(raw) == 0:
                     continue
-                date_text = cols[0].get_text(strip=True)
-                date_match = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', date_text)
-                if not date_match:
-                    date_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', date_text)
-                if not date_match:
+                parsed = parse_krx_investor_net_csv(raw, day, invst_cd, invst_nm)
+                if parsed.empty:
                     continue
-                date_str = f"{date_match.group(1)}{date_match.group(2)}{date_match.group(3)}"
-                종가 = extract_unsigned_int(cols[1].get_text())
-                전일비 = cols[2].get_text(' ', strip=True)[:64] or None
-                등락률 = extract_percent(cols[3].get_text())
-                거래량 = extract_unsigned_int(cols[4].get_text())
-                기관_순매매량 = extract_signed_int(cols[5].get_text())
-                외국인_순매매량 = extract_signed_int(cols[6].get_text())
-                외국인_보유주수 = extract_unsigned_int(cols[7].get_text())
-                외국인_보유율 = extract_percent(cols[8].get_text())
-                investor_data.append({
-                    'date': date_str,
-                    '종가': 종가,
-                    '전일비': 전일비,
-                    '등락률': 등락률,
-                    '거래량': 거래량,
-                    '기관_순매매량': 기관_순매매량,
-                    '외국인_순매매량': 외국인_순매매량,
-                    '외국인_보유주수': 외국인_보유주수,
-                    '외국인_보유율': 외국인_보유율,
-                })
-            break
-
-        return investor_data
-
-    except Exception as e:
-        if ticker and len(str(ticker)) == 6:
-            print(f"  [디버깅] 투자자별 매매동향 파싱 오류 (ticker: {ticker}): {e}")
-        return []
-
-
-def fetch_investor_trading_paged(session, ticker, max_trading_days=INVESTOR_MAX_TRADING_DAYS, timeout=10):
-    """frgn.naver `page=` 를 넘기며 최근 max_trading_days 거래일까지 누적 (중복 날짜 제외)."""
-    merged = []
-    seen_dates = set()
-    page = 1
-    max_pages = (max_trading_days + 19) // 20 + 3
-    while len(merged) < max_trading_days and page <= max_pages:
-        url = f'https://finance.naver.com/item/frgn.naver?code={ticker}&page={page}'
-        response = session.get(url, timeout=timeout)
-        response.encoding = 'euc-kr'
-        batch = parse_investor_trading_data(response.text, ticker)
-        if not batch:
-            break
-        for data in batch:
-            ds = data.get('date')
-            if not ds or ds in seen_dates:
-                continue
-            seen_dates.add(ds)
-            merged.append(data)
-            if len(merged) >= max_trading_days:
-                return merged
-        if len(batch) < 20:
-            break
-        page += 1
-    return merged
+                n = upsert_krx_investor_trade_krx(mycursor, con, parsed)
+                total_rows += n
+                day_any = True
+                day_counts[invst_cd] = n
+                if invst_cd in ('7050', '9000'):
+                    m = {}
+                    for _, r in parsed.iterrows():
+                        nq = r['net_qty']
+                        nq = None if pd.isna(nq) else int(nq)
+                        m[str(r['ticker'])] = (r['date'], nq)
+                    wide_maps[invst_cd] = m
+                _save_krx_csv_backup(content, f'invst_{invst_cd}', day)
+            except Exception as e:
+                error_items.append(f'{day}:{invst_cd}')
+                print(f'  ⚠️ {day} invst={invst_cd}({invst_nm}) 실패: {e}')
+                print(traceback.format_exc())
+        if day_any:
+            ok_days += 1
+            wn = upsert_investor_trading_wide_from_day(mycursor, con, wide_maps)
+            if ohlcv_universe_n:
+                for cd, cnt in sorted(day_counts.items()):
+                    if cnt < ohlcv_universe_n * 0.5:
+                        nm = dict(KRX_INVST_TP_CD).get(cd, cd)
+                        print(
+                            f'  · 커버리지 참고 {day} {cd}({nm}): {cnt}행 '
+                            f'(OHLCV우주≈{ohlcv_universe_n}) — 무거래 종목 제외 가능'
+                        )
+            print(
+                f'  · {day} 적재: invst행={sum(day_counts.values())}, '
+                f'와이드갱신={wn}, CSV={len(day_counts)}/{len(KRX_INVST_TP_CD)}'
+            )
+        else:
+            empty_days += 1
+    print(
+        f'  · 12010 완료: 거래일={ok_days}, 휴장/빈={empty_days}, '
+        f'실패항목={len(error_items)}, long행={total_rows}'
+    )
+    return {
+        'ok_days': ok_days,
+        'empty_days': empty_days,
+        'error_items': error_items,
+        'rows': total_rows,
+    }
 
 
-def fetch_investor_trading_first_page(session, ticker, timeout=10):
-    """최신 페이지(page=1)만 요청. 이미 DB에 과거가 채워진 경우 증분 갱신용."""
-    tkey = _investor_ticker_key(ticker)
-    url = f'https://finance.naver.com/item/frgn.naver?code={tkey}&page=1'
-    response = session.get(url, timeout=timeout)
-    response.encoding = 'euc-kr'
-    return parse_investor_trading_data(response.text, tkey)
+ensure_krx_investor_trade_krx_table(mycursor, con)
+ensure_krx_investor_trading_wide_table(mycursor, con)
+print('✓ krx_investor_trade_krx / krx_investor_trading 테이블 확인')
 
+inv_plan = resolve_investor_krx_collect_plan(mycursor, biz_day)
+print(f'   {inv_plan["message"]}')
 
+try:
+    mycursor.execute(
+        'SELECT COUNT(DISTINCT ticker) FROM krx_ohlcv WHERE `date`=%s',
+        (_as_plain_date(biz_day),),
+    )
+    _ohlcv_univ = mycursor.fetchone()[0] or None
+except Exception:
+    _ohlcv_univ = None
 
 ENABLE_KIS_INVESTOR_TRADE_KIS = False  # True: KIS 종목별 투자자매매동향(일별) 수집 활성화
 if ENABLE_KIS_INVESTOR_TRADE_KIS:
@@ -1739,80 +1966,38 @@ if ENABLE_KIS_INVESTOR_TRADE_KIS:
         return len(args)
 
 
-# 종목별 저장 건수 (한 번 조회 → 티커마다 COUNT 쿼리 생략)
-try:
-    mycursor.execute(
-        "SELECT ticker, COUNT(*) FROM krx_investor_trading GROUP BY ticker"
+
+error_list_investor = []
+krx_inv_session = rq.Session()
+krx_inv_session.headers.update({
+    'User-Agent': KRX_INFO_HEADERS.get('User-Agent', 'Mozilla/5.0'),
+    'Referer': INVESTOR_KRX_REFERER,
+})
+if not krx_login(krx_inv_session):
+    raise RuntimeError('KRX 로그인 실패(투자자 12010). KRX_ID/KRX_PW 확인')
+
+if inv_plan['mode'] == 'skip' or not inv_plan['dates']:
+    print('   (이미 적재됨 — 12010 CSV 스킵)')
+else:
+    print(
+        f'   대상 구간: {inv_plan["dates"][0]}~{inv_plan["dates"][-1]} '
+        f'(캘린더 {len(inv_plan["dates"])}일, 일당 CSV {len(KRX_INVST_TP_CD)}장)'
     )
-    investor_row_counts = {
-        _investor_ticker_key(r[0]): int(r[1]) for r in mycursor.fetchall()
-    }
-except Exception as e:
-    print(f"⚠️ krx_investor_trading 건수 조회 실패 — 전 종목 풀 페이지 수집: {e}")
-    investor_row_counts = {}
+    inv_stats = collect_krx_investor_trade_by_days(
+        krx_inv_session, mycursor, con, inv_plan['dates'], ohlcv_universe_n=_ohlcv_univ
+    )
+    error_list_investor = list(inv_stats.get('error_items') or [])
+    print(
+        f'   요약: 수집거래일={inv_stats.get("ok_days", 0)}, '
+        f'long행={inv_stats.get("rows", 0)}, 실패={len(error_list_investor)}'
+    )
 
-
-for i, ticker_raw in enumerate(tqdm(ticker_codes, desc="투자자별 매매동향 수집")):
-    tkey = _investor_ticker_key(ticker_raw)
-
-    try:
-        if investor_row_counts.get(tkey, 0) >= INVESTOR_MAX_TRADING_DAYS:
-            investor_data_list = fetch_investor_trading_first_page(session, tkey)
-        else:
-            investor_data_list = fetch_investor_trading_paged(session, tkey)
-        
-        # 디버깅: 처음 3개만 출력
-        if i < 3 and len(investor_data_list) == 0:
-            print(f"  [디버깅] ticker {tkey}: 투자자별 매매동향 데이터를 찾을 수 없습니다.")
-        
-        investor_args = []
-        for data in investor_data_list:
-            date_str = data.get('date')
-            if not date_str:
-                continue
-            try:
-                if len(date_str) == 8:
-                    date_obj = datetime.strptime(date_str, '%Y%m%d').date()
-                else:
-                    date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
-            except ValueError:
-                continue
-            investor_args.append((
-                tkey,
-                date_obj,
-                data.get('종가'),
-                data.get('전일비'),
-                data.get('등락률'),
-                data.get('거래량'),
-                data.get('기관_순매매량'),
-                data.get('외국인_순매매량'),
-                data.get('외국인_보유주수'),
-                data.get('외국인_보유율'),
-            ))
-
-        if investor_args:
-            mycursor.executemany(query_investor, investor_args)
-            commit_counter_investor += 1
-            if commit_counter_investor >= batch_size:
-                con.commit()
-                commit_counter_investor = 0
-    
-    except Exception as e:
-        print(f"투자자별 매매동향 수집 오류 (ticker: {tkey}): {e}")
-        error_list_investor.append(tkey)
-        if i < 5:  # 처음 5개만 상세 오류 출력
-            print(traceback.format_exc())
-
-# 남은 데이터 커밋
-if commit_counter_investor > 0:
-    con.commit()
-
-session.close()
+krx_inv_session.close()
 
 if error_list_investor:
-    print(f"\n⚠️ 투자자별 매매동향 수집 실패 종목 수: {len(error_list_investor)}")
-    if len(error_list_investor) <= 10:
-        print(f"실패 종목: {error_list_investor}")
+    print(f'\n⚠️ 투자자 12010 수집 실패 항목 수: {len(error_list_investor)}')
+    if len(error_list_investor) <= 15:
+        print(f'실패: {error_list_investor}')
 
 
 # --- KIS API — 종목별 투자자매매동향(일별) [비활성화: ENABLE_KIS_INVESTOR_TRADE_KIS=False] ---
