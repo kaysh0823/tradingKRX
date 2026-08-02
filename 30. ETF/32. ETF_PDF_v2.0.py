@@ -1,3 +1,121 @@
+
+import os
+import sys
+from pathlib import Path
+
+def _find_repo_root():
+    """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""
+    markers = ("env_config.py", ".env", ".git")
+
+    def _is_root(p: Path) -> bool:
+        return any((p / m).exists() for m in markers)
+
+    def _walk_up(start: Path):
+        try:
+            start = Path(start).expanduser().resolve()
+        except Exception:
+            return None
+        if not start.exists():
+            return None
+        if start.is_file():
+            start = start.parent
+        for p in [start, *start.parents]:
+            if _is_root(p):
+                return p
+        return None
+
+    tried = []
+    seen = set()
+    _nl = chr(10)
+    _hint = _nl + "REPO_ROOT 환경변수를 리포 루트로 지정하거나 F5로 실행하세요"
+
+    env_root = os.environ.get("REPO_ROOT", "").strip()
+    if env_root:
+        er = Path(env_root).expanduser()
+        try:
+            er = er.resolve()
+        except Exception as e:
+            raise RuntimeError(
+                "REPO_ROOT 경로를 해석할 수 없습니다: {!r} ({}){}".format(
+                    env_root, e, _hint
+                )
+            ) from e
+        tried.append(str(er))
+        if not er.is_dir():
+            raise RuntimeError(
+                "REPO_ROOT 가 디렉터리가 아닙니다: {}{}".format(er, _hint)
+            )
+        if _is_root(er):
+            return er
+        found = _walk_up(er)
+        if found:
+            return found
+        raise RuntimeError(
+            "REPO_ROOT={} 에서 마커(env_config.py / .env / .git)를 찾지 못했습니다.{}".format(
+                er, _hint
+            )
+        )
+
+    starts = []
+    try:
+        here = Path(__file__).resolve()
+        starts.append(here if here.is_dir() else here.parent)
+    except NameError:
+        pass
+    try:
+        import inspect
+        for fi in inspect.stack():
+            fn = getattr(fi, "filename", None) or ""
+            if not fn or fn.startswith("<"):
+                continue
+            try:
+                p = Path(fn).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() == ".py" and p.is_file():
+                starts.append(p.parent)
+    except Exception:
+        pass
+    starts.append(Path.cwd())
+    for item in sys.path:
+        if not item or item == ".":
+            continue
+        try:
+            p = Path(item)
+            if p.is_dir():
+                starts.append(p)
+        except Exception:
+            continue
+
+    for c in starts:
+        try:
+            key = str(Path(c).expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(key)
+        found = _walk_up(Path(c))
+        if found:
+            return found
+
+    raise RuntimeError(
+        "프로젝트 루트를 찾지 못했습니다 (env_config.py / .env / .git)."
+        + _nl
+        + "탐색 후보:"
+        + _nl
+        + "  - "
+        + (_nl + "  - ").join(tried)
+        + _hint
+    )
+
+_ROOT = _find_repo_root()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from env_config import load_project_env, require_env, db_url, db_connect_kwargs
+load_project_env()
+
 """
 KRX [13108] PDF 수집 + 구성비중 스냅샷 대시보드 (32. ETF_PDF_v2.0)
 =========================================================================================
@@ -172,7 +290,7 @@ KRX_HOLIDAYS = frozenset({
 
 DB_CONFIG = {
     'user': 'root',
-    'passwd': 'GloriaDahn03240701',
+    'passwd': require_env('DB_PASSWORD'),
     'host': '127.0.0.1',
     'db': 'kor_stock_db',
     'charset': 'utf8',
@@ -244,7 +362,7 @@ HEADERS = {
 def krx_login(session: requests.Session) -> bool:
     """KRX_ID / KRX_PW 환경변수가 있으면 로그인. 성공/불필요 시 True."""
     # uid, upw = os.getenv("KRX_ID"), os.getenv("KRX_PW")
-    uid, upw = "hachimitsu79", "GloriaDahn0823$$"
+    uid, upw = require_env('KRX_ID'), require_env('KRX_PW')
     if not (uid and upw):
         print("· 로그인 정보 없음 → 비로그인으로 진행")
         return True

@@ -9,6 +9,123 @@ v3.0: KRX 정보데이터시스템에서 CSV를 직접 다운로드하도록 변
 
 import io
 import os
+import sys
+from pathlib import Path
+
+def _find_repo_root():
+    """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""
+    markers = ("env_config.py", ".env", ".git")
+
+    def _is_root(p: Path) -> bool:
+        return any((p / m).exists() for m in markers)
+
+    def _walk_up(start: Path):
+        try:
+            start = Path(start).expanduser().resolve()
+        except Exception:
+            return None
+        if not start.exists():
+            return None
+        if start.is_file():
+            start = start.parent
+        for p in [start, *start.parents]:
+            if _is_root(p):
+                return p
+        return None
+
+    tried = []
+    seen = set()
+    _nl = chr(10)
+    _hint = _nl + "REPO_ROOT 환경변수를 리포 루트로 지정하거나 F5로 실행하세요"
+
+    env_root = os.environ.get("REPO_ROOT", "").strip()
+    if env_root:
+        er = Path(env_root).expanduser()
+        try:
+            er = er.resolve()
+        except Exception as e:
+            raise RuntimeError(
+                "REPO_ROOT 경로를 해석할 수 없습니다: {!r} ({}){}".format(
+                    env_root, e, _hint
+                )
+            ) from e
+        tried.append(str(er))
+        if not er.is_dir():
+            raise RuntimeError(
+                "REPO_ROOT 가 디렉터리가 아닙니다: {}{}".format(er, _hint)
+            )
+        if _is_root(er):
+            return er
+        found = _walk_up(er)
+        if found:
+            return found
+        raise RuntimeError(
+            "REPO_ROOT={} 에서 마커(env_config.py / .env / .git)를 찾지 못했습니다.{}".format(
+                er, _hint
+            )
+        )
+
+    starts = []
+    try:
+        here = Path(__file__).resolve()
+        starts.append(here if here.is_dir() else here.parent)
+    except NameError:
+        pass
+    try:
+        import inspect
+        for fi in inspect.stack():
+            fn = getattr(fi, "filename", None) or ""
+            if not fn or fn.startswith("<"):
+                continue
+            try:
+                p = Path(fn).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() == ".py" and p.is_file():
+                starts.append(p.parent)
+    except Exception:
+        pass
+    starts.append(Path.cwd())
+    for item in sys.path:
+        if not item or item == ".":
+            continue
+        try:
+            p = Path(item)
+            if p.is_dir():
+                starts.append(p)
+        except Exception:
+            continue
+
+    for c in starts:
+        try:
+            key = str(Path(c).expanduser().resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        tried.append(key)
+        found = _walk_up(Path(c))
+        if found:
+            return found
+
+    raise RuntimeError(
+        "프로젝트 루트를 찾지 못했습니다 (env_config.py / .env / .git)."
+        + _nl
+        + "탐색 후보:"
+        + _nl
+        + "  - "
+        + (_nl + "  - ").join(tried)
+        + _hint
+    )
+
+_ROOT = _find_repo_root()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from env_config import load_project_env, require_env, db_url, db_connect_kwargs
+
+load_project_env()
+
 import pandas as pd
 import numpy as np
 import pymysql
@@ -18,17 +135,9 @@ from dateutil.relativedelta import relativedelta
 from datetime import date, datetime, timedelta
 import time
 from tqdm import tqdm
-#import indicators_stock
 
-import os
-print(os.getenv('KRX_ID'))  # None이면 환경변수가 안 잡힌 것
-
-# 임시 해결: 스크립트 실행 전에 셀에서 직접 주입
-os.environ['KRX_ID'] = 'hachimitsu79'
-os.environ['KRX_PW'] = 'GloriaDahn0823$$'
-
-## 서버 설정
-engine = create_engine('mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db')
+## 서버 설정 (.env)
+engine = create_engine(db_url())
 
 
 ### KRX 정보데이터시스템 CSV 자동 다운로드
@@ -62,11 +171,7 @@ def krx_login(session: requests.Session) -> bool:
     KRX_ID / KRX_PW 환경변수로 로그인.
     CD001=성공, CD011=중복로그인(skipDup=Y 재시도), CD010=비밀번호 변경 필요.
     """
-    uid, upw = os.getenv('KRX_ID'), os.getenv('KRX_PW')
-    if not (uid and upw):
-        print('⚠️ 환경변수 KRX_ID / KRX_PW 가 설정되지 않았습니다.')
-        print('   Windows(PowerShell): setx KRX_ID "아이디" / setx KRX_PW "비번"  (후 새 터미널)')
-        return False
+    uid, upw = require_env('KRX_ID'), require_env('KRX_PW')
 
     # 1) 세션 준비(JSESSIONID 발급)
     session.get(LOGIN_PAGE, headers={'User-Agent': _LOGIN_UA}, timeout=15)
@@ -193,7 +298,7 @@ def find_biz_day(max_lookback=10):
     raise RuntimeError(f'최근 {max_lookback}일 내 유효한 영업일을 찾지 못했습니다.')
 
 
-## 최근 영업일자 (pykrx 없이 KRX 업종분류 응답으로 판별)
+## 최근 영업일자 (KRX 업종분류 응답으로 판별)
 biz_day, kospi_csv = find_biz_day()
 _save_backup(kospi_csv, 'sector_kospi', biz_day)
 
@@ -276,8 +381,8 @@ krx_ticker = krx_ticker.dropna(subset=['업종명'])
 ## DB 적재
 
 con = pymysql.connect(
-    user='root',
-    passwd='GloriaDahn03240701',
+    user=require_env('DB_USER'),
+    passwd=require_env('DB_PASSWORD'),
     host='127.0.0.1',
     db='kor_stock_db',
     charset='utf8'
@@ -356,7 +461,7 @@ print('ticker 적재 완료')
     
     
     
-# engine = create_engine('mysql+pymysql://root:GloriaDahn03240701@127.0.0.1:3306/kor_stock_db')
+# engine = create_engine(db_url())
 
 # query = """
 # select * from krx_ticker
@@ -400,7 +505,7 @@ print('ticker 적재 완료')
 # ## DB 저장 쿼리
 
 # con = pymysql.connect(user='root',
-# passwd='GloriaDahn03240701',
+# passwd=require_env('DB_PASSWORD'),
 # host='127.0.0.1',
 # db='kor_stock_db',
 # charset='utf8')
@@ -476,8 +581,8 @@ etf_df = etf_df[etf_cols]
 
 # DB 연결 생성
 con = pymysql.connect(
-    user='root',
-    passwd='GloriaDahn03240701',
+    user=require_env('DB_USER'),
+    passwd=require_env('DB_PASSWORD'),
     host='127.0.0.1',
     db='kor_stock_db',
     charset='utf8'

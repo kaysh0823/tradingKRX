@@ -313,30 +313,108 @@ def download_krx_etf_ohlcv_day(session, day_str):
     return parse_krx_etf_ohlcv_day_csv(raw, day_str), content
 
 
-def resolve_etf_ohlcv_collect_dates(biz_day, full_backfill=False, backfill_years=3):
-    """증분: 전역 MAX(date)+1~biz_day. 백필: biz_day-years~biz_day. YYYYMMDD 리스트."""
+ETF_OHLCV_INITIAL_TRADING_DAYS = 250
+ETF_OHLCV_INITIAL_START = None  # 예: '20240101'
+
+
+def _calendar_days_for_trading_days(n_trading):
+    n = max(1, int(n_trading))
+    return (n * 7) // 5 + 40
+
+
+def _calendar_ymd_range(start_d, end_d):
+    if start_d is None or end_d is None or start_d > end_d:
+        return []
+    return [d.strftime('%Y%m%d') for d in pd.date_range(start_d, end_d, freq='D')]
+
+
+def resolve_etf_ohlcv_collect_plan(
+    biz_day,
+    initial_trading_days=ETF_OHLCV_INITIAL_TRADING_DAYS,
+    initial_start=ETF_OHLCV_INITIAL_START,
+):
+    """
+    DB MAX(date) 기준 자동 증분.
+    - 비어 있음: 최근 N거래일(또는 지정 시작일) ~ biz_day
+    - MAX == biz_day: 스킵
+    - MAX < biz_day: (MAX+1) ~ biz_day
+    """
     end = _as_date(biz_day)
+    db_max = None
+    try:
+        con = pymysql.connect(**DB_CONFIG)
+        cur = con.cursor()
+        cur.execute('SELECT MAX(`date`) FROM krx_etf_ohlcv')
+        row = cur.fetchone()
+        con.close()
+        db_max = _as_date(row[0]) if row else None
+    except Exception:
+        db_max = None
+
+    plan = {
+        'mode': 'skip',
+        'db_max': db_max,
+        'biz_day': end,
+        'from_date': None,
+        'to_date': end,
+        'dates': [],
+        'message': '',
+    }
     if end is None:
-        return []
-    if full_backfill:
-        start = end - relativedelta(years=int(backfill_years))
-    else:
-        try:
-            con = pymysql.connect(**DB_CONFIG)
-            cur = con.cursor()
-            cur.execute('SELECT MAX(`date`) FROM krx_etf_ohlcv')
-            row = cur.fetchone()
-            con.close()
-            last = _as_date(row[0]) if row else None
-        except Exception:
-            last = None
-        if last is None:
-            start = end - relativedelta(years=int(backfill_years))
-        else:
-            start = last + timedelta(days=1)
-    if start > end:
-        return []
-    return [d.strftime('%Y%m%d') for d in pd.date_range(start, end, freq='D')]
+        plan['message'] = '기준영업일 없음 — 스킵'
+        return plan
+
+    if db_max is None:
+        start = _as_date(initial_start) if initial_start else (
+            end - timedelta(days=_calendar_days_for_trading_days(initial_trading_days))
+        )
+        plan['mode'] = 'initial'
+        plan['from_date'] = start
+        plan['dates'] = _calendar_ymd_range(start, end)
+        plan['message'] = (
+            f'DB 비어 있음 → 초기 백필 {start}~{end} '
+            f'(캘린더 {len(plan["dates"])}일, 목표≈{initial_trading_days}거래일)'
+        )
+        return plan
+
+    if db_max >= end:
+        plan['mode'] = 'skip'
+        plan['from_date'] = db_max
+        plan['message'] = f'이미 적재됨 (DB 최신={db_max}, 기준일={end}) — 수집 스킵'
+        return plan
+
+    start = db_max + timedelta(days=1)
+    plan['mode'] = 'incremental'
+    plan['from_date'] = start
+    plan['dates'] = _calendar_ymd_range(start, end)
+    plan['message'] = (
+        f'증분 수집 {start}~{end} (DB 최신={db_max}, 캘린더 {len(plan["dates"])}일)'
+    )
+    return plan
+
+
+def _etf_day_insert_update_counts(day, tickers):
+    """해당일 기존 티커 수로 신규/갱신 추정."""
+    if not tickers:
+        return 0, 0
+    existing = set()
+    try:
+        con = pymysql.connect(**DB_CONFIG)
+        cur = con.cursor()
+        tickers = [str(t) for t in tickers]
+        for i in range(0, len(tickers), 500):
+            chunk = tickers[i:i + 500]
+            ph = ','.join(['%s'] * len(chunk))
+            cur.execute(
+                f'SELECT ticker FROM krx_etf_ohlcv WHERE `date`=%s AND ticker IN ({ph})',
+                (day, *chunk),
+            )
+            existing.update(str(r[0]) for r in cur.fetchall())
+        con.close()
+    except Exception:
+        return len(tickers), 0
+    inserted = sum(1 for t in tickers if t not in existing)
+    return inserted, len(tickers) - inserted
 
 # OHLCV 기본 조회·모멘텀: 최소 거래일 수 및 캘린더 룩백(주말·공휴일 여유)
 MIN_OHLCV_TRADING_DAYS = 125
@@ -841,16 +919,20 @@ def collect_etf_ohlcv_data(
     full_backfill=False,
     biz_day=None,
     backfill_years=3,
+    initial_trading_days=ETF_OHLCV_INITIAL_TRADING_DAYS,
+    initial_start=ETF_OHLCV_INITIAL_START,
 ):
     """
     ETF OHLCV 수집·DB 저장 (KRX MDCSTAT04301 일자 CSV).
 
-    기본(full_backfill=False): 전역 MAX(date)+1 ~ biz_day 캘린더 루프.
-    full_backfill=True: 최근 backfill_years년 전체 재수집.
-    하루 CSV = 전 ETF 스냅샷 → 종목별 요청 없음.
-    max_etf/max_pages_per_etf 는 호환용(무시·필터만).
+    수집 범위는 DB MAX(date) 자동 증분:
+      - 비어 있음 → 최근 initial_trading_days(또는 initial_start)부터
+      - MAX == biz_day → 스킵
+      - MAX < biz_day → 밀린 일만
+    full_backfill=True(레거시): DB 무시하고 초기 백필과 동일하게 강제 재수집.
     """
-    _ = max_pages_per_etf  # 레거시 인자 (무시)
+    _ = max_pages_per_etf
+    _ = backfill_years
     ensure_etf_ohlcv_table(verbose=True)
 
     if biz_day is None:
@@ -858,7 +940,7 @@ def collect_etf_ohlcv_data(
     else:
         biz_day = _as_date(biz_day)
     print(f"기준 영업일(biz_day): {biz_day}")
-    print(f"모드: {'전체 백필' if full_backfill else '증분(daily)'} — KRX CSV MDCSTAT04301")
+    print("원천: KRX CSV MDCSTAT04301 (DB 자동 증분)")
 
     print("ETF 리스트 조회 중...")
     etf_list = get_etf_list_from_db()
@@ -869,8 +951,11 @@ def collect_etf_ohlcv_data(
             "failed": 0,
             "skipped": 0,
             "total_records": 0,
+            "inserted": 0,
+            "updated": 0,
             "error_list": [],
             "biz_day": biz_day,
+            "mode": "empty_list",
         }
 
     if max_etf:
@@ -881,21 +966,56 @@ def collect_etf_ohlcv_data(
         t = str(r["ticker"]).strip()
         tickers.add(t.zfill(6) if t.isdigit() else t)
 
-    dates = resolve_etf_ohlcv_collect_dates(
-        biz_day, full_backfill=full_backfill, backfill_years=backfill_years
-    )
-    print(f"총 {len(tickers)}개 ETF 필터 — 수집 캘린더일 {len(dates)}"
-          + (f" ({dates[0]}~{dates[-1]})" if dates else " (없음, 스킵)"))
+    if full_backfill:
+        # 레거시 강제 백필: DB 최신을 무시하고 초기 구간부터
+        end = _as_date(biz_day)
+        start = _as_date(initial_start) if initial_start else (
+            end - timedelta(days=_calendar_days_for_trading_days(initial_trading_days))
+        )
+        plan = {
+            "mode": "initial",
+            "db_max": None,
+            "biz_day": end,
+            "from_date": start,
+            "to_date": end,
+            "dates": _calendar_ymd_range(start, end),
+            "message": (
+                f"강제 백필(full_backfill) {start}~{end} "
+                f"(캘린더 {len(_calendar_ymd_range(start, end))}일)"
+            ),
+        }
+    else:
+        plan = resolve_etf_ohlcv_collect_plan(
+            biz_day,
+            initial_trading_days=initial_trading_days,
+            initial_start=initial_start,
+        )
 
-    if not dates:
+    print(f"  {plan['message']}")
+    print(
+        f"  DB 최신={plan['db_max']}, 기준일={plan['biz_day']}, 모드={plan['mode']}, "
+        f"ETF 필터={len(tickers)}"
+    )
+    dates = plan["dates"]
+
+    if plan["mode"] == "skip" or not dates:
+        print("  (이미 적재됨 — ETF OHLCV CSV 스킵)")
         return {
             "success": 0,
             "failed": 0,
             "skipped": len(tickers),
             "total_records": 0,
+            "inserted": 0,
+            "updated": 0,
             "error_list": [],
             "biz_day": biz_day,
+            "mode": "skip",
         }
+
+    print(
+        f"  대상 구간: {dates[0]}~{dates[-1]} "
+        f"(캘린더 {len(dates)}일, 휴장은 응답으로 스킵)"
+    )
 
     session = rq.Session()
     session.headers.update(KRX_ETF_OHLCV_HEADERS)
@@ -907,6 +1027,8 @@ def collect_etf_ohlcv_data(
     ok_days = 0
     empty_days = 0
     total_records = 0
+    inserted_rows = 0
+    updated_rows = 0
     try:
         for day in tqdm(dates, desc="ETF OHLCV KRX CSV"):
             try:
@@ -919,10 +1041,15 @@ def collect_etf_ohlcv_data(
                     empty_days += 1
                     continue
                 save_df = day_df[["ticker", "date", "open", "high", "low", "close", "volume"]].copy()
+                day_date = _as_date(save_df["date"].iloc[0])
+                ins, upd = _etf_day_insert_update_counts(day_date, save_df["ticker"].tolist())
                 result = save_etf_ohlcv_to_db(save_df, batch_size=200)
                 if result.get("success"):
                     ok_days += 1
-                    total_records += int(result.get("records_saved") or 0)
+                    n = int(result.get("records_saved") or 0)
+                    total_records += n
+                    inserted_rows += ins
+                    updated_rows += upd
                 else:
                     error_days.append(day)
                     print(f"  ⚠️ {day} 저장 실패: {result.get('error')}")
@@ -934,10 +1061,10 @@ def collect_etf_ohlcv_data(
         session.close()
 
     print(f"\n✓ ETF OHLCV 데이터 수집 완료 (biz_day={biz_day})")
-    print(f"  - 적재 거래일: {ok_days}")
-    print(f"  - 휴장/빈응답: {empty_days}")
+    print(f"  - 대상 구간: {dates[0]}~{dates[-1]}")
+    print(f"  - 수집 거래일: {ok_days} (휴장/빈응답={empty_days})")
     print(f"  - 실패 일수: {len(error_days)}")
-    print(f"  - 총 레코드 수: {total_records}개")
+    print(f"  - 행수: {total_records} (신규={inserted_rows}, 갱신={updated_rows})")
     if error_days:
         print(f"  실패일: {error_days[:10]}{'...' if len(error_days) > 10 else ''}")
 
@@ -946,8 +1073,11 @@ def collect_etf_ohlcv_data(
         "failed": len(error_days),
         "skipped": empty_days,
         "total_records": total_records,
+        "inserted": inserted_rows,
+        "updated": updated_rows,
         "error_list": error_days,
         "biz_day": biz_day,
+        "mode": plan["mode"],
     }
 
 
@@ -959,9 +1089,10 @@ def retry_failed_etf_ohlcv(
     backfill_years=3,
 ):
     """
-    실패한 '일자'(YYYYMMDD) 재수집. 레거시 티커 리스트가 오면 full 증분 재실행.
+    실패한 '일자'(YYYYMMDD) 재수집. 레거시 티커 리스트가 오면 DB 자동 증분 재실행.
     """
     _ = max_pages_per_etf
+    _ = backfill_years
     if not error_list:
         print("재수집할 실패 항목이 없습니다.")
         return {"success": 0, "failed": 0, "skipped": 0, "total_records": 0, "error_list": []}
@@ -971,12 +1102,14 @@ def retry_failed_etf_ohlcv(
     else:
         biz_day = _as_date(biz_day)
 
-    day_like = [str(x).replace("-", "") for x in error_list if str(x).replace("-", "").isdigit() and len(str(x).replace("-", "")) == 8]
+    day_like = [
+        str(x).replace("-", "")
+        for x in error_list
+        if str(x).replace("-", "").isdigit() and len(str(x).replace("-", "")) == 8
+    ]
     if not day_like:
-        print("레거시 티커 실패 목록 → 증분/백필 전체 재수집으로 대체")
-        return collect_etf_ohlcv_data(
-            full_backfill=full_backfill, biz_day=biz_day, backfill_years=backfill_years
-        )
+        print("레거시 티커 실패 목록 → DB 자동 증분 재수집으로 대체")
+        return collect_etf_ohlcv_data(full_backfill=full_backfill, biz_day=biz_day)
 
     print(f"\n실패한 {len(day_like)}개 일자 ETF OHLCV 재수집... (biz_day={biz_day})")
     ensure_etf_ohlcv_table(verbose=False)
@@ -6412,14 +6545,13 @@ if __name__ == "__main__":
         print("\n처음 3개 ETF의 전체 정보:")
         print(etf_all.head(3))
     
-    # ETF OHLCV 데이터 수집 (전체)
+    # ETF OHLCV 데이터 수집 (DB MAX(date) 자동 증분)
     print("\n" + "=" * 50)
-    print("ETF OHLCV 데이터 수집 시작 (KRX MDCSTAT04301)")
+    print("ETF OHLCV 데이터 수집 시작 (KRX MDCSTAT04301, DB 자동 증분)")
     print("=" * 50)
     
-    # 기본: 증분 수집. 최초 전체 히스토리는 full_backfill=True
-    print("\nETF OHLCV 증분 수집을 시작합니다... (전체 백필: full_backfill=True)")
-    result = collect_etf_ohlcv_data(max_etf=None, full_backfill=False)
+    print("\nETF OHLCV 자동 증분 수집을 시작합니다...")
+    result = collect_etf_ohlcv_data(max_etf=None)
     print(f"\n수집 결과: {result}")
 
     if result.get("error_list") and len(result["error_list"]) > 0:
@@ -6428,7 +6560,6 @@ if __name__ == "__main__":
         print("=" * 50)
         retry_result = retry_failed_etf_ohlcv(
             result["error_list"],
-            full_backfill=False,
             biz_day=result.get("biz_day"),
         )
         print(f"\n재수집 결과: {retry_result}")

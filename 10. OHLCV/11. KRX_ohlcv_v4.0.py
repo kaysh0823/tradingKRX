@@ -453,10 +453,12 @@ def krx_login(session: rq.Session) -> bool:
     return False
 
 
-def get_krx_csv(session, bld, params, retries=3):
+def get_krx_csv(session, bld, params, retries=3, min_bytes=100, empty_ok=False):
     """
     KRX 정보데이터시스템에서 OTP 발급 후 CSV를 다운로드하여 bytes로 반환.
-    실패 시 최대 retries회 재시도. 호출 간 1초 대기.
+    - empty_ok=True: 짧은/빈 응답을 휴장·무데이터로 보고 재시도 없이 반환
+      (12010 등 빈응답이 정상인 엔드포인트). 네트워크 오류만 재시도.
+    - empty_ok=False(기본): 짧은 응답은 오류로 재시도 후 RuntimeError.
     """
     otp_params = {
         'locale': 'ko_KR',
@@ -475,13 +477,20 @@ def get_krx_csv(session, bld, params, retries=3):
             res = session.post(DOWN_URL, data={'code': otp}, timeout=30)
             res.raise_for_status()
 
-            if len(res.content) < 100:
+            if min_bytes > 0 and len(res.content) < min_bytes:
+                if empty_ok:
+                    time.sleep(1)
+                    return res.content
                 print(f'OTP 응답 앞 200자: {otp[:200]!r}')
                 raise ValueError(f'응답이 비정상적으로 짧음 ({len(res.content)} bytes)')
 
             time.sleep(1)
             return res.content
 
+        except (rq.Timeout, rq.ConnectionError) as e:
+            last_err = e
+            print(f'KRX 네트워크 오류 ({bld}, {attempt}/{retries}): {type(e).__name__}: {e}')
+            time.sleep(1 if attempt < retries else 0)
         except Exception as e:
             last_err = e
             print(f'KRX 다운로드 실패 ({bld}, {attempt}/{retries}): {e}')
@@ -527,6 +536,58 @@ def _calendar_ymd_range(start_d, end_d):
     if start_d is None or end_d is None or start_d > end_d:
         return []
     return [d.strftime('%Y%m%d') for d in pd.date_range(start_d, end_d, freq='D')]
+
+
+def _weekday_ymd_range(start_d, end_d):
+    """주말 제외 캘린더일 (공휴일은 걸러지지 않음 — OHLCV 없을 때 폴백)."""
+    if start_d is None or end_d is None or start_d > end_d:
+        return []
+    out = []
+    for d in pd.date_range(start_d, end_d, freq='D'):
+        if d.weekday() < 5:  # Mon–Fri
+            out.append(d.strftime('%Y%m%d'))
+    return out
+
+
+def _trading_ymd_range_from_db(mycursor, start_d, end_d):
+    """
+    DB 실제 거래일 목록 (krx_ohlcv → krx_index_ohlcv → 주말제외 폴백).
+    반환: (YYYYMMDD list, source_label)
+    """
+    start_d = _as_plain_date(start_d)
+    end_d = _as_plain_date(end_d)
+    if start_d is None or end_d is None or start_d > end_d:
+        return [], 'empty'
+
+    def _fetch(sql):
+        try:
+            mycursor.execute(sql, (start_d, end_d))
+            rows = mycursor.fetchall()
+        except Exception:
+            return []
+        out = []
+        for (d,) in rows:
+            dd = _as_plain_date(d)
+            if dd is not None:
+                out.append(dd.strftime('%Y%m%d'))
+        return out
+
+    dates = _fetch(
+        'SELECT DISTINCT `date` FROM krx_ohlcv '
+        'WHERE `date` >= %s AND `date` <= %s ORDER BY `date`'
+    )
+    if dates:
+        return dates, 'krx_ohlcv'
+
+    dates = _fetch(
+        'SELECT DISTINCT `date` FROM krx_index_ohlcv '
+        'WHERE `date` >= %s AND `date` <= %s ORDER BY `date`'
+    )
+    if dates:
+        return dates, 'krx_index_ohlcv'
+
+    dates = _weekday_ymd_range(start_d, end_d)
+    return dates, 'weekday_fallback'
 
 
 def _krx_num_series(s):
@@ -1464,6 +1525,10 @@ def ensure_krx_investor_trading_wide_table(mycursor, con):
 
 
 def resolve_investor_krx_collect_plan(mycursor, biz_day):
+    """
+    DB MAX(date) 자동 증분. dates는 거래일만
+    (krx_ohlcv / krx_index_ohlcv DISTINCT, 없으면 주말제외 폴백).
+    """
     end = _as_plain_date(biz_day)
     mycursor.execute('SELECT MAX(`date`) FROM krx_investor_trade_krx')
     row = mycursor.fetchone()
@@ -1474,6 +1539,7 @@ def resolve_investor_krx_collect_plan(mycursor, biz_day):
         'biz_day': end,
         'from_date': None,
         'dates': [],
+        'date_source': '',
         'message': '',
     }
     if end is None:
@@ -1489,10 +1555,12 @@ def resolve_investor_krx_collect_plan(mycursor, biz_day):
         )
         plan['mode'] = 'initial'
         plan['from_date'] = start
-        plan['dates'] = _calendar_ymd_range(start, end)
+        dates, src = _trading_ymd_range_from_db(mycursor, start, end)
+        plan['dates'] = dates
+        plan['date_source'] = src
         plan['message'] = (
             f'DB 비어 있음 → 초기 백필 {start}~{end} '
-            f'(캘린더 {len(plan["dates"])}일 × 투자자 {len(KRX_INVST_TP_CD)}종)'
+            f'(거래일 {len(dates)}일×{len(KRX_INVST_TP_CD)}종, 출처={src})'
         )
         return plan
     if db_max >= end:
@@ -1503,10 +1571,12 @@ def resolve_investor_krx_collect_plan(mycursor, biz_day):
     start = db_max + timedelta(days=1)
     plan['mode'] = 'incremental'
     plan['from_date'] = start
-    plan['dates'] = _calendar_ymd_range(start, end)
+    dates, src = _trading_ymd_range_from_db(mycursor, start, end)
+    plan['dates'] = dates
+    plan['date_source'] = src
     plan['message'] = (
         f'증분 수집 {start}~{end} (DB 최신={db_max}, '
-        f'캘린더 {len(plan["dates"])}일 × {len(KRX_INVST_TP_CD)} CSV/일)'
+        f'거래일 {len(dates)}일×{len(KRX_INVST_TP_CD)} CSV/일, 출처={src})'
     )
     return plan
 
@@ -1546,6 +1616,9 @@ def parse_krx_investor_net_csv(df, day_str, invst_tp_cd, invst_tp_nm):
 
 
 def download_krx_investor_net_csv(session, day_str, invst_tp_cd):
+    """
+    12010 CSV. 짧은/빈 응답은 휴장·무데이터로 보고 빈 DF 반환(재시도 없음).
+    """
     content = get_krx_csv(
         session,
         BLD_INVESTOR_NET,
@@ -1557,10 +1630,16 @@ def download_krx_investor_net_csv(session, day_str, invst_tp_cd):
             'share': '1',
             'money': '1',
         },
+        empty_ok=True,
+        min_bytes=100,
     )
+    if content is None or len(content) < 100:
+        return pd.DataFrame(), content or b''
     try:
         raw = pd.read_csv(BytesIO(content), encoding='EUC-KR')
     except Exception:
+        return pd.DataFrame(), content
+    if raw is None or len(raw) == 0:
         return pd.DataFrame(), content
     return raw, content
 
@@ -1602,12 +1681,13 @@ def upsert_investor_trading_wide_from_day(mycursor, con, by_invst_net_qty):
     tickers = set(inst) | set(frgn)
     if not tickers:
         return 0
+    # MySQL 1052 방지: new 컬럼 별칭 + 기존값은 테이블명으로 한정
     sql = """
-    INSERT INTO krx_investor_trading (ticker, date, `기관_순매매량`, `외국인_순매매량`)
-    VALUES (%s, %s, %s, %s) AS new
+    INSERT INTO krx_investor_trading (ticker, `date`, `기관_순매매량`, `외국인_순매매량`)
+    VALUES (%s, %s, %s, %s) AS new(ticker, `date`, `기관_순매매량`, `외국인_순매매량`)
     ON DUPLICATE KEY UPDATE
-      `기관_순매매량`=COALESCE(new.`기관_순매매량`, `기관_순매매량`),
-      `외국인_순매매량`=COALESCE(new.`외국인_순매매량`, `외국인_순매매량`)
+      `기관_순매매량`=COALESCE(new.`기관_순매매량`, krx_investor_trading.`기관_순매매량`),
+      `외국인_순매매량`=COALESCE(new.`외국인_순매매량`, krx_investor_trading.`외국인_순매매량`)
     """
     rows = []
     for tk in tickers:
@@ -1623,22 +1703,71 @@ def upsert_investor_trading_wide_from_day(mycursor, con, by_invst_net_qty):
     return len(rows)
 
 
+def rebuild_investor_trading_wide_from_long(mycursor, con, day=None):
+    """
+    krx_investor_trade_krx(7050/9000) → krx_investor_trading 와이드 재구축.
+    day=None 이면 롱에 있는 전 일자. 와이드 실패로 빈 날을 메울 때 사용.
+    """
+    params = []
+    day_filter = ''
+    if day is not None:
+        day_filter = ' AND `date` = %s'
+        params.append(_as_plain_date(day))
+    sql = f"""
+    SELECT `date`, ticker, invst_tp_cd, net_qty
+    FROM krx_investor_trade_krx
+    WHERE invst_tp_cd IN ('7050', '9000'){day_filter}
+    """
+    mycursor.execute(sql, params if params else None)
+    rows = mycursor.fetchall()
+    if not rows:
+        return 0
+    # group by date → by_invst maps
+    by_day = {}
+    for d, ticker, invst_cd, net_qty in rows:
+        d = _as_plain_date(d)
+        tk = str(ticker)
+        by_day.setdefault(d, {}).setdefault(str(invst_cd), {})[tk] = (
+            d, None if net_qty is None else int(net_qty)
+        )
+    total = 0
+    for d, maps in sorted(by_day.items()):
+        total += upsert_investor_trading_wide_from_day(mycursor, con, maps)
+    return total
+
+
 def collect_krx_investor_trade_by_days(session, mycursor, con, dates, ohlcv_universe_n=None):
+    """거래일 목록만 순회. 빈/짧은 CSV는 조용히 스킵(재시도 없음)."""
     total_rows = 0
     ok_days = 0
     empty_days = 0
     error_items = []
+    n_inv = len(KRX_INVST_TP_CD)
+    print(f'  · 요청 예정: 거래일 {len(dates)} × 투자자 {n_inv} = 최대 {len(dates) * n_inv}회')
     for day in tqdm(dates, desc='KRX 12010 투자자 CSV'):
         day_any = False
         wide_maps = {}
         day_counts = {}
+        empty_invst = 0
+        day_no_data = False  # 첫 짧은 응답 → 당일 나머지 투자자 요청 생략
         for invst_cd, invst_nm in KRX_INVST_TP_CD:
+            if day_no_data:
+                empty_invst += 1
+                continue
             try:
                 raw, content = download_krx_investor_net_csv(session, day, invst_cd)
+                if content is not None and len(content) < 100:
+                    # 휴장·무데이터: 당일 잔여 invst 스킵
+                    if not day_any:
+                        day_no_data = True
+                    empty_invst += 1
+                    continue
                 if raw is None or len(raw) == 0:
+                    empty_invst += 1
                     continue
                 parsed = parse_krx_investor_net_csv(raw, day, invst_cd, invst_nm)
                 if parsed.empty:
+                    empty_invst += 1
                     continue
                 n = upsert_krx_investor_trade_krx(mycursor, con, parsed)
                 total_rows += n
@@ -1669,12 +1798,13 @@ def collect_krx_investor_trade_by_days(session, mycursor, con, dates, ohlcv_univ
                         )
             print(
                 f'  · {day} 적재: invst행={sum(day_counts.values())}, '
-                f'와이드갱신={wn}, CSV={len(day_counts)}/{len(KRX_INVST_TP_CD)}'
+                f'와이드갱신={wn}, CSV={len(day_counts)}/{n_inv}'
             )
         else:
             empty_days += 1
+            print(f'  · {day} 데이터 없음 → skip (빈응답/생략 {empty_invst}/{n_inv})')
     print(
-        f'  · 12010 완료: 거래일={ok_days}, 휴장/빈={empty_days}, '
+        f'  · 12010 완료: 적재거래일={ok_days}, 빈스킵={empty_days}, '
         f'실패항목={len(error_items)}, long행={total_rows}'
     )
     return {
@@ -1688,6 +1818,12 @@ def collect_krx_investor_trade_by_days(session, mycursor, con, dates, ohlcv_univ
 ensure_krx_investor_trade_krx_table(mycursor, con)
 ensure_krx_investor_trading_wide_table(mycursor, con)
 print('✓ krx_investor_trade_krx / krx_investor_trading 테이블 확인')
+try:
+    _n_wide = rebuild_investor_trading_wide_from_long(mycursor, con)
+    print(f'  · 롱→와이드 재동기화: {_n_wide}행')
+except Exception as e:
+    print(f'  ⚠️ 롱→와이드 재동기화 실패: {e}')
+    print(traceback.format_exc())
 
 inv_plan = resolve_investor_krx_collect_plan(mycursor, biz_day)
 print(f'   {inv_plan["message"]}')
@@ -1981,7 +2117,8 @@ if inv_plan['mode'] == 'skip' or not inv_plan['dates']:
 else:
     print(
         f'   대상 구간: {inv_plan["dates"][0]}~{inv_plan["dates"][-1]} '
-        f'(캘린더 {len(inv_plan["dates"])}일, 일당 CSV {len(KRX_INVST_TP_CD)}장)'
+        f'(거래일 {len(inv_plan["dates"])}일 × CSV {len(KRX_INVST_TP_CD)}종/일'
+        f', 출처={inv_plan.get("date_source", "?")})'
     )
     inv_stats = collect_krx_investor_trade_by_days(
         krx_inv_session, mycursor, con, inv_plan['dates'], ohlcv_universe_n=_ohlcv_univ
