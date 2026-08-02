@@ -123,7 +123,14 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from env_config import load_project_env, require_env, db_url, db_connect_kwargs
 load_project_env()
-from indicators_core import atr_wilder, energy_ratio, rs_avg, talent_up_share
+from indicators_core import (
+    atr_wilder,
+    bollinger_band_width,
+    bollinger_band_width_q,
+    energy_ratio,
+    rs_avg,
+    talent_up_share,
+)
 
 
 import os
@@ -366,11 +373,11 @@ def get_indicators(d, tradeHist=None):
         d['bol20_ma'] = middleband
         d['bol20_dn'] = lowerband
         
-        d['band20_w'] = (d.bol20_up - d.bol20_dn)/d.bol20_ma
-        
-        d['band20_w_min'], d['band20_w_max'] = talib.MINMAX(d.band20_w, timeperiod=125)
-        
-        d['band20_q'] = (d.band20_w - d.band20_w_min)/(d.band20_w_max - d.band20_w_min)
+        # 정본: indicators_core (루트·naverPub 동일). band20_q = 정규화 0~1
+        d['band20_w'] = bollinger_band_width(d.close, window=20, n_sigma=2.0)
+        d['band20_w_min'] = d['band20_w'].rolling(125, min_periods=125).min()
+        d['band20_w_max'] = d['band20_w'].rolling(125, min_periods=125).max()
+        d['band20_q'] = bollinger_band_width_q(d.close, window=20, n_sigma=2.0, lookback=125)
 
         d['atr_w'] = d.atr14 / d.close.replace(0, np.nan)
         d['atr_w_min'], d['atr_w_max'] = talib.MINMAX(d.atr_w, timeperiod=125)

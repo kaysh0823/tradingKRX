@@ -10,6 +10,8 @@
 - 에너지배율 = (거래대금 시장내 비중)/(시총 시장내 비중) × (1 + tanh(수익률% / 15))
 - RS 평균 = mean(rs_20, rs_50, rs_120, rs_200)  (rs_10 제외)
 - Talent = 전일종가 대비 일간등락률 ≥ +10% 일수 비중을 20/50/120에 0.5/0.3/0.2 가중합성
+- Band Width raw = (BB상단−하단)/중심 = (2·nσ·std)/SMA (window=20, nσ=2, std ddof=1)
+- Band Width q = (raw − rollmin(raw,125)) / (rollmax − rollmin)  → 0~1
 """
 from __future__ import annotations
 
@@ -227,3 +229,41 @@ def talent_score(
             }
         )
     return out
+
+
+def bollinger_band_width(
+    close: pd.Series,
+    window: int = 20,
+    n_sigma: float = 2.0,
+) -> pd.Series:
+    """
+    Band Width raw = (BB상단 − 하단) / 중심 = (2·nσ·std) / SMA(window).
+
+    std = rolling sample std (ddof=1). 정본: screening/51 band20_w.
+    루트·naverPub indicators_core 함께 수정.
+    """
+    s = pd.to_numeric(close, errors="coerce")
+    w = int(window)
+    mid = s.rolling(w, min_periods=w).mean()
+    std = s.rolling(w, min_periods=w).std(ddof=1)
+    return (2.0 * float(n_sigma) * std) / mid.replace(0, np.nan)
+
+
+def bollinger_band_width_q(
+    close: pd.Series,
+    window: int = 20,
+    n_sigma: float = 2.0,
+    lookback: int = 125,
+) -> pd.Series:
+    """
+    Band Width 정규화 q ∈ [0,1].
+
+    q = (raw − rollmin(raw, lookback)) / (rollmax − rollmin).
+    정본: screening/51 band20_q. 루트·naverPub indicators_core 함께 수정.
+    """
+    raw = bollinger_band_width(close, window=window, n_sigma=n_sigma)
+    lb = int(lookback)
+    rmin = raw.rolling(lb, min_periods=lb).min()
+    rmax = raw.rolling(lb, min_periods=lb).max()
+    denom = (rmax - rmin).replace(0, np.nan)
+    return (raw - rmin) / denom
