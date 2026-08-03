@@ -2166,7 +2166,7 @@ if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
             rs_kospi_df['rs10_score'] = rs_kospi_df['rs_10d']
             rs_kospi_df['rs20_score'] = rs_kospi_df['rs_20d']
             rs_kospi_df['rs50_score'] = rs_kospi_df['rs_50d']
-            # rs_score = mean(rs_20,50,120,200) — 정본
+            # rs_score = 가중평균(rs_20/50/120/200) — 정본 indicators_core.rs_avg
             rs_kospi_df['rs_score'] = rs_avg(
                 frame=rs_kospi_df, cols=('rs_20d', 'rs_50d', 'rs_120d', 'rs_200d')
             ).round(2)

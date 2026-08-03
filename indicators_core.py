@@ -8,13 +8,14 @@
 정본 정의:
 - ATR = Wilder 평활(RMA, alpha=1/period). talib.ATR 와 값 동일.
 - 에너지배율 = (거래대금 시장내 비중)/(시총 시장내 비중) × (1 + tanh(수익률% / 15))
-- RS 평균 = mean(rs_20, rs_50, rs_120, rs_200)  (rs_10 제외)
+- RS 평균 = 가중평균 0.4·rs_200 + 0.3·rs_120 + 0.2·rs_50 + 0.1·rs_20  (rs_10 제외, 결측 시 재정규화)
 - Talent = 전일종가 대비 일간등락률 ≥ +10% 일수 비중을 20/50/120에 0.5/0.3/0.2 가중합성
 - Band Width raw = (BB상단−하단)/중심 = (2·nσ·std)/SMA (window=20, nσ=2, std ddof=1)
 - Band Width q = (raw − rollmin(raw,125)) / (rollmax − rollmin)  → 0~1
 """
 from __future__ import annotations
 
+import re
 from typing import Optional, Sequence, Union
 
 import numpy as np
@@ -28,6 +29,9 @@ TALENT_WINDOWS = (20, 50, 120)
 TALENT_WEIGHTS = (0.5, 0.3, 0.2)
 RS_AVG_COLS = ("rs_20", "rs_50", "rs_120", "rs_200")
 RS_AVG_COLS_D = ("rs_20d", "rs_50d", "rs_120d", "rs_200d")
+# 가중평균 정본 (합=1). 키는 기간 정규화명; frame 컬럼 rs_20 / rs_20d 모두 매핑.
+RS_AVG_WEIGHTS = {"rs_20": 0.1, "rs_50": 0.2, "rs_120": 0.3, "rs_200": 0.4}
+_RS_PERIODS_DESC = (200, 120, 50, 20)  # 매칭 시 긴 기간 우선(200 ⊃ 20 방지)
 
 
 def true_range(
@@ -128,6 +132,86 @@ def energy_ratio(
     return out
 
 
+def _rs_period_key(col: str) -> Optional[str]:
+    """컬럼명 → 'rs_20'|'rs_50'|'rs_120'|'rs_200'. rs_10 등은 None."""
+    s = str(col).lower()
+    # 200|120|50|20 긴 기간 우선 — rs_20 ⊂ rs_200 부분일치 방지
+    m = re.search(r"(?:rs[_-]?)?(200|120|50|20)d?", s)
+    if not m:
+        return None
+    return f"rs_{m.group(1)}"
+
+
+def _rs_weighted_from_pairs(
+    pairs: list[tuple[str, ArrayLike]],
+    *,
+    index=None,
+) -> Union[float, pd.Series]:
+    """
+    (period_key, values) 목록 → 가중평균.
+    결측은 skipna + 남은 가중치로 재정규화.
+    """
+    if not pairs:
+        if index is not None:
+            return pd.Series(np.nan, index=index, dtype=float)
+        return float("nan")
+
+    series_list: list[tuple[float, pd.Series]] = []
+    scalars: list[tuple[float, float]] = []
+    any_series = False
+    for key, raw in pairs:
+        w = float(RS_AVG_WEIGHTS.get(key, 0.0))
+        if w <= 0:
+            continue
+        if raw is None:
+            continue
+        if np.isscalar(raw) or (isinstance(raw, (float, int, np.floating, np.integer)) and not isinstance(raw, (pd.Series, np.ndarray))):
+            try:
+                x = float(raw)
+            except (TypeError, ValueError):
+                continue
+            scalars.append((w, x))
+            continue
+        s = pd.to_numeric(pd.Series(raw), errors="coerce")
+        series_list.append((w, s))
+        any_series = True
+
+    if not any_series and not scalars:
+        if index is not None:
+            return pd.Series(np.nan, index=index, dtype=float)
+        return float("nan")
+
+    if not any_series:
+        num = 0.0
+        den = 0.0
+        for w, x in scalars:
+            if np.isfinite(x):
+                num += w * x
+                den += w
+        return float(num / den) if den > 0 else float("nan")
+
+    # 시리즈(+선택 스칼라를 상수 시리즈로)
+    aligned: list[tuple[float, pd.Series]] = list(series_list)
+    if scalars:
+        base_idx = series_list[0][1].index
+        for w, x in scalars:
+            aligned.append((w, pd.Series(x, index=base_idx, dtype=float)))
+
+    idx = index
+    if idx is None:
+        idx = aligned[0][1].index
+    num = pd.Series(0.0, index=idx, dtype=float)
+    den = pd.Series(0.0, index=idx, dtype=float)
+    for w, s in aligned:
+        s = s.reindex(idx)
+        ok = s.notna() & np.isfinite(s.to_numpy(dtype=float, na_value=np.nan))
+        vals = s.to_numpy(dtype=float, na_value=np.nan)
+        num = num + pd.Series(np.where(ok, w * vals, 0.0), index=idx)
+        den = den + pd.Series(np.where(ok, w, 0.0), index=idx)
+    out = num / den.replace(0.0, np.nan)
+    return out.astype(float)
+
+
 def rs_avg(
     rs_20: ArrayLike = None,
     rs_50: ArrayLike = None,
@@ -138,28 +222,36 @@ def rs_avg(
     cols: Sequence[str] = RS_AVG_COLS,
 ) -> Union[float, pd.Series]:
     """
-    RS 평균 = mean(rs_20, rs_50, rs_120, rs_200). rs_10 제외.
+    RS 가중평균 (rs_10 제외).
 
-    frame+cols 로 DataFrame 행평균, 또는 개별 시리즈/스칼라 인자.
+    rs_avg = 0.4·rs_200 + 0.3·rs_120 + 0.2·rs_50 + 0.1·rs_20
+    결측 컬럼은 skipna 후 남은 가중치로 재정규화.
+    frame+cols(rs_20 / rs_20d 등) 또는 개별 인자. 루트·naverPub 함께 수정.
     """
     if frame is not None:
-        use = [c for c in cols if c in frame.columns]
-        if not use:
-            return pd.Series(np.nan, index=frame.index, dtype=float)
-        return frame[use].apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
+        pairs: list[tuple[str, ArrayLike]] = []
+        seen: set[str] = set()
+        for c in cols:
+            if c not in frame.columns:
+                continue
+            key = _rs_period_key(c)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            pairs.append((key, frame[c]))
+        return _rs_weighted_from_pairs(pairs, index=frame.index)
 
-    parts = []
-    for v in (rs_20, rs_50, rs_120, rs_200):
+    pairs = []
+    for key, v in (
+        ("rs_20", rs_20),
+        ("rs_50", rs_50),
+        ("rs_120", rs_120),
+        ("rs_200", rs_200),
+    ):
         if v is None:
             continue
-        parts.append(pd.to_numeric(v, errors="coerce"))
-    if not parts:
-        return float("nan")
-    if all(np.isscalar(p) or (isinstance(p, float)) for p in parts):
-        arr = np.asarray([float(p) for p in parts], dtype=float)
-        return float(np.nanmean(arr)) if np.any(np.isfinite(arr)) else float("nan")
-    df = pd.concat([pd.Series(p) for p in parts], axis=1)
-    return df.mean(axis=1, skipna=True)
+        pairs.append((key, v))
+    return _rs_weighted_from_pairs(pairs)
 
 
 def daily_ret_from_close(close: pd.Series) -> pd.Series:
