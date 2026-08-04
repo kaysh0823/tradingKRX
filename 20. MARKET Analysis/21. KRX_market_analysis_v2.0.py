@@ -3475,6 +3475,34 @@ def _load_latest_ticker_list(engine) -> pd.DataFrame:
     return df
 
 
+def _market_dash_annotate_ohlcv_meta(ohlcv: pd.DataFrame, ticker: str, ticker_list_idx) -> pd.DataFrame:
+    """대시보드용 OHLCV에 ticker/name/sector/market_cap 부착. 기존 동명 컬럼은 제거 후 insert."""
+    ohlcv = ohlcv.copy()
+    for c in ("name", "sector", "market_cap", "ticker"):
+        if c in ohlcv.columns:
+            ohlcv = ohlcv.drop(columns=[c])
+    ohlcv.insert(0, "ticker", str(ticker))
+    try:
+        ohlcv.insert(1, "name", ticker_list_idx.loc[ticker, "종목명"])
+        ohlcv.insert(2, "sector", ticker_list_idx.loc[ticker, "업종명"])
+        try:
+            if "시가총액" in ticker_list_idx.columns and ticker in ticker_list_idx.index:
+                market_cap = ticker_list_idx.loc[ticker, "시가총액"]
+                if pd.notna(market_cap):
+                    ohlcv.insert(3, "market_cap", market_cap)
+                else:
+                    ohlcv.insert(3, "market_cap", None)
+            else:
+                ohlcv.insert(3, "market_cap", None)
+        except (KeyError, IndexError):
+            ohlcv.insert(3, "market_cap", None)
+    except (KeyError, IndexError):
+        ohlcv.insert(1, "name", ticker)
+        ohlcv.insert(2, "sector", "")
+        ohlcv.insert(3, "market_cap", None)
+    return ohlcv
+
+
 def _market_dash_load_single_ticker_ohlcv(ticker, ticker_list_idx, eng, memory_cache=None):
     """단일 티커 OHLCV 로드 (대시보드 breadth·변동성용). memory_cache 있으면 DB 생략."""
     ticker = str(ticker)
@@ -3484,49 +3512,26 @@ def _market_dash_load_single_ticker_ohlcv(ticker, ticker_list_idx, eng, memory_c
             if raw is None or raw.empty:
                 return ticker, None
             ohlcv = raw.sort_values("date").reset_index(drop=True).copy()
-            ohlcv.insert(0, "ticker", ticker)
-            try:
-                ohlcv.insert(1, "name", ticker_list_idx.loc[ticker, "종목명"])
-                ohlcv.insert(2, "sector", ticker_list_idx.loc[ticker, "업종명"])
-                try:
-                    if "시가총액" in ticker_list_idx.columns and ticker in ticker_list_idx.index:
-                        market_cap = ticker_list_idx.loc[ticker, "시가총액"]
-                        if pd.notna(market_cap):
-                            ohlcv.insert(3, "market_cap", market_cap)
-                        else:
-                            ohlcv.insert(3, "market_cap", None)
-                    else:
-                        ohlcv.insert(3, "market_cap", None)
-                except (KeyError, IndexError):
-                    ohlcv.insert(3, "market_cap", None)
-            except (KeyError, IndexError):
-                ohlcv.insert(1, "name", ticker)
-                ohlcv.insert(2, "sector", "")
-                ohlcv.insert(3, "market_cap", None)
+            # 가격 컬럼만 유지(캐시에 name 등이 있어도 충돌 방지)
+            keep = [c for c in ("date", "open", "high", "low", "close", "volume") if c in ohlcv.columns]
+            ohlcv = ohlcv[keep]
+            ohlcv = _market_dash_annotate_ohlcv_meta(ohlcv, ticker, ticker_list_idx)
             ohlcv = ohlcv.set_index("date")
             return ticker, ohlcv
 
-        query = """select * from krx_ohlcv where ticker = '{}';""".format(ticker)
-        ohlcv = pd.read_sql_query(query, con=eng)
+        # KRX 통일 후 name/market/mcap 등이 추가됨 → select * + insert(name) 충돌 방지
+        ohlcv = pd.read_sql_query(
+            """
+            SELECT date, open, high, low, close, volume
+            FROM krx_ohlcv
+            WHERE ticker = %s
+            ORDER BY date
+            """,
+            con=eng,
+            params=(ticker,),
+        )
         if ohlcv is not None and not ohlcv.empty:
-            try:
-                ohlcv.insert(1, "name", ticker_list_idx.loc[ticker, "종목명"])
-                ohlcv.insert(2, "sector", ticker_list_idx.loc[ticker, "업종명"])
-                try:
-                    if "시가총액" in ticker_list_idx.columns and ticker in ticker_list_idx.index:
-                        market_cap = ticker_list_idx.loc[ticker, "시가총액"]
-                        if pd.notna(market_cap):
-                            ohlcv.insert(3, "market_cap", market_cap)
-                        else:
-                            ohlcv.insert(3, "market_cap", None)
-                    else:
-                        ohlcv.insert(3, "market_cap", None)
-                except (KeyError, IndexError):
-                    ohlcv.insert(3, "market_cap", None)
-            except (KeyError, IndexError):
-                ohlcv.insert(1, "name", ticker)
-                ohlcv.insert(2, "sector", "")
-                ohlcv.insert(3, "market_cap", None)
+            ohlcv = _market_dash_annotate_ohlcv_meta(ohlcv, ticker, ticker_list_idx)
             ohlcv = ohlcv.set_index("date")
             return ticker, ohlcv
         return ticker, None

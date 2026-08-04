@@ -629,12 +629,23 @@ ticker_list = ticker_list.set_index('종목코드')
 def load_single_ticker_ohlcv(ticker, ticker_list, engine):
     """단일 티커 OHLCV 데이터 로드 (병렬 처리용)"""
     try:
-        query = """select * from krx_ohlcv where ticker = '{}';"""
-        query = query.format(ticker)
-        
-        ohlcv = pd.read_sql_query(query, con=engine)
-        
+        # KRX 통일 후 name/market/mcap 등 추가 → select * + insert(name) 충돌 방지
+        ohlcv = pd.read_sql_query(
+            """
+            SELECT date, open, high, low, close, volume
+            FROM krx_ohlcv
+            WHERE ticker = %s
+            ORDER BY date
+            """,
+            con=engine,
+            params=(str(ticker),),
+        )
+
         if ohlcv is not None and not ohlcv.empty:
+            for c in ("name", "sector", "market_cap", "ticker"):
+                if c in ohlcv.columns:
+                    ohlcv = ohlcv.drop(columns=[c])
+            ohlcv.insert(0, "ticker", str(ticker))
             try:
                 ohlcv.insert(1, 'name', ticker_list.loc[ticker, '종목명'])
                 ohlcv.insert(2, 'sector', ticker_list.loc[ticker, '업종명'])
