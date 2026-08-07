@@ -3503,59 +3503,145 @@ def _market_dash_annotate_ohlcv_meta(ohlcv: pd.DataFrame, ticker: str, ticker_li
     return ohlcv
 
 
-def _market_dash_load_single_ticker_ohlcv(ticker, ticker_list_idx, eng, memory_cache=None):
-    """단일 티커 OHLCV 로드 (대시보드 breadth·변동성용). memory_cache 있으면 DB 생략."""
-    ticker = str(ticker)
+def _market_dash_ohlcv_cutoff(eng, lookback_td: int = 500) -> pd.Timestamp | None:
+    """최근 lookback_td 거래일 중 가장 이른 날짜(롤링 워밍업 포함 창)."""
     try:
-        if memory_cache is not None and ticker in memory_cache:
-            raw = memory_cache[ticker]
-            if raw is None or raw.empty:
-                return ticker, None
-            ohlcv = raw.sort_values("date").reset_index(drop=True).copy()
-            # 가격 컬럼만 유지(캐시에 name 등이 있어도 충돌 방지)
-            keep = [c for c in ("date", "open", "high", "low", "close", "volume") if c in ohlcv.columns]
-            ohlcv = ohlcv[keep]
-            ohlcv = _market_dash_annotate_ohlcv_meta(ohlcv, ticker, ticker_list_idx)
-            ohlcv = ohlcv.set_index("date")
-            return ticker, ohlcv
-
-        # KRX 통일 후 name/market/mcap 등이 추가됨 → select * + insert(name) 충돌 방지
-        ohlcv = pd.read_sql_query(
-            """
-            SELECT date, open, high, low, close, volume
-            FROM krx_ohlcv
-            WHERE ticker = %s
-            ORDER BY date
-            """,
+        td = pd.read_sql_query(
+            "SELECT DISTINCT date FROM krx_ohlcv ORDER BY date DESC LIMIT %s",
             con=eng,
-            params=(ticker,),
+            params=(int(lookback_td),),
         )
-        if ohlcv is not None and not ohlcv.empty:
-            ohlcv = _market_dash_annotate_ohlcv_meta(ohlcv, ticker, ticker_list_idx)
-            ohlcv = ohlcv.set_index("date")
-            return ticker, ohlcv
-        return ticker, None
-    except Exception as e:
-        print(f"대시보드 OHLCV 로드 실패 {ticker}: {e}")
-        return ticker, None
+    except Exception:
+        return None
+    if td is None or td.empty:
+        return None
+    return pd.to_datetime(td["date"].iloc[-1], errors="coerce").normalize()
 
 
-def _market_dash_load_ohlcv_parallel(tickers, ticker_list_idx, eng, memory_cache=None, max_workers=10, quiet: bool = False):
-    ohlcv_data = {}
+def _market_dash_frame_from_raw(raw: pd.DataFrame, ticker: str, ticker_list_idx, cutoff=None) -> pd.DataFrame | None:
+    """date/OHLCV raw → annotate + date index. cutoff 있으면 해당일 이상만."""
+    if raw is None or raw.empty:
+        return None
+    ohlcv = raw.copy()
+    if "date" not in ohlcv.columns:
+        return None
+    keep = [c for c in ("date", "open", "high", "low", "close", "volume") if c in ohlcv.columns]
+    ohlcv = ohlcv[keep]
+    ohlcv["date"] = pd.to_datetime(ohlcv["date"], errors="coerce")
+    ohlcv = ohlcv.dropna(subset=["date"]).sort_values("date")
+    if cutoff is not None:
+        ohlcv = ohlcv[ohlcv["date"] >= pd.Timestamp(cutoff)]
+    if ohlcv.empty:
+        return None
+    ohlcv = ohlcv.reset_index(drop=True)
+    ohlcv = _market_dash_annotate_ohlcv_meta(ohlcv, ticker, ticker_list_idx)
+    return ohlcv.set_index("date")
+
+
+def _market_dash_load_ohlcv_parallel(
+    tickers,
+    ticker_list_idx,
+    eng,
+    memory_cache=None,
+    max_workers=4,
+    quiet: bool = False,
+    lookback_td: int = 500,
+    chunk_size: int = 500,
+):
+    """
+    대시보드 OHLCV 벌크 로드.
+    - memory_cache 우선, 나머지는 ticker IN (...) 청크 쿼리(청크당 1회)
+    - date >= 최근 lookback_td 거래일 시작(기본 500 = 표시250 + 롤링200 + 버퍼)
+    반환: {ticker: DataFrame[date index, name/sector/market_cap/OHLCV]}
+    """
+    ohlcv_data: dict = {}
     tickers = [str(t) for t in tickers]
-    n_mem = sum(1 for t in tickers if memory_cache and t in memory_cache)
-    n_db = len(tickers) - n_mem
+    if not tickers:
+        return ohlcv_data
+
+    cutoff = _market_dash_ohlcv_cutoff(eng, lookback_td=lookback_td)
+    if cutoff is None or pd.isna(cutoff):
+        if not quiet:
+            print("  → OHLCV 로드 실패: 기준일(cutoff) 없음")
+        return ohlcv_data
+    co_str = pd.Timestamp(cutoff).strftime("%Y-%m-%d")
+
+    need_db: list[str] = []
+    for t in tickers:
+        if memory_cache is not None and t in memory_cache:
+            raw = memory_cache[t]
+            if raw is None or (hasattr(raw, "empty") and raw.empty):
+                continue
+            try:
+                frame = raw.copy()
+                if "date" not in frame.columns:
+                    frame = frame.reset_index()
+                    if len(frame.columns) and frame.columns[0] != "date":
+                        frame = frame.rename(columns={frame.columns[0]: "date"})
+                framed = _market_dash_frame_from_raw(frame, t, ticker_list_idx, cutoff=cutoff)
+                if framed is not None and not framed.empty:
+                    ohlcv_data[t] = framed
+                    continue
+            except Exception as e:
+                if not quiet:
+                    print(f"대시보드 OHLCV 캐시 처리 실패 {t}: {e}")
+            need_db.append(t)
+        else:
+            need_db.append(t)
+
+    n_mem = len(ohlcv_data)
+    n_db = len(need_db)
+    n_chunks = (n_db + chunk_size - 1) // chunk_size if n_db else 0
     if not quiet:
-        print(f"  → OHLCV 소스: 메모리 {n_mem}종목 / DB 조회 {n_db}종목")
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ticker = {
-            executor.submit(_market_dash_load_single_ticker_ohlcv, t, ticker_list_idx, eng, memory_cache): t
-            for t in tickers
-        }
-        for future in tqdm(as_completed(future_to_ticker), total=len(tickers), desc="대시보드 OHLCV", disable=quiet):
-            ticker, data = future.result()
-            if data is not None:
-                ohlcv_data[ticker] = data
+        print(
+            f"  → OHLCV 소스: 메모리 {n_mem}종목 / DB {n_db}종목 "
+            f"(청크 {n_chunks}×{chunk_size}, date>={co_str}, lookback_td={lookback_td})"
+        )
+
+    def _load_chunk(chunk: list[str]) -> pd.DataFrame:
+        ph = ",".join(["%s"] * len(chunk))
+        q = f"""
+            SELECT ticker, date, open, high, low, close, volume
+            FROM krx_ohlcv
+            WHERE ticker IN ({ph}) AND date >= %s
+            ORDER BY ticker, date
+        """
+        return pd.read_sql_query(q, con=eng, params=tuple(chunk) + (co_str,))
+
+    chunks = [need_db[i : i + chunk_size] for i in range(0, len(need_db), chunk_size)] if need_db else []
+    # 청크 단위 병렬(소수). 연결 폭주 방지로 워커 상한 유지.
+    workers = max(1, min(int(max_workers or 1), len(chunks))) if chunks else 1
+    chunk_frames: list[pd.DataFrame] = []
+    if chunks:
+        if workers <= 1 or len(chunks) == 1:
+            for ch in tqdm(chunks, desc="대시보드 OHLCV 청크", disable=quiet):
+                try:
+                    chunk_frames.append(_load_chunk(ch))
+                except Exception as e:
+                    print(f"대시보드 OHLCV 청크 로드 실패: {e}")
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futs = {executor.submit(_load_chunk, ch): ch for ch in chunks}
+                for fut in tqdm(as_completed(futs), total=len(futs), desc="대시보드 OHLCV 청크", disable=quiet):
+                    try:
+                        chunk_frames.append(fut.result())
+                    except Exception as e:
+                        print(f"대시보드 OHLCV 청크 로드 실패: {e}")
+
+    if chunk_frames:
+        all_db = pd.concat([c for c in chunk_frames if c is not None and not c.empty], ignore_index=True)
+        if not all_db.empty:
+            all_db["ticker"] = all_db["ticker"].astype(str)
+            all_db["date"] = pd.to_datetime(all_db["date"], errors="coerce")
+            all_db = all_db.dropna(subset=["date"])
+            for ticker, g in all_db.groupby("ticker", sort=False):
+                try:
+                    framed = _market_dash_frame_from_raw(g, str(ticker), ticker_list_idx, cutoff=None)
+                    if framed is not None and not framed.empty:
+                        ohlcv_data[str(ticker)] = framed
+                except Exception as e:
+                    print(f"대시보드 OHLCV 조립 실패 {ticker}: {e}")
+
     return ohlcv_data
 
 
@@ -4038,7 +4124,13 @@ def write_volatility_spread_top100_html(
     if _need_load:
         try:
             loaded = _market_dash_load_ohlcv_parallel(
-                _need_load, ticker_list_idx, engine, memory_cache=memory_cache, quiet=quiet
+                _need_load,
+                ticker_list_idx,
+                engine,
+                memory_cache=memory_cache,
+                quiet=quiet,
+                lookback_td=500,
+                chunk_size=500,
             )
             ohlcv_data.update(loaded)
         except Exception:
@@ -4459,7 +4551,14 @@ def run_market_dashboard(
         _log(f"대시보드: 코스피+코스닥 유니버스 {len(_universe_dash)}종목 OHLCV 로드 중...")
 
         ohlcv_data = _market_dash_load_ohlcv_parallel(
-            _universe_dash, ticker_list_idx, engine, memory_cache=memory_cache, quiet=quiet
+            _universe_dash,
+            ticker_list_idx,
+            engine,
+            memory_cache=memory_cache,
+            quiet=quiet,
+            lookback_td=BREADTH_WINDOW + 200 + 50,  # 표시250 + CVI/ADL 롤링200 + 버퍼
+            chunk_size=500,
+            max_workers=4,
         )
 
         def load_index_ohlcv(index_ticker: str) -> pd.DataFrame:
