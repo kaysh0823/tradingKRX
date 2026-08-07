@@ -3705,13 +3705,14 @@ MARKET_DASH_HOLIDAYS = [
 MARKET_DASH_PAGE_DESCS: dict[int, str] = {
     1: "Advance Decline Line: 전일 대비 상승 종목 수 − 하락 종목 수(Net AD)의 200일 롤링 누적선과, 그 선의 20일 지수이동평균(Signal)입니다. 아래 막대는 같은 날짜의 Net AD 일별 값이고, 맨 아래는 맥클레란 오실레이터(Net AD의 EMA19−EMA39, 0선 기준)입니다. 지수와 함께 시장 참여 종목의 방향성 강도를 봅니다.",
     2: "CVI: 전일 대비 상승 종목 거래대금 합 − 하락 종목 거래대금 합(net TV)의 200일 롤링 누적선과 Signal(EMA20)입니다. 가운데 막대는 일별 net TV이고, 아래는 삼성전자·SK하이닉스를 제외한 동일 지표입니다.",
-    3: "시장 변동성: 유니버스 각 종목의 ATR3÷종가 날짜별 평균과 Vol SMA20, 그리고 ATR3/종가 vs 시가총액 산점도입니다. 산점도에서 ATR3/종가 ≥ 0.4 종목은 제외하며, RS Top10·거래대금 Top10을 강조합니다.",
+    3: "시장 변동성: 지수(10/20/50 SMA+거래량)와, 유니버스 각 종목 ATR3÷종가의 날짜별 평균·Vol SMA20입니다.",
     4: "Zweig Breadth Thrust: 상승÷(상승+하락) 종목 비율의 10일 SMA(%)입니다. 최근 10일 안에 40% 미만을 거친 뒤 61.5%를 처음 돌파하면 별(★)로 표시합니다.",
     5: "종가>SMA 비중: 해당 시장 유니버스에서 종가가 SMA5·10·20 위에 있는 종목 비율(%)입니다. 코스피·코스닥 각각 SMA 길이별로 한 패널씩 나누어 표시합니다.",
     6: "종가>SMA5 · <SMA10 비중: 단기(5일) 강세 종목 비율과 중기(10일) 약세 종목 비율을 겹쳐 봅니다. 단기 과열·중기 약세 괴리를 확인합니다.",
     7: "120일 신고가/신저가 종목 수: 종가가 최근 120거래일 최고·최저 종가인 종목 수입니다. 신고가·신저가 확산 정도를 봅니다.",
     8: "ADR: 최근 20거래일 상승 종목 수 합 ÷ 같은 기간 하락 종목 수 합에 100을 곱한 값입니다. 일별 값은 들쭉날쭉하므로 ADR의 10일 SMA로 추세를 보조합니다. 약 100 근처는 균형, 120~125 이상은 단기 과열, 70~75 이하는 침체(과매도) 권역으로 자주 해석합니다.",
     9: "모멘텀 속도: 지수 종가 기준 ROC(기간 변화율 %) ÷ 기간으로 나눈 하루 평균 변화율(%/일)입니다. 5·10·20·50일 선을 겹쳐 단기·중기 추세 속도를 비교합니다. 0선 위는 상승 모멘텀, 아래는 하락 모멘텀입니다.",
+    10: "ATR3/종가 vs 시가총액: 코스피(위)·코스닥(아래) 산점도입니다. ATR3/종가 ≥ 0.4 종목은 제외하며, RS Top20·거래대금 Top20을 강조합니다. P25/P50/P75·평균 수직선이 함께 표시됩니다.",
 }
 
 _MARKET_DASH_BTN_LABELS: dict[int, str] = {
@@ -3724,6 +3725,7 @@ _MARKET_DASH_BTN_LABELS: dict[int, str] = {
     7: "7페이지: 120일 신고가/신저가 종목수",
     8: "8페이지: ADR",
     9: "9페이지: 모멘텀 속도",
+    10: "10페이지: ATR3/종가 vs 시가총액",
 }
 
 
@@ -4520,7 +4522,7 @@ def run_market_dashboard(
 
     _log = print if not quiet else (lambda *a, **k: None)
     ohlcv_data: dict = {}
-    # 대시보드 HTML 재기록용(변동성 페이지에 ATR 산점도 통합 후 최종 조립)
+    # 대시보드 HTML 재기록용(후단에서 ATR 산점도 페이지를 붙여 최종 조립)
     dash_state: dict = {"path": None, "figs": None}
 
     # 1) 코스피/코스닥 분리: (지수, Advance Decline Line, 시장 평균 변동성 등)
@@ -5074,16 +5076,15 @@ def run_market_dashboard(
         fig_page2.update_yaxes(title_text="상승TV−하락TV", row=5, col=1)
         fig_page2.update_yaxes(title_text="상승TV−하락TV", row=5, col=2)
 
-        # Page 3: 시장 변동성 (지수 / ATR3 평균 / ATR3·시총 산점도는 후단에서 row3 채움)
+        # Page 3: 시장 변동성 (지수 / ATR3 평균) — ATR 산점도는 10페이지 독립
         fig_vol = make_subplots(
-            rows=3,
+            rows=2,
             cols=2,
             shared_xaxes=False,
-            vertical_spacing=0.08,
+            vertical_spacing=0.10,
             horizontal_spacing=0.07,
             specs=[
                 [{"secondary_y": True}, {"secondary_y": True}],
-                [{}, {}],
                 [{}, {}],
             ],
             subplot_titles=[
@@ -5091,8 +5092,6 @@ def run_market_dashboard(
                 "코스닥 지수 (10/20/50 SMA + 거래량)",
                 "코스피 시장 평균 변동성 (ATR3/Close) + Vol SMA20",
                 "코스닥 시장 평균 변동성 (ATR3/Close) + Vol SMA20",
-                "코스피: ATR3/종가 vs 시가총액(로그)",
-                "코스닥: ATR3/종가 vs 시가총액(로그)",
             ],
         )
         fig_vol.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["close"], mode="lines", name="코스피 지수", line=dict(color="#1F77B4", width=2.5)), row=1, col=1)
@@ -5112,17 +5111,13 @@ def run_market_dashboard(
         fig_vol.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"], mode="lines", name="코스닥 변동성(ATR3/Close)", line=dict(color="#2ECC71", width=2)), row=2, col=2)
         fig_vol.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"].rolling(20).mean(), mode="lines", name="코스닥 Vol SMA20", line=dict(color="#2ECC71", width=2.2, dash="dash")), row=2, col=2)
 
-        _apply_common_layout(fig_vol, "Page 3: 시장 변동성", layout_height=1680, max_xaxis_row=3)
+        _apply_common_layout(fig_vol, "Page 3: 시장 변동성", layout_height=980, max_xaxis_row=2)
         fig_vol.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_vol.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_vol.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
         fig_vol.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
         fig_vol.update_yaxes(title_text="ATR3/Close", row=2, col=1)
         fig_vol.update_yaxes(title_text="ATR3/Close", row=2, col=2)
-        fig_vol.update_xaxes(title_text="ATR3/종가", row=3, col=1)
-        fig_vol.update_yaxes(type="log", title_text="시가총액 (원)", row=3, col=1)
-        fig_vol.update_xaxes(title_text="ATR3/종가", row=3, col=2)
-        fig_vol.update_yaxes(type="log", title_text="시가총액 (원)", row=3, col=2)
 
         # Page 4: Zweig Breadth Thrust
         fig_page4 = make_subplots(
@@ -5676,8 +5671,8 @@ def run_market_dashboard(
         fig_page10.update_yaxes(title_text="모멘텀 (%/일)", row=2, col=1)
         fig_page10.update_yaxes(title_text="모멘텀 (%/일)", row=2, col=2)
 
-        # 산점도(row3)는 후단 스냅 준비 후 fig_vol에 채우고 최종 HTML 조립
-        # 순서: 1 ADL / 2 CVI / 3 시장변동성 / 4 Zweig / 5 SMA비중 / 6 SMA5·10 / 7 신고가 / 8 ADR / 9 모멘텀
+        # ATR 산점도는 후단 스냅 준비 후 10페이지로 붙여 최종 HTML 조립
+        # 순서: 1 ADL / 2 CVI / 3 시장변동성 / 4 Zweig / 5 SMA비중 / 6 SMA5·10 / 7 신고가 / 8 ADR / 9 모멘텀 / 10 ATR산점도
         output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
         output_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
         os.makedirs(output_dir, exist_ok=True)
@@ -5694,7 +5689,7 @@ def run_market_dashboard(
             "page9": fig_page9,
             "page10": fig_page10,
         }
-        # 산점도 통합 전 임시 저장(후단 실패 시에도 9페이지 골격은 남김)
+        # ATR 산점도 전 임시 저장(후단 실패 시에도 9페이지 골격은 남김)
         try:
             _tmp_divs = [
                 pio.to_html(fig_page1, full_html=False, include_plotlyjs="cdn"),
@@ -5712,12 +5707,12 @@ def run_market_dashboard(
             pass
 
         if not quiet:
-            print("완료: 대시보드 차트 생성(시장 변동성 산점도는 이어 통합)")
+            print("완료: 대시보드 차트 생성(ATR3/종가 산점도는 이어 10페이지로 추가)")
 
     except Exception as e:
         print(f"실패: 코스피/코스닥 지수+Advance Decline Line+변동성 대시보드 생성 ({type(e).__name__}: {e})")
 
-    # 거래대금 HTML + 대시보드 시장 변동성(산점도 통합)
+    # 거래대금 HTML + 대시보드 ATR 산점도(10페이지) 조립
     try:
         import talib
 
@@ -5884,7 +5879,7 @@ def run_market_dashboard(
             )
 
         _log("\n" + "=" * 80)
-        _log("거래대금 HTML · 대시보드 시장 변동성(산점도 통합) 생성")
+        _log("거래대금 HTML · 대시보드 ATR 산점도(10페이지) 생성")
         _log("=" * 80)
         _highlight_set = set([str(x) for x in (highlight_tickers or set())])
         _top100_tickers_all: set[str] = set()
@@ -6086,7 +6081,7 @@ def run_market_dashboard(
             return np.isfinite(ac) & (df["mcap"].fillna(0) > 0) & (ac < 0.4)
 
         def _mj_scatter_panel_traces(df: pd.DataFrame, base_color: str, *, show_highlight_legend: bool) -> list:
-            """기본 점 + RS Top10 + 거래대금 Top10(중복 시 거래대금 우선) + 종목명 라벨."""
+            """기본 점 + RS Top20 + 거래대금 Top20(중복 시 거래대금 우선) + 종목명 라벨."""
             d = df[_mj_atr_scatter_mask(df)].copy()
             if d.empty:
                 return []
@@ -6095,8 +6090,8 @@ def run_market_dashboard(
             d["atr_over_close"] = pd.to_numeric(d["atr_over_close"], errors="coerce")
             tv_rank = pd.to_numeric(d.get("tv_rank"), errors="coerce")
             rs_rank = pd.to_numeric(d.get("rs_rank"), errors="coerce")
-            tv_mask = tv_rank.notna() & (tv_rank <= 10)
-            rs_mask = rs_rank.notna() & (rs_rank <= 10) & (~tv_mask)
+            tv_mask = tv_rank.notna() & (tv_rank <= 20)
+            rs_mask = rs_rank.notna() & (rs_rank <= 20) & (~tv_mask)
             base_mask = ~(tv_mask | rs_mask)
             out = []
 
@@ -6137,10 +6132,10 @@ def run_market_dashboard(
                     x=frame["atr_over_close"],
                     y=frame["mcap"],
                     mode="markers+text",
-                    marker=dict(size=10, opacity=0.92, color=color, line=dict(width=1, color="#fff")),
+                    marker=dict(size=9, opacity=0.92, color=color, line=dict(width=1, color="#fff")),
                     text=frame["name"].astype(str),
                     textposition=textpos,
-                    textfont=dict(size=9, color=color),
+                    textfont=dict(size=8, color=color),
                     customdata=_hover_cd(frame),
                     hovertemplate=hover,
                     name=name,
@@ -6148,8 +6143,8 @@ def run_market_dashboard(
                     legendgroup=name,
                 )
 
-            tr_tv = _hi_trace(d.loc[tv_mask], "#E53935", "거래대금 Top10", show_highlight_legend)
-            tr_rs = _hi_trace(d.loc[rs_mask], "#FB8C00", "RS Top10", show_highlight_legend)
+            tr_tv = _hi_trace(d.loc[tv_mask], "#E53935", "거래대금 Top20", show_highlight_legend)
+            tr_rs = _hi_trace(d.loc[rs_mask], "#FB8C00", "RS Top20", show_highlight_legend)
             if tr_tv is not None:
                 out.append(tr_tv)
             if tr_rs is not None:
@@ -6738,43 +6733,51 @@ def run_market_dashboard(
         out_energy = os.path.join(out_dir, "에너지배율.html")
         out_ad = os.path.join(out_dir, "market_AD_line.html")
 
-        # 시장 변동성 페이지(fig_vol) row3에 ATR3/시총 산점도 통합 후 대시보드 최종 조립
+        # ATR3/종가 vs 시총 산점도 → 대시보드 10페이지(2×1 세로)로 최종 조립
         _dash_atr_path = None
         _figs = dash_state.get("figs") or {}
         fig_vol = _figs.get("vol")
-        if fig_vol is not None:
-            try:
-                for tr in _mj_scatter_panel_traces(df_k, "#1f77b4", show_highlight_legend=True):
-                    fig_vol.add_trace(tr, row=3, col=1)
-                for tr in _mj_atr_ref_line_traces(df_k, "코스피"):
-                    fig_vol.add_trace(tr, row=3, col=1)
-                for tr in _mj_scatter_panel_traces(df_q, "#9467bd", show_highlight_legend=False):
-                    fig_vol.add_trace(tr, row=3, col=2)
-                for tr in _mj_atr_ref_line_traces(df_q, "코스닥"):
-                    fig_vol.add_trace(tr, row=3, col=2)
-                _xr = _mj_atr_x_range_combined(df_k, df_q)
-                if _xr is not None:
-                    _xlo, _xhi = _xr
-                    fig_vol.update_xaxes(range=[_xlo, _xhi], row=3, col=1)
-                    fig_vol.update_xaxes(range=[_xlo, _xhi], row=3, col=2)
-                # row3는 날짜축/휴일 rangebreaks 불필요(산점도)
-                fig_vol.update_xaxes(
-                    type="linear",
-                    tickformat="",
-                    rangeslider_visible=False,
-                    rangebreaks=[],
-                    row=3,
-                    col=1,
-                )
-                fig_vol.update_xaxes(
-                    type="linear",
-                    tickformat="",
-                    rangeslider_visible=False,
-                    rangebreaks=[],
-                    row=3,
-                    col=2,
-                )
 
+        def _build_atr_scatter_fig():
+            sub = make_subplots(
+                rows=2,
+                cols=1,
+                subplot_titles=(
+                    "코스피: ATR3/종가 vs 시가총액(로그)",
+                    "코스닥: ATR3/종가 vs 시가총액(로그)",
+                ),
+                vertical_spacing=0.10,
+            )
+            for tr in _mj_scatter_panel_traces(df_k, "#1f77b4", show_highlight_legend=True):
+                sub.add_trace(tr, row=1, col=1)
+            for tr in _mj_atr_ref_line_traces(df_k, "코스피"):
+                sub.add_trace(tr, row=1, col=1)
+            for tr in _mj_scatter_panel_traces(df_q, "#9467bd", show_highlight_legend=False):
+                sub.add_trace(tr, row=2, col=1)
+            for tr in _mj_atr_ref_line_traces(df_q, "코스닥"):
+                sub.add_trace(tr, row=2, col=1)
+            sub.update_xaxes(title_text="ATR3/종가", row=1, col=1)
+            sub.update_yaxes(type="log", title_text="시가총액 (원)", row=1, col=1)
+            sub.update_xaxes(title_text="ATR3/종가", row=2, col=1)
+            sub.update_yaxes(type="log", title_text="시가총액 (원)", row=2, col=1)
+            _xr = _mj_atr_x_range_combined(df_k, df_q)
+            if _xr is not None:
+                _xlo, _xhi = _xr
+                sub.update_xaxes(range=[_xlo, _xhi], row=1, col=1)
+                sub.update_xaxes(range=[_xlo, _xhi], row=2, col=1)
+            sub.update_layout(
+                height=1960,
+                template="plotly_white",
+                title_text="Page 10: ATR3/종가 vs 시가총액",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+                margin=dict(t=100, l=55, r=45, b=45),
+                hovermode="closest",
+            )
+            return sub
+
+        if fig_vol is not None and _figs.get("page1") is not None:
+            try:
+                fig_atr = _build_atr_scatter_fig()
                 _out = dash_state.get("path") or out_ad
                 div1 = pio.to_html(_figs["page1"], full_html=False, include_plotlyjs="cdn")
                 div2 = pio.to_html(_figs["page2"], full_html=False, include_plotlyjs=False)
@@ -6785,49 +6788,21 @@ def run_market_dashboard(
                 div7 = pio.to_html(_figs["page8"], full_html=False, include_plotlyjs=False)
                 div8 = pio.to_html(_figs["page9"], full_html=False, include_plotlyjs=False)
                 div9 = pio.to_html(_figs["page10"], full_html=False, include_plotlyjs=False)
-                dash_divs = [div1, div2, div3, div4, div5, div6, div7, div8, div9]
+                div10 = pio.to_html(fig_atr, full_html=False, include_plotlyjs=False)
+                dash_divs = [div1, div2, div3, div4, div5, div6, div7, div8, div9, div10]
                 _write_krx_market_dashboard_html(_out, dash_divs)
                 _dash_atr_path = _out
-                _log(f"  → 대시보드 9페이지(시장 변동성·산점도 통합) 반영: {_dash_atr_path}")
+                _log(f"  → 대시보드 10페이지(ATR3/종가 산점도 독립) 반영: {_dash_atr_path}")
             except Exception as _e_dash:
-                _log(f"경고: 대시보드 시장 변동성 산점도 통합 실패 ({type(_e_dash).__name__}: {_e_dash})")
+                _log(f"경고: 대시보드 ATR 산점도 페이지 조립 실패 ({type(_e_dash).__name__}: {_e_dash})")
                 _dash_atr_path = None
         else:
             # 대시보드 본문이 없을 때만 산점도 단독 HTML
             try:
-                sub = make_subplots(
-                    rows=2,
-                    cols=1,
-                    subplot_titles=("코스피: ATR3/종가 vs 시가총액(로그)", "코스닥: ATR3/종가 vs 시가총액(로그)"),
-                    vertical_spacing=0.12,
-                )
-                for tr in _mj_scatter_panel_traces(df_k, "#1f77b4", show_highlight_legend=True):
-                    sub.add_trace(tr, row=1, col=1)
-                for tr in _mj_atr_ref_line_traces(df_k, "코스피"):
-                    sub.add_trace(tr, row=1, col=1)
-                for tr in _mj_scatter_panel_traces(df_q, "#9467bd", show_highlight_legend=False):
-                    sub.add_trace(tr, row=2, col=1)
-                for tr in _mj_atr_ref_line_traces(df_q, "코스닥"):
-                    sub.add_trace(tr, row=2, col=1)
-                sub.update_xaxes(title_text="ATR3/종가", row=1, col=1)
-                sub.update_yaxes(type="log", title_text="시가총액 (원)", row=1, col=1)
-                sub.update_xaxes(title_text="ATR3/종가", row=2, col=1)
-                sub.update_yaxes(type="log", title_text="시가총액 (원)", row=2, col=1)
-                _xr = _mj_atr_x_range_combined(df_k, df_q)
-                if _xr is not None:
-                    _xlo, _xhi = _xr
-                    sub.update_xaxes(range=[_xlo, _xhi], row=1, col=1)
-                    sub.update_xaxes(range=[_xlo, _xhi], row=2, col=1)
-                sub.update_layout(
-                    height=1040,
-                    template="plotly_white",
-                    title_text=f"시장 변동성 분포 (기준일 근접: {ref_d.date()})",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
-                    margin=dict(t=100),
-                )
+                fig_atr = _build_atr_scatter_fig()
                 _write_krx_market_dashboard_html(
                     out_ad,
-                    [pio.to_html(sub, full_html=False, include_plotlyjs="cdn")],
+                    [pio.to_html(fig_atr, full_html=False, include_plotlyjs="cdn")],
                 )
                 _dash_atr_path = out_ad
             except Exception:
@@ -6962,7 +6937,7 @@ def run_market_dashboard(
     <strong>5일 상승률(%)</strong>: 최신 종가 ÷ 5거래일 전 종가 − 1.<br/>
     3일·D-0·D-1·D-2 에너지배율 표는 <a href="{html.escape(os.path.basename(out_energy))}"><code>{html.escape(os.path.basename(out_energy))}</code></a>를 참고하세요.
     Talent(일) = 최근 120거래일 중 (전일종가 대비 등락률 ≥ +10%)인 날 수이며, 거래대금 상위 100 내 요약은 코스피 평균 {_fmt_talent_stat(_st_k.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_k.get('talent_p95'))}, 코스닥 평균 {_fmt_talent_stat(_st_q.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_q.get('talent_p95'))} 입니다.<br/>
-    ATR3/종가 vs 시가총액 분포는 <a href="{html.escape(os.path.basename(out_ad))}"><code>{html.escape(os.path.basename(out_ad))}</code></a> <strong>3페이지(시장 변동성)</strong>를 참고하세요.<br/>
+    ATR3/종가 vs 시가총액 분포는 <a href="{html.escape(os.path.basename(out_ad))}"><code>{html.escape(os.path.basename(out_ad))}</code></a> <strong>10페이지(ATR3/종가 vs 시가총액)</strong>를 참고하세요.<br/>
     일별 거래대금 Top20 표는 코스피·코스닥 각각 <strong>해당 시장 종목만</strong> 대상으로 당일 거래대금(종가×거래량) 기준 상위 20입니다. 행 날짜는 두 시장 OHLCV가 공통으로 갖는 최근 20거래일입니다.<br/>
     <strong>표 정렬</strong>: 거래대금 상위 100·일별 Top20 표에서 칼럼 헤더를 클릭하면 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
     파일: {os.path.basename(out_tv)}
@@ -7066,7 +7041,7 @@ def run_market_dashboard(
                 pass
 
             if _dash_atr_path:
-                print(f"완료: 코스피/코스닥 지표 대시보드(9페이지, 시장 변동성·산점도 통합): {_dash_atr_path}")
+                print(f"완료: 코스피/코스닥 지표 대시보드(10페이지, ATR3/종가 산점도 독립): {_dash_atr_path}")
             print(f"완료: 거래대금 HTML 저장: {out_tv}")
             print(f"완료: 에너지배율 HTML 저장: {out_energy}")
         return _top100_tickers_all, ohlcv_data
@@ -7100,7 +7075,7 @@ def _announce_krx_reports_from_disk(len_rs: int, len_bo: int) -> None:
         except Exception:
             pass
 
-    print("완료: 코스피/코스닥 지표 대시보드(9페이지, 시장 변동성·산점도 통합 · 1·2·3페이지는 다단 구성)")
+    print("완료: 코스피/코스닥 지표 대시보드(10페이지 · 1·2·3·10페이지는 다단 구성)")
     _open_if_file(p_ad)
     if os.path.isfile(p_tv):
         print(f"완료: 거래대금 HTML 저장: {p_tv}")
