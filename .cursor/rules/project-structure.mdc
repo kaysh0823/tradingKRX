@@ -25,7 +25,8 @@ alwaysApply: true
   대표 공통 지표: RS(상대강도, 가중평균 0.4·rs_200+0.3·rs_120+0.2·rs_50+0.1·rs_20),
   에너지배율(거래대금/시총 비중 × tanh 방향가중, K=15),
   talent 지수, 주가위치, ATR(Wilder)/종가, Band Width(정규화 q, window20·2σ·lookback125),
-  모멘텀 속도(ROC÷N), CVI, ADR, 스크리닝 패턴, picking 점수.
+  모멘텀 속도(ROC÷N), CVI(상승−하락 거래대금 200일 누적 + Signal EMA20; 삼성·하이닉스 제외 병기),
+  ADR, 스크리닝 패턴, picking 점수.
 - **새 로직을 넣기 전에 10~50·naverPub에 이미 있는지 먼저 확인**하고, 있으면 재활용/이식한다.
   같은 지표를 폴더마다 다르게 재구현하지 말 것. (예: CVI/ADR 정의는
   `20. MARKET Analysis/21. KRX_market_analysis_v2.0.py`, 스크리닝은

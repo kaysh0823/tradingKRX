@@ -3617,31 +3617,29 @@ MARKET_DASH_HOLIDAYS = [
 ]
 
 MARKET_DASH_PAGE_DESCS: dict[int, str] = {
-    1: "AD line: 전일 대비 상승 종목 수 − 하락 종목 수를 누적한 선입니다. SMA20은 그 추세선입니다. 아래 막대는 같은 날짜의 (상승−하락) 일별 값입니다. 지수와 함께 시장 참여 종목의 방향성 강도를 봅니다.",
-    2: "시장 평균 변동성: 유니버스 각 종목의 ATR14÷종가를 날짜별로 평균한 값입니다. Vol SMA20은 변동성의 20일 이동평균으로, 시장 전체 가격 변동 폭의 수준·추세를 봅니다.",
-    3: "맥클레란 오실레이터: 일별 Net AD(상승−하락 종목 수)에 EMA19·EMA39를 적용한 차이입니다. 0선 위·아래로 breadth 모멘텀을 확인합니다.",
+    1: "Advance Decline Line: 전일 대비 상승 종목 수 − 하락 종목 수(Net AD)의 200일 롤링 누적선과, 그 선의 20일 지수이동평균(Signal)입니다. 아래 막대는 같은 날짜의 Net AD 일별 값이고, 맨 아래는 맥클레란 오실레이터(Net AD의 EMA19−EMA39, 0선 기준)입니다. 지수와 함께 시장 참여 종목의 방향성 강도를 봅니다.",
+    2: "CVI: 전일 대비 상승 종목 거래대금 합 − 하락 종목 거래대금 합(net TV)의 200일 롤링 누적선과 Signal(EMA20)입니다. 가운데 막대는 일별 net TV이고, 아래는 삼성전자·SK하이닉스를 제외한 동일 지표입니다.",
+    3: "시장 평균 변동성: 유니버스 각 종목의 ATR14÷종가를 날짜별로 평균한 값입니다. Vol SMA20은 변동성의 20일 이동평균으로, 시장 전체 가격 변동 폭의 수준·추세를 봅니다.",
     4: "Zweig Breadth Thrust: 상승÷(상승+하락) 종목 비율의 10일 SMA(%)입니다. 최근 10일 안에 40% 미만을 거친 뒤 61.5%를 처음 돌파하면 별(★)로 표시합니다.",
-    5: "CVI(거래대금): 전일 대비 상승 종목 거래대금 합을 하락 종목 거래대금 합으로 나눈 뒤, 최근 20거래일 합(상승 합 ÷ 하락 합)으로 본 지표입니다. 가운데는 20일 비·SMA20, 아래는 일별 비율(당일 상승 합÷하락 합) 막대입니다.",
-    6: "종가>SMA 비중: 해당 시장 유니버스에서 종가가 SMA5·10·20 위에 있는 종목 비율(%)입니다. 코스피·코스닥 각각 SMA 길이별로 한 패널씩 나누어 표시합니다.",
-    7: "종가>SMA5 · <SMA10 비중: 단기(5일) 강세 종목 비율과 중기(10일) 약세 종목 비율을 겹쳐 봅니다. 단기 과열·중기 약세 괴리를 확인합니다.",
-    8: "120일 신고가/신저가 종목 수: 종가가 최근 120거래일 최고·최저 종가인 종목 수입니다. 신고가·신저가 확산 정도를 봅니다.",
-    9: "ADR: 최근 20거래일 상승 종목 수 합 ÷ 같은 기간 하락 종목 수 합에 100을 곱한 값입니다. 일별 값은 들쭉날쭉하므로 ADR의 10일 SMA로 추세를 보조합니다. 약 100 근처는 균형, 120~125 이상은 단기 과열, 70~75 이하는 침체(과매도) 권역으로 자주 해석합니다.",
-    10: "모멘텀 속도: 지수 종가 기준 ROC(기간 변화율 %) ÷ 기간으로 나눈 하루 평균 변화율(%/일)입니다. 5·10·20·50일 선을 겹쳐 단기·중기 추세 속도를 비교합니다. 0선 위는 상승 모멘텀, 아래는 하락 모멘텀입니다.",
-    11: "ATR14/종가 vs 시가총액: 종목별 최신 ATR14÷종가(가로)와 시가총액(세로·로그) 산점도입니다. ATR14/종가 ≥ 0.4 종목은 왜곡 방지를 위해 점·분위선에서 제외합니다. 회색/주황/녹색 선은 각 시장 P25·P50·P75·평균입니다.",
+    5: "종가>SMA 비중: 해당 시장 유니버스에서 종가가 SMA5·10·20 위에 있는 종목 비율(%)입니다. 코스피·코스닥 각각 SMA 길이별로 한 패널씩 나누어 표시합니다.",
+    6: "종가>SMA5 · <SMA10 비중: 단기(5일) 강세 종목 비율과 중기(10일) 약세 종목 비율을 겹쳐 봅니다. 단기 과열·중기 약세 괴리를 확인합니다.",
+    7: "120일 신고가/신저가 종목 수: 종가가 최근 120거래일 최고·최저 종가인 종목 수입니다. 신고가·신저가 확산 정도를 봅니다.",
+    8: "ADR: 최근 20거래일 상승 종목 수 합 ÷ 같은 기간 하락 종목 수 합에 100을 곱한 값입니다. 일별 값은 들쭉날쭉하므로 ADR의 10일 SMA로 추세를 보조합니다. 약 100 근처는 균형, 120~125 이상은 단기 과열, 70~75 이하는 침체(과매도) 권역으로 자주 해석합니다.",
+    9: "모멘텀 속도: 지수 종가 기준 ROC(기간 변화율 %) ÷ 기간으로 나눈 하루 평균 변화율(%/일)입니다. 5·10·20·50일 선을 겹쳐 단기·중기 추세 속도를 비교합니다. 0선 위는 상승 모멘텀, 아래는 하락 모멘텀입니다.",
+    10: "ATR14/종가 vs 시가총액: 종목별 최신 ATR14÷종가(가로)와 시가총액(세로·로그) 산점도입니다. ATR14/종가 ≥ 0.4 종목은 왜곡 방지를 위해 점·분위선에서 제외합니다. 회색/주황/녹색 선은 각 시장 P25·P50·P75·평균입니다.",
 }
 
 _MARKET_DASH_BTN_LABELS: dict[int, str] = {
-    1: "1페이지: 지수 x AD line",
-    2: "2페이지: 지수 x 변동성",
-    3: "3페이지: 지수 x 맥클레란",
+    1: "1페이지: Advance Decline Line",
+    2: "2페이지: CVI(거래대금)",
+    3: "3페이지: 지수 x 변동성",
     4: "4페이지: Zweig Breadth Thrust",
-    5: "5페이지: CVI(거래대금)",
-    6: "6페이지: 종가>SMA5/10/20 비중",
-    7: "7페이지: 종가>SMA5 · <SMA10 비중",
-    8: "8페이지: 120일 신고가/신저가 종목수",
-    9: "9페이지: ADR",
-    10: "10페이지: 모멘텀 속도",
-    11: "11페이지: ATR14/종가 vs 시총",
+    5: "5페이지: 종가>SMA5/10/20 비중",
+    6: "6페이지: 종가>SMA5 · <SMA10 비중",
+    7: "7페이지: 120일 신고가/신저가 종목수",
+    8: "8페이지: ADR",
+    9: "9페이지: 모멘텀 속도",
+    10: "10페이지: ATR14/종가 vs 시총",
 }
 
 
@@ -4432,16 +4430,16 @@ def run_market_dashboard(
 
     _log = print if not quiet else (lambda *a, **k: None)
     ohlcv_data: dict = {}
-    # 대시보드 HTML 재기록용(ATR 산점도 11페이지 추가)
+    # 대시보드 HTML 재기록용(ATR 산점도 10페이지 추가)
     dash_state: dict = {"path": None, "divs": None}
 
-    # 1) 코스피/코스닥 분리: (지수, AD line, 시장 평균 변동성) 총 6개 지표
+    # 1) 코스피/코스닥 분리: (지수, Advance Decline Line, 시장 평균 변동성 등)
     try:
         _log("\n" + "=" * 80)
-        _log("코스피/코스닥 지수+AD line+변동성 차트 생성")
+        _log("코스피/코스닥 지수+Advance Decline Line+변동성 차트 생성")
         _log("=" * 80)
 
-        BREADTH_WINDOW = 250  # 최근 N거래일 (AD line·변동성 공통 x축)
+        BREADTH_WINDOW = 250  # 최근 N거래일 (AD 200일 롤링 채움·변동성 공통 x축)
         holidays = MARKET_DASH_HOLIDAYS
 
         # universe 구성 (krx_ticker_sector에 코스피/코스닥 메인에 해당하는 sector_cd 존재)
@@ -4507,8 +4505,12 @@ def run_market_dashboard(
             down_cnt = defaultdict(int)
             up_tv_sum = defaultdict(float)
             down_tv_sum = defaultdict(float)
+            up_tv_ex = defaultdict(float)
+            down_tv_ex = defaultdict(float)
+            _CVI_EXCLUDE = {"005930", "000660"}  # 삼성전자·SK하이닉스
 
-            # AD line / CVI: 전일 대비 상승·하락을 날짜별 집계(종목 수·당일 거래대금 합), CVI는 (20일 상승 거래대금 합)/(20일 하락 거래대금 합)
+            # Advance Decline / CVI: 전일 대비 상승·하락을 날짜별 집계(종목 수·당일 거래대금 합)
+            # CVI = (상승TV합−하락TV합) 200일 롤링 누적 + Signal(EMA20)
             for t in universe_set:
                 df = ohlcv_data.get(t)
                 if df is None or df.empty:
@@ -4526,6 +4528,9 @@ def run_market_dashboard(
 
                 if len(df) < 2:
                     continue
+
+                t_norm = str(t).zfill(6)
+                include_ex = t_norm not in _CVI_EXCLUDE
 
                 diff = df["close"].diff()
                 pos_mask = diff.to_numpy() > 0
@@ -4545,7 +4550,10 @@ def run_market_dashboard(
                         up_cnt[_norm_market_date(d)] += int(c)
                     for dt, vv in zip(diff.index[pos_mask], tv_s[pos_mask].to_numpy()):
                         if np.isfinite(vv):
-                            up_tv_sum[_norm_market_date(dt)] += float(vv)
+                            nd = _norm_market_date(dt)
+                            up_tv_sum[nd] += float(vv)
+                            if include_ex:
+                                up_tv_ex[nd] += float(vv)
 
                 if neg_mask.any():
                     neg_dates = diff.index[neg_mask]
@@ -4554,21 +4562,39 @@ def run_market_dashboard(
                         down_cnt[_norm_market_date(d)] += int(c)
                     for dt, vv in zip(diff.index[neg_mask], tv_s[neg_mask].to_numpy()):
                         if np.isfinite(vv):
-                            down_tv_sum[_norm_market_date(dt)] += float(vv)
+                            nd = _norm_market_date(dt)
+                            down_tv_sum[nd] += float(vv)
+                            if include_ex:
+                                down_tv_ex[nd] += float(vv)
 
             all_dates = sorted(
-                {_norm_market_date(d) for d in (set(up_cnt.keys()) | set(down_cnt.keys()) | set(up_tv_sum.keys()) | set(down_tv_sum.keys()))}
+                {
+                    _norm_market_date(d)
+                    for d in (
+                        set(up_cnt.keys())
+                        | set(down_cnt.keys())
+                        | set(up_tv_sum.keys())
+                        | set(down_tv_sum.keys())
+                        | set(up_tv_ex.keys())
+                        | set(down_tv_ex.keys())
+                    )
+                }
             )
             if len(all_dates) == 0:
                 return pd.DataFrame(
                     columns=[
-                        "ad_line",
+                        "ad_200",
+                        "ad_signal",
                         "net_ad_daily",
                         "market_avg_volatility",
                         "mcclellan",
                         "zweig_ma10_pct",
                         "cvi",
+                        "cvi_signal",
                         "cvi_daily",
+                        "cvi_ex",
+                        "cvi_ex_signal",
+                        "cvi_daily_ex",
                         "adr",
                     ]
                 )
@@ -4579,17 +4605,25 @@ def run_market_dashboard(
             breadth_df["down"] = [down_cnt.get(d, 0) for d in idx]
 
             ad_daily = breadth_df["up"] - breadth_df["down"]
-            breadth_df["ad_line"] = ad_daily.cumsum()
             breadth_df["net_ad_daily"] = ad_daily
+            # Advance Decline Line: Net AD 200일 롤링 누적 + Signal(EMA20) — tail 전에 계산해 창을 채움
+            breadth_df["ad_200"] = ad_daily.rolling(200).sum()
+            breadth_df["ad_signal"] = breadth_df["ad_200"].ewm(span=20, adjust=False).mean()
 
             uv = np.array([up_tv_sum.get(d, 0.0) for d in idx], dtype=float)
             dv = np.array([down_tv_sum.get(d, 0.0) for d in idx], dtype=float)
-            breadth_df["cvi_daily"] = np.where(dv > 0.0, uv / dv, np.nan)
-            uv_s = pd.Series(uv, index=breadth_df.index, dtype=float)
-            dv_s = pd.Series(dv, index=breadth_df.index, dtype=float)
-            roll_up = uv_s.rolling(20, min_periods=1).sum()
-            roll_dn = dv_s.rolling(20, min_periods=1).sum()
-            breadth_df["cvi"] = np.where(roll_dn.to_numpy(dtype=float) > 0.0, roll_up.to_numpy(dtype=float) / roll_dn.to_numpy(dtype=float), np.nan)
+            net_tv = uv - dv
+            breadth_df["cvi_daily"] = net_tv
+            breadth_df["cvi"] = pd.Series(net_tv, index=idx).rolling(200).sum()
+            breadth_df["cvi_signal"] = breadth_df["cvi"].ewm(span=20, adjust=False).mean()
+
+            uv_ex = np.array([up_tv_ex.get(d, 0.0) for d in idx], dtype=float)
+            dv_ex = np.array([down_tv_ex.get(d, 0.0) for d in idx], dtype=float)
+            net_tv_ex = uv_ex - dv_ex
+            breadth_df["cvi_daily_ex"] = net_tv_ex
+            breadth_df["cvi_ex"] = pd.Series(net_tv_ex, index=idx).rolling(200).sum()
+            breadth_df["cvi_ex_signal"] = breadth_df["cvi_ex"].ewm(span=20, adjust=False).mean()
+
             # ADR: (20일 상승 종목 수 합 ÷ 20일 하락 종목 수 합) × 100 (하락 합 0이면 미정의)
             up_ct = breadth_df["up"].astype(float)
             dn_ct = breadth_df["down"].astype(float)
@@ -4650,12 +4684,26 @@ def run_market_dashboard(
 
             breadth_df["market_avg_volatility"] = np.where(vol_cnt > 0, vol_sum / vol_cnt, np.nan)
             return breadth_df[
-                ["ad_line", "net_ad_daily", "market_avg_volatility", "mcclellan", "zweig_ma10_pct", "cvi", "cvi_daily", "adr"]
+                [
+                    "ad_200",
+                    "ad_signal",
+                    "net_ad_daily",
+                    "market_avg_volatility",
+                    "mcclellan",
+                    "zweig_ma10_pct",
+                    "cvi",
+                    "cvi_signal",
+                    "cvi_daily",
+                    "cvi_ex",
+                    "cvi_ex_signal",
+                    "cvi_daily_ex",
+                    "adr",
+                ]
             ]
 
         kospi_df = compute_market_ad_line_and_volatility(kospi_set)
         kosdaq_df = compute_market_ad_line_and_volatility(kosdaq_set)
-        # 지수 데이터는 AD line 구간(마지막 BREADTH_WINDOW)으로 정렬해서 x축을 동일하게 맞춤
+        # 지수 데이터는 breadth 구간(마지막 BREADTH_WINDOW)으로 정렬해서 x축을 동일하게 맞춤
         kospi_index_aligned = kospi_index_df.reindex(kospi_df.index)
         kosdaq_index_aligned = kosdaq_index_df.reindex(kosdaq_df.index)
 
@@ -4709,25 +4757,28 @@ def run_market_dashboard(
                         rangebreaks=[dict(bounds=["sat", "mon"]), dict(values=holidays)],
                     )
 
-        # Page 1
+        # Page 1: 지수 / Advance Decline Line(200 + Signal) / Net AD / 맥클레란
         fig_page1 = make_subplots(
-            rows=3,
+            rows=4,
             cols=2,
             shared_xaxes=False,
-            vertical_spacing=0.08,
+            vertical_spacing=0.06,
             horizontal_spacing=0.07,
             specs=[
                 [{"secondary_y": True}, {"secondary_y": True}],
+                [{}, {}],
                 [{}, {}],
                 [{}, {}],
             ],
             subplot_titles=[
                 "코스피 지수 (10/20/50 SMA + 거래량)",
                 "코스닥 지수 (10/20/50 SMA + 거래량)",
-                "코스피 AD line (상승−하락 누적) + SMA20",
-                "코스닥 AD line (상승−하락 누적) + SMA20",
+                "코스피 Advance Decline Line (200일) + Signal",
+                "코스닥 Advance Decline Line (200일) + Signal",
                 "코스피 Net AD (상승−하락, 일별)",
                 "코스닥 Net AD (상승−하락, 일별)",
+                "코스피 맥클레란 오실레이터 (EMA19−EMA39 of Net AD)",
+                "코스닥 맥클레란 오실레이터 (EMA19−EMA39 of Net AD)",
             ],
         )
         fig_page1.add_trace(
@@ -4746,10 +4797,52 @@ def run_market_dashboard(
         fig_page1.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#5E35B1", width=1.8, dash="dot")), row=1, col=2)
         fig_page1.add_trace(go.Bar(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=2, secondary_y=True)
 
-        fig_page1.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["ad_line"], mode="lines", name="코스피 AD line", line=dict(color="#FF6B35", width=2.5)), row=2, col=1)
-        fig_page1.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["ad_line"].rolling(20).mean(), mode="lines", name="코스피 AD line SMA20", line=dict(color="#FF6B35", width=2.2, dash="dash")), row=2, col=1)
-        fig_page1.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["ad_line"], mode="lines", name="코스닥 AD line", line=dict(color="#FF6B35", width=2.5)), row=2, col=2)
-        fig_page1.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["ad_line"].rolling(20).mean(), mode="lines", name="코스닥 AD line SMA20", line=dict(color="#FF6B35", width=2.2, dash="dash")), row=2, col=2)
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kospi_df.index,
+                y=kospi_df["ad_200"],
+                mode="lines",
+                name="Advance Decline Line",
+                line=dict(color="#FF6B35", width=2.2),
+            ),
+            row=2,
+            col=1,
+        )
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kospi_df.index,
+                y=kospi_df["ad_signal"],
+                mode="lines",
+                name="Signal",
+                line=dict(color="#8E44AD", width=2.0, dash="dash"),
+            ),
+            row=2,
+            col=1,
+        )
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kosdaq_df.index,
+                y=kosdaq_df["ad_200"],
+                mode="lines",
+                name="Advance Decline Line",
+                line=dict(color="#FF6B35", width=2.2),
+                showlegend=False,
+            ),
+            row=2,
+            col=2,
+        )
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kosdaq_df.index,
+                y=kosdaq_df["ad_signal"],
+                mode="lines",
+                name="Signal",
+                line=dict(color="#8E44AD", width=2.0, dash="dash"),
+                showlegend=False,
+            ),
+            row=2,
+            col=2,
+        )
 
         _nad_k = kospi_df["net_ad_daily"].fillna(0.0).to_numpy(dtype=float)
         _nad_q = kosdaq_df["net_ad_daily"].fillna(0.0).to_numpy(dtype=float)
@@ -4766,29 +4859,72 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page1, "Page 1: (KOSPI/KOSDAQ Index) x (KOSPI/KOSDAQ AD line)", layout_height=1280, max_xaxis_row=3)
+        _zero_k = np.zeros(len(kospi_df.index), dtype=float)
+        _zero_q = np.zeros(len(kosdaq_df.index), dtype=float)
+        fig_page1.add_trace(
+            go.Scatter(x=kospi_df.index, y=kospi_df["mcclellan"], mode="lines", name="코스피 맥클레란", line=dict(color="#E67E22", width=2)),
+            row=4,
+            col=1,
+        )
+        fig_page1.add_trace(
+            go.Scatter(x=kospi_df.index, y=_zero_k, mode="lines", name="0", line=dict(color="rgba(0,0,0,0.35)", width=1, dash="dash"), showlegend=False),
+            row=4,
+            col=1,
+        )
+        fig_page1.add_trace(
+            go.Scatter(x=kosdaq_df.index, y=kosdaq_df["mcclellan"], mode="lines", name="코스닥 맥클레란", line=dict(color="#E67E22", width=2)),
+            row=4,
+            col=2,
+        )
+        fig_page1.add_trace(
+            go.Scatter(x=kosdaq_df.index, y=_zero_q, mode="lines", name="0", line=dict(color="rgba(0,0,0,0.35)", width=1, dash="dash"), showlegend=False),
+            row=4,
+            col=2,
+        )
+
+        _apply_common_layout(
+            fig_page1,
+            "Page 1: Advance Decline Line",
+            layout_height=1680,
+            max_xaxis_row=4,
+        )
         fig_page1.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page1.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page1.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
         fig_page1.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
-        fig_page1.update_yaxes(title_text="AD line", row=2, col=1)
-        fig_page1.update_yaxes(title_text="AD line", row=2, col=2)
+        fig_page1.update_yaxes(title_text="Advance Decline Line", row=2, col=1)
+        fig_page1.update_yaxes(title_text="Advance Decline Line", row=2, col=2)
         fig_page1.update_yaxes(title_text="상승−하락(종목 수)", row=3, col=1)
         fig_page1.update_yaxes(title_text="상승−하락(종목 수)", row=3, col=2)
+        fig_page1.update_yaxes(title_text="McClellan", row=4, col=1)
+        fig_page1.update_yaxes(title_text="McClellan", row=4, col=2)
 
-        # Page 2
+
+        # Page 2: CVI (200일 누적 net TV + Signal / 일별 net / 삼성·하이닉스 제외)
         fig_page2 = make_subplots(
-            rows=2,
+            rows=5,
             cols=2,
             shared_xaxes=False,
-            vertical_spacing=0.10,
+            vertical_spacing=0.05,
             horizontal_spacing=0.07,
-            specs=[[{"secondary_y": True}, {"secondary_y": True}], [{}, {}]],
+            specs=[
+                [{"secondary_y": True}, {"secondary_y": True}],
+                [{}, {}],
+                [{}, {}],
+                [{}, {}],
+                [{}, {}],
+            ],
             subplot_titles=[
                 "코스피 지수 (10/20/50 SMA + 거래량)",
                 "코스닥 지수 (10/20/50 SMA + 거래량)",
-                "코스피 시장 평균 변동성 (ATR14/Close) + Vol SMA20",
-                "코스닥 시장 평균 변동성 (ATR14/Close) + Vol SMA20",
+                "코스피 CVI (200일 누적) + Signal",
+                "코스닥 CVI (200일 누적) + Signal",
+                "코스피 일별 net 거래대금 (상승TV−하락TV)",
+                "코스닥 일별 net 거래대금 (상승TV−하락TV)",
+                "코스피 CVI (삼성·하이닉스 제외, 200일) + Signal",
+                "코스닥 CVI (삼성·하이닉스 제외, 200일) + Signal",
+                "코스피 일별 net (삼성·하이닉스 제외)",
+                "코스닥 일별 net (삼성·하이닉스 제외)",
             ],
         )
         fig_page2.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["close"], mode="lines", name="코스피 지수", line=dict(color="#1F77B4", width=2.5)), row=1, col=1)
@@ -4803,21 +4939,46 @@ def run_market_dashboard(
         fig_page2.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#5E35B1", width=1.8, dash="dot")), row=1, col=2)
         fig_page2.add_trace(go.Bar(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=2, secondary_y=True)
 
-        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["market_avg_volatility"], mode="lines", name="코스피 변동성(ATR14/Close)", line=dict(color="#2ECC71", width=2)), row=2, col=1)
-        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["market_avg_volatility"].rolling(20).mean(), mode="lines", name="코스피 Vol SMA20", line=dict(color="#2ECC71", width=2.2, dash="dash")), row=2, col=1)
-        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"], mode="lines", name="코스닥 변동성(ATR14/Close)", line=dict(color="#2ECC71", width=2)), row=2, col=2)
-        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"].rolling(20).mean(), mode="lines", name="코스닥 Vol SMA20", line=dict(color="#2ECC71", width=2.2, dash="dash")), row=2, col=2)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi"], mode="lines", name="CVI", line=dict(color="#16A085", width=2.2)), row=2, col=1)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_signal"], mode="lines", name="Signal", line=dict(color="#8E44AD", width=2.0, dash="dash")), row=2, col=1)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi"], mode="lines", name="CVI", line=dict(color="#16A085", width=2.2), showlegend=False), row=2, col=2)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_signal"], mode="lines", name="Signal", line=dict(color="#8E44AD", width=2.0, dash="dash"), showlegend=False), row=2, col=2)
 
-        _apply_common_layout(fig_page2, "Page 2: (KOSPI/KOSDAQ Index) x (KOSPI/KOSDAQ Volatility)")
+        _cd_k = kospi_df["cvi_daily"].fillna(0.0).to_numpy(dtype=float)
+        _cd_q = kosdaq_df["cvi_daily"].fillna(0.0).to_numpy(dtype=float)
+        _cc_k = [("#e57373" if v >= 0 else "#64b5f6") for v in _cd_k]
+        _cc_q = [("#e57373" if v >= 0 else "#64b5f6") for v in _cd_q]
+        fig_page2.add_trace(go.Bar(x=kospi_df.index, y=_cd_k, name="코스피 일별 net TV", marker_color=_cc_k, showlegend=False), row=3, col=1)
+        fig_page2.add_trace(go.Bar(x=kosdaq_df.index, y=_cd_q, name="코스닥 일별 net TV", marker_color=_cc_q, showlegend=False), row=3, col=2)
+
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_ex"], mode="lines", name="CVI(제외)", line=dict(color="#1ABC9C", width=2.2)), row=4, col=1)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_ex_signal"], mode="lines", name="Signal(제외)", line=dict(color="#9B59B6", width=2.0, dash="dash")), row=4, col=1)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_ex"], mode="lines", name="CVI(제외)", line=dict(color="#1ABC9C", width=2.2), showlegend=False), row=4, col=2)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_ex_signal"], mode="lines", name="Signal(제외)", line=dict(color="#9B59B6", width=2.0, dash="dash"), showlegend=False), row=4, col=2)
+
+        _cde_k = kospi_df["cvi_daily_ex"].fillna(0.0).to_numpy(dtype=float)
+        _cde_q = kosdaq_df["cvi_daily_ex"].fillna(0.0).to_numpy(dtype=float)
+        _cce_k = [("#e57373" if v >= 0 else "#64b5f6") for v in _cde_k]
+        _cce_q = [("#e57373" if v >= 0 else "#64b5f6") for v in _cde_q]
+        fig_page2.add_trace(go.Bar(x=kospi_df.index, y=_cde_k, name="코스피 일별 net(제외)", marker_color=_cce_k, showlegend=False), row=5, col=1)
+        fig_page2.add_trace(go.Bar(x=kosdaq_df.index, y=_cde_q, name="코스닥 일별 net(제외)", marker_color=_cce_q, showlegend=False), row=5, col=2)
+
+        _apply_common_layout(fig_page2, "Page 2: CVI (200d net trade-value cumulative + Signal)", layout_height=2000, max_xaxis_row=5)
         fig_page2.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page2.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page2.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
         fig_page2.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
-        fig_page2.update_yaxes(title_text="ATR14/Close", row=2, col=1)
-        fig_page2.update_yaxes(title_text="ATR14/Close", row=2, col=2)
+        fig_page2.update_yaxes(title_text="CVI", row=2, col=1)
+        fig_page2.update_yaxes(title_text="CVI", row=2, col=2)
+        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=3, col=1)
+        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=3, col=2)
+        fig_page2.update_yaxes(title_text="CVI(제외)", row=4, col=1)
+        fig_page2.update_yaxes(title_text="CVI(제외)", row=4, col=2)
+        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=5, col=1)
+        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=5, col=2)
 
-        # Page 3
-        fig_page3 = make_subplots(
+        # Page 3: 변동성
+        fig_vol = make_subplots(
             rows=2,
             cols=2,
             shared_xaxes=False,
@@ -4827,39 +4988,36 @@ def run_market_dashboard(
             subplot_titles=[
                 "코스피 지수 (10/20/50 SMA + 거래량)",
                 "코스닥 지수 (10/20/50 SMA + 거래량)",
-                "코스피 맥클레란 오실레이터 (EMA19−EMA39 of Net AD)",
-                "코스닥 맥클레란 오실레이터 (EMA19−EMA39 of Net AD)",
+                "코스피 시장 평균 변동성 (ATR14/Close) + Vol SMA20",
+                "코스닥 시장 평균 변동성 (ATR14/Close) + Vol SMA20",
             ],
         )
-        fig_page3.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["close"], mode="lines", name="코스피 지수", line=dict(color="#1F77B4", width=2.5)), row=1, col=1)
-        fig_page3.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma10"], mode="lines", name="SMA10", line=dict(color="#4C9AFF", width=1.8, dash="dot")), row=1, col=1)
-        fig_page3.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma20"], mode="lines", name="SMA20", line=dict(color="#1E88E5", width=1.8, dash="dot")), row=1, col=1)
-        fig_page3.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#1565C0", width=1.8, dash="dot")), row=1, col=1)
-        fig_page3.add_trace(go.Bar(x=kospi_index_aligned.index, y=kospi_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=1, secondary_y=True)
+        fig_vol.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["close"], mode="lines", name="코스피 지수", line=dict(color="#1F77B4", width=2.5)), row=1, col=1)
+        fig_vol.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma10"], mode="lines", name="SMA10", line=dict(color="#4C9AFF", width=1.8, dash="dot")), row=1, col=1)
+        fig_vol.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma20"], mode="lines", name="SMA20", line=dict(color="#1E88E5", width=1.8, dash="dot")), row=1, col=1)
+        fig_vol.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#1565C0", width=1.8, dash="dot")), row=1, col=1)
+        fig_vol.add_trace(go.Bar(x=kospi_index_aligned.index, y=kospi_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=1, secondary_y=True)
 
-        fig_page3.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["close"], mode="lines", name="코스닥 지수", line=dict(color="#9467BD", width=2.5)), row=1, col=2)
-        fig_page3.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma10"], mode="lines", name="SMA10", line=dict(color="#B388FF", width=1.8, dash="dot")), row=1, col=2)
-        fig_page3.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma20"], mode="lines", name="SMA20", line=dict(color="#7E57C2", width=1.8, dash="dot")), row=1, col=2)
-        fig_page3.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#5E35B1", width=1.8, dash="dot")), row=1, col=2)
-        fig_page3.add_trace(go.Bar(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=2, secondary_y=True)
+        fig_vol.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["close"], mode="lines", name="코스닥 지수", line=dict(color="#9467BD", width=2.5)), row=1, col=2)
+        fig_vol.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma10"], mode="lines", name="SMA10", line=dict(color="#B388FF", width=1.8, dash="dot")), row=1, col=2)
+        fig_vol.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma20"], mode="lines", name="SMA20", line=dict(color="#7E57C2", width=1.8, dash="dot")), row=1, col=2)
+        fig_vol.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#5E35B1", width=1.8, dash="dot")), row=1, col=2)
+        fig_vol.add_trace(go.Bar(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=2, secondary_y=True)
 
-        _zero_k = np.zeros(len(kospi_df.index), dtype=float)
-        fig_page3.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["mcclellan"], mode="lines", name="코스피 맥클레란", line=dict(color="#E67E22", width=2)), row=2, col=1)
-        fig_page3.add_trace(go.Scatter(x=kospi_df.index, y=_zero_k, mode="lines", name="0", line=dict(color="rgba(0,0,0,0.35)", width=1, dash="dash"), showlegend=False), row=2, col=1)
+        fig_vol.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["market_avg_volatility"], mode="lines", name="코스피 변동성(ATR14/Close)", line=dict(color="#2ECC71", width=2)), row=2, col=1)
+        fig_vol.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["market_avg_volatility"].rolling(20).mean(), mode="lines", name="코스피 Vol SMA20", line=dict(color="#2ECC71", width=2.2, dash="dash")), row=2, col=1)
+        fig_vol.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"], mode="lines", name="코스닥 변동성(ATR14/Close)", line=dict(color="#2ECC71", width=2)), row=2, col=2)
+        fig_vol.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"].rolling(20).mean(), mode="lines", name="코스닥 Vol SMA20", line=dict(color="#2ECC71", width=2.2, dash="dash")), row=2, col=2)
 
-        _zero_q = np.zeros(len(kosdaq_df.index), dtype=float)
-        fig_page3.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["mcclellan"], mode="lines", name="코스닥 맥클레란", line=dict(color="#E67E22", width=2)), row=2, col=2)
-        fig_page3.add_trace(go.Scatter(x=kosdaq_df.index, y=_zero_q, mode="lines", name="0", line=dict(color="rgba(0,0,0,0.35)", width=1, dash="dash"), showlegend=False), row=2, col=2)
+        _apply_common_layout(fig_vol, "Page 3: (KOSPI/KOSDAQ Index) x (KOSPI/KOSDAQ Volatility)")
+        fig_vol.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
+        fig_vol.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
+        fig_vol.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
+        fig_vol.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
+        fig_vol.update_yaxes(title_text="ATR14/Close", row=2, col=1)
+        fig_vol.update_yaxes(title_text="ATR14/Close", row=2, col=2)
 
-        _apply_common_layout(fig_page3, "Page 3: (KOSPI/KOSDAQ Index) x (McClellan Oscillator)")
-        fig_page3.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
-        fig_page3.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
-        fig_page3.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
-        fig_page3.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
-        fig_page3.update_yaxes(title_text="McClellan", row=2, col=1)
-        fig_page3.update_yaxes(title_text="McClellan", row=2, col=2)
-
-        # Page 4
+        # Page 4: Zweig Breadth Thrust
         fig_page4 = make_subplots(
             rows=2,
             cols=2,
@@ -4932,70 +5090,7 @@ def run_market_dashboard(
         fig_page4.update_yaxes(title_text="Breadth %", row=2, col=1)
         fig_page4.update_yaxes(title_text="Breadth %", row=2, col=2)
 
-        # Page 5
-        fig_page5 = make_subplots(
-            rows=3,
-            cols=2,
-            shared_xaxes=False,
-            vertical_spacing=0.08,
-            horizontal_spacing=0.07,
-            specs=[
-                [{"secondary_y": True}, {"secondary_y": True}],
-                [{}, {}],
-                [{}, {}],
-            ],
-            subplot_titles=[
-                "코스피 지수 (10/20/50 SMA + 거래량)",
-                "코스닥 지수 (10/20/50 SMA + 거래량)",
-                "코스피 CVI (최근 20일 상승 거래대금 합 ÷ 하락 합) + SMA20",
-                "코스닥 CVI (최근 20일 상승 거래대금 합 ÷ 하락 합) + SMA20",
-                "코스피 일별 거래대금 비 (당일 상승 합 ÷ 하락 합)",
-                "코스닥 일별 거래대금 비 (당일 상승 합 ÷ 하락 합)",
-            ],
-        )
-        fig_page5.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["close"], mode="lines", name="코스피 지수", line=dict(color="#1F77B4", width=2.5)), row=1, col=1)
-        fig_page5.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma10"], mode="lines", name="SMA10", line=dict(color="#4C9AFF", width=1.8, dash="dot")), row=1, col=1)
-        fig_page5.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma20"], mode="lines", name="SMA20", line=dict(color="#1E88E5", width=1.8, dash="dot")), row=1, col=1)
-        fig_page5.add_trace(go.Scatter(x=kospi_index_aligned.index, y=kospi_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#1565C0", width=1.8, dash="dot")), row=1, col=1)
-        fig_page5.add_trace(go.Bar(x=kospi_index_aligned.index, y=kospi_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=1, secondary_y=True)
-
-        fig_page5.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["close"], mode="lines", name="코스닥 지수", line=dict(color="#9467BD", width=2.5)), row=1, col=2)
-        fig_page5.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma10"], mode="lines", name="SMA10", line=dict(color="#B388FF", width=1.8, dash="dot")), row=1, col=2)
-        fig_page5.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma20"], mode="lines", name="SMA20", line=dict(color="#7E57C2", width=1.8, dash="dot")), row=1, col=2)
-        fig_page5.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#5E35B1", width=1.8, dash="dot")), row=1, col=2)
-        fig_page5.add_trace(go.Bar(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=2, secondary_y=True)
-
-        fig_page5.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi"], mode="lines", name="코스피 CVI", line=dict(color="#16A085", width=2.2)), row=2, col=1)
-        fig_page5.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi"].rolling(20).mean(), mode="lines", name="코스피 CVI SMA20", line=dict(color="#16A085", width=2, dash="dash")), row=2, col=1)
-        fig_page5.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi"], mode="lines", name="코스닥 CVI", line=dict(color="#16A085", width=2.2)), row=2, col=2)
-        fig_page5.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi"].rolling(20).mean(), mode="lines", name="코스닥 CVI SMA20", line=dict(color="#16A085", width=2, dash="dash")), row=2, col=2)
-
-        _cd_k = kospi_df["cvi_daily"].to_numpy(dtype=float)
-        _cd_q = kosdaq_df["cvi_daily"].to_numpy(dtype=float)
-        _cc_k = [("#bdbdbd" if not np.isfinite(v) else ("#e57373" if v >= 1.0 else "#64b5f6")) for v in _cd_k]
-        _cc_q = [("#bdbdbd" if not np.isfinite(v) else ("#e57373" if v >= 1.0 else "#64b5f6")) for v in _cd_q]
-        fig_page5.add_trace(
-            go.Bar(x=kospi_df.index, y=_cd_k, name="코스피 일별 순거래대금", marker_color=_cc_k, showlegend=False),
-            row=3,
-            col=1,
-        )
-        fig_page5.add_trace(
-            go.Bar(x=kosdaq_df.index, y=_cd_q, name="코스닥 일별 순거래대금", marker_color=_cc_q, showlegend=False),
-            row=3,
-            col=2,
-        )
-
-        _apply_common_layout(fig_page5, "Page 5: CVI (20d adv/decl trade-value ratio)", layout_height=1280, max_xaxis_row=3)
-        fig_page5.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
-        fig_page5.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
-        fig_page5.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
-        fig_page5.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
-        fig_page5.update_yaxes(title_text="CVI (20일 비)", row=2, col=1)
-        fig_page5.update_yaxes(title_text="CVI (20일 비)", row=2, col=2)
-        fig_page5.update_yaxes(title_text="일별 비 (상승÷하락)", row=3, col=1)
-        fig_page5.update_yaxes(title_text="일별 비 (상승÷하락)", row=3, col=2)
-
-        # Page 6
+        # Page 5: 종가>SMA 비중
         def compute_close_above_sma_ratio(universe_set: set, target_index: pd.DatetimeIndex, windows=(5, 10, 20)) -> pd.DataFrame:
             if target_index is None or len(target_index) == 0:
                 cols = [f"above_sma{w}_pct" for w in windows]
@@ -5159,7 +5254,7 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page6, "Page 6: Close > SMA breadth (%) — by window", layout_height=1680, max_xaxis_row=4)
+        _apply_common_layout(fig_page6, "Page 5: Close > SMA breadth (%) — by window", layout_height=1680, max_xaxis_row=4)
         fig_page6.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page6.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page6.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5171,7 +5266,7 @@ def run_market_dashboard(
         fig_page6.update_yaxes(title_text="비중(%)", row=4, col=1, range=[0, 100])
         fig_page6.update_yaxes(title_text="비중(%)", row=4, col=2, range=[0, 100])
 
-        # Page 7: 종가>SMA5 비중 vs 종가<SMA10 비중 (종목수/전체 = %와 동일 스케일)
+        # Page 6: 종가>SMA5 vs <SMA10 비중
         fig_page7 = make_subplots(
             rows=2,
             cols=2,
@@ -5222,7 +5317,7 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page7, "Page 7: Close>SMA5 vs Close<SMA10 breadth (%)")
+        _apply_common_layout(fig_page7, "Page 6: Close>SMA5 vs Close<SMA10 breadth (%)")
         fig_page7.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page7.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page7.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5230,7 +5325,7 @@ def run_market_dashboard(
         fig_page7.update_yaxes(title_text="비중(%)", row=2, col=1, range=[0, 100])
         fig_page7.update_yaxes(title_text="비중(%)", row=2, col=2, range=[0, 100])
 
-        # Page 8: 종가 기준 120일 신고가/신저가 종목수
+        # Page 7: 120일 신고가/신저가
         def compute_120d_high_low_counts(universe_set: set, target_index: pd.DatetimeIndex, window: int = 120) -> pd.DataFrame:
             """각 날짜별로 '종가가 최근 window 거래일 최고/최저'인 종목 수를 계산."""
             idx = pd.DatetimeIndex(target_index)
@@ -5307,7 +5402,7 @@ def run_market_dashboard(
         fig_page8.add_trace(go.Scatter(x=kosdaq_120hl.index, y=kosdaq_120hl["high_cnt"], mode="lines", name="코스닥 120일 신고가 수", line=dict(color="#E74C3C", width=2.2)), row=2, col=2)
         fig_page8.add_trace(go.Scatter(x=kosdaq_120hl.index, y=kosdaq_120hl["low_cnt"], mode="lines", name="코스닥 120일 신저가 수", line=dict(color="#2980B9", width=2.2)), row=2, col=2)
 
-        _apply_common_layout(fig_page8, "Page 8: 120-day New High / New Low counts (Close 기준)")
+        _apply_common_layout(fig_page8, "Page 7: 120-day New High / New Low counts (Close 기준)")
         fig_page8.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page8.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page8.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5388,7 +5483,7 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page9, "Page 9: ADR (20d sum advances / declines × 100)")
+        _apply_common_layout(fig_page9, "Page 8: ADR (20d sum advances / declines × 100)")
         fig_page9.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page9.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page9.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5396,7 +5491,7 @@ def run_market_dashboard(
         fig_page9.update_yaxes(title_text="ADR (×100)", row=2, col=1)
         fig_page9.update_yaxes(title_text="ADR (×100)", row=2, col=2)
 
-        # Page 10: 모멘텀 속도 (Pine: ta.roc(close,N)/N)
+        # Page 9: 모멘텀 속도
         kospi_mom_df = _compute_momentum_speed(kospi_index_df["close"]).reindex(kospi_df.index)
         kosdaq_mom_df = _compute_momentum_speed(kosdaq_index_df["close"]).reindex(kosdaq_df.index)
 
@@ -5466,7 +5561,7 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page10, "Page 10: (KOSPI/KOSDAQ Index) x (Momentum Speed)")
+        _apply_common_layout(fig_page10, "Page 9: (KOSPI/KOSDAQ Index) x (Momentum Speed)")
         fig_page10.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page10.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page10.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5474,34 +5569,34 @@ def run_market_dashboard(
         fig_page10.update_yaxes(title_text="모멘텀 (%/일)", row=2, col=1)
         fig_page10.update_yaxes(title_text="모멘텀 (%/일)", row=2, col=2)
 
-        # Save as a single HTML with 10 pages (toggle)
+        # Save as a single HTML with 9 pages (toggle; ATR 산점도는 이어 10페이지)
+        # 순서: 1 ADL / 2 CVI / 3 변동성 / 4 Zweig / 5 SMA비중 / 6 SMA5·10 / 7 신고가 / 8 ADR / 9 모멘텀
         output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
         output_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
         os.makedirs(output_dir, exist_ok=True)
         out_path = os.path.join(output_dir, "market_AD_line.html")
 
         div1 = pio.to_html(fig_page1, full_html=False, include_plotlyjs="cdn")
-        div2 = pio.to_html(fig_page2, full_html=False, include_plotlyjs=False)
-        div3 = pio.to_html(fig_page3, full_html=False, include_plotlyjs=False)
-        div4 = pio.to_html(fig_page4, full_html=False, include_plotlyjs=False)
-        div5 = pio.to_html(fig_page5, full_html=False, include_plotlyjs=False)
-        div6 = pio.to_html(fig_page6, full_html=False, include_plotlyjs=False)
-        div7 = pio.to_html(fig_page7, full_html=False, include_plotlyjs=False)
-        div8 = pio.to_html(fig_page8, full_html=False, include_plotlyjs=False)
-        div9 = pio.to_html(fig_page9, full_html=False, include_plotlyjs=False)
-        div10 = pio.to_html(fig_page10, full_html=False, include_plotlyjs=False)
-        dash_divs = [div1, div2, div3, div4, div5, div6, div7, div8, div9, div10]
+        div2 = pio.to_html(fig_page2, full_html=False, include_plotlyjs=False)  # CVI
+        div3 = pio.to_html(fig_vol, full_html=False, include_plotlyjs=False)  # 변동성
+        div4 = pio.to_html(fig_page4, full_html=False, include_plotlyjs=False)  # Zweig
+        div5 = pio.to_html(fig_page6, full_html=False, include_plotlyjs=False)  # SMA비중
+        div6 = pio.to_html(fig_page7, full_html=False, include_plotlyjs=False)
+        div7 = pio.to_html(fig_page8, full_html=False, include_plotlyjs=False)
+        div8 = pio.to_html(fig_page9, full_html=False, include_plotlyjs=False)
+        div9 = pio.to_html(fig_page10, full_html=False, include_plotlyjs=False)
+        dash_divs = [div1, div2, div3, div4, div5, div6, div7, div8, div9]
         _write_krx_market_dashboard_html(out_path, dash_divs)
         dash_state["path"] = out_path
         dash_state["divs"] = dash_divs
 
         if not quiet:
-            print("완료: 코스피/코스닥 지표 대시보드(10페이지 저장, ATR 산점도는 이어 11페이지로 추가)")
+            print("완료: 코스피/코스닥 지표 대시보드(9페이지 저장, ATR 산점도는 이어 10페이지로 추가)")
 
     except Exception as e:
-        print(f"실패: 코스피/코스닥 지수+AD line+변동성 대시보드 생성 ({type(e).__name__}: {e})")
+        print(f"실패: 코스피/코스닥 지수+Advance Decline Line+변동성 대시보드 생성 ({type(e).__name__}: {e})")
 
-    # 거래대금 HTML + 대시보드 11페이지(ATR 분포)
+    # 거래대금 HTML + 대시보드 10페이지(ATR 분포)
     try:
         import talib
 
@@ -5668,7 +5763,7 @@ def run_market_dashboard(
             )
 
         _log("\n" + "=" * 80)
-        _log("거래대금 HTML · 대시보드 ATR 산점도(11페이지) 생성")
+        _log("거래대금 HTML · 대시보드 ATR 산점도(10페이지) 생성")
         _log("=" * 80)
         _highlight_set = set([str(x) for x in (highlight_tickers or set())])
         _top100_tickers_all: set[str] = set()
@@ -6499,7 +6594,7 @@ def run_market_dashboard(
             margin=dict(t=100),
         )
 
-        # 대시보드 11페이지로 ATR 산점도 추가(CDN은 1페이지에 포함)
+        # 대시보드 10페이지로 ATR 산점도 추가(CDN은 1페이지에 포함)
         div_scatter = pio.to_html(sub, full_html=False, include_plotlyjs=False)
         _dash_atr_path = None
         if dash_state.get("path") and dash_state.get("divs"):
@@ -6509,7 +6604,7 @@ def run_market_dashboard(
                     _dash_atr_path,
                     list(dash_state["divs"]) + [div_scatter],
                 )
-                _log(f"  → 대시보드 11페이지(ATR 산점도) 반영: {_dash_atr_path}")
+                _log(f"  → 대시보드 10페이지(ATR 산점도) 반영: {_dash_atr_path}")
             except Exception as _e_dash:
                 _log(f"경고: 대시보드 ATR 페이지 반영 실패 ({type(_e_dash).__name__}: {_e_dash})")
                 _dash_atr_path = None
@@ -6653,7 +6748,7 @@ def run_market_dashboard(
     <strong>5일 상승률(%)</strong>: 최신 종가 ÷ 5거래일 전 종가 − 1.<br/>
     3일·D-0·D-1·D-2 에너지배율 표는 <a href="{html.escape(os.path.basename(out_energy))}"><code>{html.escape(os.path.basename(out_energy))}</code></a>를 참고하세요.
     Talent(일) = 최근 120거래일 중 (전일종가 대비 등락률 ≥ +10%)인 날 수이며, 거래대금 상위 100 내 요약은 코스피 평균 {_fmt_talent_stat(_st_k.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_k.get('talent_p95'))}, 코스닥 평균 {_fmt_talent_stat(_st_q.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_q.get('talent_p95'))} 입니다.<br/>
-    ATR14/종가 vs 시가총액 분포는 <a href="{html.escape(os.path.basename(out_ad))}"><code>{html.escape(os.path.basename(out_ad))}</code></a> <strong>11페이지</strong>를 참고하세요.<br/>
+    ATR14/종가 vs 시가총액 분포는 <a href="{html.escape(os.path.basename(out_ad))}"><code>{html.escape(os.path.basename(out_ad))}</code></a> <strong>10페이지</strong>를 참고하세요.<br/>
     일별 거래대금 Top20 표는 코스피·코스닥 각각 <strong>해당 시장 종목만</strong> 대상으로 당일 거래대금(종가×거래량) 기준 상위 20입니다. 행 날짜는 두 시장 OHLCV가 공통으로 갖는 최근 20거래일입니다.<br/>
     <strong>표 정렬</strong>: 거래대금 상위 100·일별 Top20 표에서 칼럼 헤더를 클릭하면 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
     파일: {os.path.basename(out_tv)}
@@ -6757,7 +6852,7 @@ def run_market_dashboard(
                 pass
 
             if _dash_atr_path:
-                print(f"완료: 코스피/코스닥 지표 대시보드(11페이지, ATR 산점도 포함): {_dash_atr_path}")
+                print(f"완료: 코스피/코스닥 지표 대시보드(10페이지, ATR 산점도 포함): {_dash_atr_path}")
             print(f"완료: 거래대금 HTML 저장: {out_tv}")
             print(f"완료: 에너지배율 HTML 저장: {out_energy}")
         return _top100_tickers_all, ohlcv_data
@@ -6791,7 +6886,7 @@ def _announce_krx_reports_from_disk(len_rs: int, len_bo: int) -> None:
         except Exception:
             pass
 
-    print("완료: 코스피/코스닥 지표 대시보드(11페이지, ATR 산점도 포함 · 1·5·6·10페이지는 다단 구성)")
+    print("완료: 코스피/코스닥 지표 대시보드(10페이지, ATR 산점도 포함 · 1·2·5페이지는 다단 구성)")
     _open_if_file(p_ad)
     if os.path.isfile(p_tv):
         print(f"완료: 거래대금 HTML 저장: {p_tv}")
