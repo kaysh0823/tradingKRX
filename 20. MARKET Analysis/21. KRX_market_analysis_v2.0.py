@@ -117,6 +117,7 @@ if str(_ROOT) not in sys.path:
 from env_config import load_project_env, require_env, db_url, db_connect_kwargs
 load_project_env()
 from indicators_core import atr_wilder, energy_ratio, rs_avg, talent_up_count
+from exclusions import drop_excluded, filter_tickers
 
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
@@ -1478,7 +1479,6 @@ def _load_tv_top100_universe(
                AND t.종목구분 = '보통주'
             WHERE DATE(o.date) = DATE(%s)
             ORDER BY (o.close * o.volume) DESC
-            LIMIT 100
         """
         try:
             df = pd.read_sql_query(q, con=engine, params=(sector_cd, d_str))
@@ -1486,6 +1486,10 @@ def _load_tv_top100_universe(
             continue
         if df is None or df.empty:
             continue
+        df = drop_excluded(df, "ticker")
+        if df is None or df.empty:
+            continue
+        df = df.head(100)
         for i, tk in enumerate(df["ticker"].astype(str).tolist(), start=1):
             universe.add(tk)
             market_set.add(tk)
@@ -1516,6 +1520,9 @@ def _krx_tv_rank_prev_by_ticker(engine) -> dict[str, float]:
             WHERE DATE(o.date) = DATE(%s)
         """
         df = pd.read_sql_query(q, con=engine, params=(d_prev_s,))
+        if df is None or df.empty:
+            return {}
+        df = drop_excluded(df, "ticker")
         if df is None or df.empty:
             return {}
         df["ticker"] = df["ticker"].astype(str)
@@ -1628,6 +1635,9 @@ def _load_latest_rs_rank_and_score_maps(engine) -> tuple[dict[str, int], dict[st
         df = pd.read_sql_query(q, con=engine)
     except Exception:
         return {}, {}
+    if df is None or df.empty:
+        return {}, {}
+    df = drop_excluded(df, "ticker")
     if df is None or df.empty:
         return {}, {}
     df["ticker"] = df["ticker"].astype(str)
@@ -1766,7 +1776,8 @@ def write_rs_high_list_html(
         print(f"실패: RS 고분위 리스트 조회 ({type(e).__name__}: {e})")
         return None, set()
 
-    if df.empty:
+    df = drop_excluded(df, "ticker")
+    if df is None or df.empty:
         rs_html_doc = """<!doctype html>
 <html lang="ko">
 <head><meta charset="utf-8"/><title>RS 고분위 리스트</title></head>
@@ -1926,6 +1937,8 @@ def write_rs_high_list_html(
             WHERE UPPER(TRIM(r.market_type)) IN ('KOSPI', 'KOSDAQ')
         """
         df_rs_mkt = pd.read_sql_query(q_mkt_rs, con=engine)
+        if df_rs_mkt is not None and not df_rs_mkt.empty:
+            df_rs_mkt = drop_excluded(df_rs_mkt, "ticker")
         if df_rs_mkt is not None and not df_rs_mkt.empty:
             df_rs_mkt["ticker"] = df_rs_mkt["ticker"].astype(str)
             df_rs_mkt["market_type"] = df_rs_mkt["market_type"].astype(str).str.strip().str.upper()
@@ -2542,6 +2555,8 @@ def write_rs_high_list_html(
                 params=tuple([pd.Timestamp(d).strftime("%Y-%m-%d") for d in _dates20]),
             )
             if _rs20 is not None and not _rs20.empty:
+                _rs20 = drop_excluded(_rs20, "ticker")
+            if _rs20 is not None and not _rs20.empty:
                 _rs20["ticker"] = _rs20["ticker"].astype(str)
                 _rs20["market_type"] = _rs20["market_type"].astype(str).str.upper()
                 _rs20["date"] = pd.to_datetime(_rs20["date"], errors="coerce")
@@ -2880,7 +2895,7 @@ def write_120d_breakout_list_html(
         print(f"실패: 신고가 리스트 시장 티커 조회 ({type(e).__name__}: {e})")
         return None, set()
 
-    universe = sorted(set(kospi_list) | set(kosdaq_list))
+    universe = filter_tickers(sorted(set(kospi_list) | set(kosdaq_list)))
     if not universe:
         print("실패: 신고가 리스트 유니버스가 비었습니다.")
         return None, set()
@@ -3472,7 +3487,7 @@ def _load_latest_ticker_list(engine) -> pd.DataFrame:
     df = pd.read_sql_query(query, con=engine)
     if df is None or df.empty:
         raise RuntimeError("ticker_list 로드 실패: krx_ticker 데이터가 없습니다.")
-    return df
+    return drop_excluded(df, "종목코드")
 
 
 def _market_dash_annotate_ohlcv_meta(ohlcv: pd.DataFrame, ticker: str, ticker_list_idx) -> pd.DataFrame:
@@ -4535,14 +4550,18 @@ def run_market_dashboard(
         holidays = MARKET_DASH_HOLIDAYS
 
         # universe 구성 (krx_ticker_sector에 코스피/코스닥 메인에 해당하는 sector_cd 존재)
-        kospi_list = pd.read_sql_query(
-            "SELECT ticker FROM krx_ticker_sector WHERE sector_cd = '1001';",
-            con=engine,
-        )["ticker"].astype(str).values.tolist()
-        kosdaq_list = pd.read_sql_query(
-            "SELECT ticker FROM krx_ticker_sector WHERE sector_cd = '2001';",
-            con=engine,
-        )["ticker"].astype(str).values.tolist()
+        kospi_list = filter_tickers(
+            pd.read_sql_query(
+                "SELECT ticker FROM krx_ticker_sector WHERE sector_cd = '1001';",
+                con=engine,
+            )["ticker"].astype(str).values.tolist()
+        )
+        kosdaq_list = filter_tickers(
+            pd.read_sql_query(
+                "SELECT ticker FROM krx_ticker_sector WHERE sector_cd = '2001';",
+                con=engine,
+            )["ticker"].astype(str).values.tolist()
+        )
 
         kospi_set = set(kospi_list)
         kosdaq_set = set(kosdaq_list)
@@ -5909,6 +5928,7 @@ def run_market_dashboard(
         except Exception:
             meta["theme_str"] = ""
         meta["theme_str"] = meta["theme_str"].fillna("").astype(str)
+        meta = drop_excluded(meta, "ticker")
         kospi_tickers = meta.loc[meta["sector_cd"] == "1001", "ticker"].tolist()
         kosdaq_tickers = meta.loc[meta["sector_cd"] == "2001", "ticker"].tolist()
         all_tickers = kospi_tickers + kosdaq_tickers

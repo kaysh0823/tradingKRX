@@ -123,6 +123,7 @@ if str(_ROOT) not in sys.path:
 from env_config import load_project_env, require_env, db_url, db_connect_kwargs
 load_project_env()
 
+from exclusions import drop_excluded, filter_tickers
 from indicators_core import atr_wilder, energy_ratio, rs_avg
 
 
@@ -1176,12 +1177,13 @@ where 기준일 = (select max(기준일) from krx_ticker) and 종목구분 = '�
 
 ticker_list = pd.read_sql(query, con=engine)
 ticker_list = ticker_list[['종목코드', '종목명', '업종명']]
+ticker_list = drop_excluded(ticker_list, "종목코드")
 ticker_list = ticker_list.set_index('종목코드')
 
 ### OHLCV를 가져옴
 ohlcv_data_all = {}
 print("서버에서 OHLCV 데이터를 가젹오고 있습니다.")
-_tickers_all = [str(t).zfill(6) for t in ticker_list.index]
+_tickers_all = filter_tickers([str(t).zfill(6) for t in ticker_list.index])
 if _tickers_all:
     _ph = ",".join(["%s"] * len(_tickers_all))
     _q = f"""

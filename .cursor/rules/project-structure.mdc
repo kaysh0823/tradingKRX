@@ -27,6 +27,10 @@ alwaysApply: true
   talent 지수, 주가위치, ATR(Wilder period=3)/종가, Band Width(정규화 q, window20·2σ·lookback125),
   모멘텀 속도(ROC÷N), CVI(상승−하락 거래대금 200일 누적 + Signal EMA20; 삼성·하이닉스 제외 병기),
   ADR, 스크리닝 패턴, picking 점수.
+- **전역 제외 목록** (`exclusions.py`, 루트·`naverPub/` 문자 동일):
+  수집(OHLCV/지수/ETF PDF/투자자/RS·talent 적재)은 유지하고,
+  모든 분석·표·그래프 유니버스에서만 `filter_tickers` / `drop_excluded` 로 제외한다.
+  변경 시 양쪽 저장소를 함께 수정한다.
 - **새 로직을 넣기 전에 10~50·naverPub에 이미 있는지 먼저 확인**하고, 있으면 재활용/이식한다.
   같은 지표를 폴더마다 다르게 재구현하지 말 것. (예: CVI/ADR 정의는
   `20. MARKET Analysis/21. KRX_market_analysis_v2.0.py`, 스크리닝은

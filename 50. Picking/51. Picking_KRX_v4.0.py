@@ -123,6 +123,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from env_config import load_project_env, require_env, db_url, db_connect_kwargs
 load_project_env()
+from exclusions import drop_excluded
 from indicators_core import (
     atr_wilder,
     bollinger_band_width,
@@ -622,6 +623,7 @@ if '시가총액' in ticker_list.columns:
 else:
     ticker_list['시가총액'] = None
     ticker_list = ticker_list[['종목코드', '종목명', '업종명', '시가총액']]
+ticker_list = drop_excluded(ticker_list, "종목코드")
 ticker_list = ticker_list.set_index('종목코드')
 
 
