@@ -831,6 +831,7 @@ def _mj_html_energy_top50_by_market(
     chg5_map: dict[str, float] | None = None,
     rs_rank_map: dict[str, int] | None = None,
     high_flags: dict[str, dict[int, str]] | None = None,
+    pos_map: dict[str, dict[int, float]] | None = None,
 ) -> str:
     """
     해당 시장 당일 거래대금 상위 100 중 3일 에너지배율 내림차순 상위 50.
@@ -842,6 +843,7 @@ def _mj_html_energy_top50_by_market(
     chg5_map = chg5_map or {}
     rs_rank_map = rs_rank_map or {}
     high_flags = high_flags or {}
+    pos_map = pos_map or {}
 
     def _prep_slice(df0: pd.DataFrame) -> pd.DataFrame:
         if df0 is None or df0.empty:
@@ -935,6 +937,9 @@ def _mj_html_energy_top50_by_market(
         "<th style='text-align:right;padding:8px 4px;'>Talent(일)</th>",
         "<th style='text-align:right;padding:8px 4px;'>RS순위</th>",
         "<th style='text-align:left;padding:8px 4px;'>신고가 여부</th>",
+        "<th style='text-align:right;padding:8px 4px;'>주가위치(20)</th>",
+        "<th style='text-align:right;padding:8px 4px;'>주가위치(50)</th>",
+        "<th style='text-align:right;padding:8px 4px;'>주가위치(120)</th>",
         "</tr></thead><tbody>",
     ]
     fc_base = "#212121"
@@ -1013,6 +1018,15 @@ def _mj_html_energy_top50_by_market(
         )
         parts.append(f"<td style='text-align:right;color:{fc_base}'{_sv(_rs)}>{html.escape(_rs_txt)}</td>")
         parts.append(f"<td style='text-align:left;color:{fc_base}'>{html.escape(high_txt)}</td>")
+        _pm = pos_map.get(tk, {}) or {}
+        for _w in (20, 50, 120):
+            _pv = _pm.get(_w)
+            try:
+                _px = float(_pv) if _pv is not None else np.nan
+            except (TypeError, ValueError):
+                _px = np.nan
+            _pt = f"{_px:.2f}" if np.isfinite(_px) else ""
+            parts.append(f"<td style='text-align:right;color:{fc_base}'{_sv(_px if np.isfinite(_px) else None)}>{html.escape(_pt)}</td>")
         parts.append("</tr>")
     parts.append("</tbody></table></div>")
     return "".join(parts)
@@ -3544,7 +3558,7 @@ def _market_dash_frame_from_raw(raw: pd.DataFrame, ticker: str, ticker_list_idx,
     ohlcv = raw.copy()
     if "date" not in ohlcv.columns:
         return None
-    keep = [c for c in ("date", "open", "high", "low", "close", "volume") if c in ohlcv.columns]
+    keep = [c for c in ("date", "open", "high", "low", "close", "volume", "mcap") if c in ohlcv.columns]
     ohlcv = ohlcv[keep]
     ohlcv["date"] = pd.to_datetime(ohlcv["date"], errors="coerce")
     ohlcv = ohlcv.dropna(subset=["date"]).sort_values("date")
@@ -3620,7 +3634,7 @@ def _market_dash_load_ohlcv_parallel(
     def _load_chunk(chunk: list[str]) -> pd.DataFrame:
         ph = ",".join(["%s"] * len(chunk))
         q = f"""
-            SELECT ticker, date, open, high, low, close, volume
+            SELECT ticker, date, open, high, low, close, volume, mcap
             FROM krx_ohlcv
             WHERE ticker IN ({ph}) AND date >= %s
             ORDER BY ticker, date
@@ -3729,7 +3743,7 @@ MARKET_DASH_PAGE_DESCS: dict[int, str] = {
     5: "종가>SMA 비중: 해당 시장 유니버스에서 종가가 SMA5·10·20 위에 있는 종목 비율(%)입니다. 코스피·코스닥 각각 SMA 길이별로 한 패널씩 나누어 표시합니다.",
     6: "120일 신고가/신저가 종목 수: 종가가 최근 120거래일 최고·최저 종가인 종목 수입니다. 신고가·신저가 확산 정도를 봅니다.",
     7: "ADR: 최근 20거래일 상승 종목 수 합 ÷ 같은 기간 하락 종목 수 합에 100을 곱한 값입니다. 일별 값은 들쭉날쭉하므로 ADR의 10일 SMA로 추세를 보조합니다. 약 100 근처는 균형, 120~125 이상은 단기 과열, 70~75 이하는 침체(과매도) 권역으로 자주 해석합니다.",
-    8: "모멘텀 속도: 지수 종가 기준 ROC(기간 변화율 %) ÷ 기간으로 나눈 하루 평균 변화율(%/일)입니다. 5·10·20·50일 선을 겹쳐 단기·중기 추세 속도를 비교합니다. 0선 위는 상승 모멘텀, 아래는 하락 모멘텀입니다.",
+    8: "모멘텀 속도: 지수 종가 기준 ROC(기간 변화율 %) ÷ 기간으로 나눈 하루 평균 변화율(%/일)입니다. 20·50일 선을 겹쳐 중기 추세 속도를 비교합니다. 0선 위는 상승 모멘텀, 아래는 하락 모멘텀입니다.",
     9: "ATR3/종가 vs 시가총액: 코스피(위)·코스닥(아래) 산점도입니다. x축 [0, 0.3], 0.3 초과 종목은 주석으로만 표시합니다. 분위선·평균은 전 종목 기준이며 RS Top20·거래대금 Top20을 강조합니다.",
 }
 
@@ -3808,8 +3822,8 @@ def _write_krx_market_dashboard_html(out_path: str, plot_divs: list[str]) -> Non
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
 
-_MOMENTUM_SPEED_PERIODS = (5, 10, 20, 50)
-_MOMENTUM_SPEED_COLORS = {5: "#E53935", 10: "#FB8C00", 20: "#43A047", 50: "#1E88E5"}
+_MOMENTUM_SPEED_PERIODS = (20, 50)
+_MOMENTUM_SPEED_COLORS = {20: "#43A047", 50: "#1E88E5"}
 
 
 def _compute_momentum_speed(close: pd.Series, periods: tuple[int, ...] = _MOMENTUM_SPEED_PERIODS) -> pd.DataFrame:
@@ -3896,6 +3910,33 @@ def _calc_pct_b_last(df: pd.DataFrame, timeperiod: int = 20) -> float | None:
         return float(pct_b) if np.isfinite(pct_b) else None
     except Exception:
         return None
+
+
+
+def _price_position_close(close, windows=(20, 50, 120)) -> dict:
+    """주가위치_N = (종가 − N일 종가최저)/(N일 종가최고 − 최저), clip [0,1]. 종가 기준."""
+    s = pd.to_numeric(close, errors="coerce")
+    out = {int(w): np.nan for w in windows}
+    if s is None or len(s) == 0:
+        return out
+    try:
+        cur = float(s.iloc[-1])
+    except Exception:
+        return out
+    if not np.isfinite(cur):
+        return out
+    for w in windows:
+        w = int(w)
+        if len(s) < w:
+            continue
+        win = s.iloc[-w:]
+        hi = float(pd.to_numeric(win, errors="coerce").max())
+        lo = float(pd.to_numeric(win, errors="coerce").min())
+        denom = hi - lo
+        if not (np.isfinite(hi) and np.isfinite(lo) and denom > 0):
+            continue
+        out[w] = float(np.clip((cur - lo) / denom, 0.0, 1.0))
+    return out
 
 
 def _calc_ohlcv_chg_and_elapsed(df: pd.DataFrame) -> dict:
@@ -4200,6 +4241,7 @@ def write_volatility_spread_top100_html(
             th = th[:95] + "…"
         tk = str(ticker)
         market = "KOSPI" if tk in kospi_tv_set else ("KOSDAQ" if tk in kosdaq_tv_set else "")
+        _pp = _price_position_close(df["close"], windows=(20, 50, 120)) if "close" in df.columns else {}
         rows.append(
             {
                 "ticker": tk,
@@ -4209,6 +4251,9 @@ def write_volatility_spread_top100_html(
                 "rs_rank": rs_rank_map.get(tk),
                 "rs_score": rs_score_map.get(tk),
                 "tv_rank": rank_map.get(tk),
+                "pos_20": _pp.get(20, np.nan),
+                "pos_50": _pp.get(50, np.nan),
+                "pos_120": _pp.get(120, np.nan),
                 "current_price": extra["current_price"],
                 "pct_b": extra["pct_b"],
                 "chg_1d_pct": extra["chg_1d_pct"],
@@ -4329,6 +4374,15 @@ def write_volatility_spread_top100_html(
             return ""
         return f"{x * 100:.1f}"
 
+    def _fmt_pos(v) -> str:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if not np.isfinite(x):
+            return ""
+        return f"{x:.2f}"
+
     def _fmt_pct_cell(v) -> str:
         try:
             if v is None or (isinstance(v, float) and (np.isnan(v) or not np.isfinite(v))):
@@ -4353,7 +4407,8 @@ def write_volatility_spread_top100_html(
             "<th>CLV(5일평균)</th><th>순방향변동(5일)</th><th>DRB(5일평균)</th>"
             "<th>거래대금 순위</th><th>RS순위</th><th>RS점수</th>"
             "<th>당일 상승률(%)</th><th>3일간 상승률(%)</th><th>%b</th>"
-            "<th>이전 신고가 경과일수</th>",
+            "<th>이전 신고가 경과일수</th>"
+            "<th>주가위치(20)</th><th>주가위치(50)</th><th>주가위치(120)</th>",
             "</tr></thead><tbody>",
         ]
         for i, (_, r) in enumerate(sub_df.iterrows(), start=1):
@@ -4395,6 +4450,9 @@ def write_volatility_spread_top100_html(
                 f"<td style='text-align:right'{_html_sort_num_attr(_chg3)}>{_chg3_cell}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(r.get('pct_b'))}>{_fmt_pct_b(r.get('pct_b'))}</td>"
                 f"<td style='text-align:center'{_html_sort_num_attr(_eh)}>{html.escape(_eh_txt)}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(r.get('pos_20'))}>{_fmt_pos(r.get('pos_20'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(r.get('pos_50'))}>{_fmt_pos(r.get('pos_50'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(r.get('pos_120'))}>{_fmt_pos(r.get('pos_120'))}</td>"
                 f"</tr>"
             )
         lines.append("</tbody></table>")
@@ -4769,8 +4827,9 @@ def run_market_dashboard(
             breadth_df["adv_ratio"] = np.where(_ad_denom > 0, breadth_df["up"].to_numpy(dtype=float) / _ad_denom, np.nan)
             breadth_df["zweig_ma10_pct"] = breadth_df["adv_ratio"].rolling(10, min_periods=10).mean() * 100.0
 
-            # 시총가중 변동성: Σ(ATR3/종가 × mcap) / Σ(mcap)
-            # mcap: ohlcv_data의 market_cap(최신 krx_ticker 시가총액 상수 가중; per-date 시총 미보관 시 근사)
+            # 시총가중 변동성(날짜별): Σ(ATR3/종가 × mcap_d) / Σ(mcap_d)
+            # mcap: krx_ohlcv.mcap(일자별). 결측일은 해당 종목 그날 가중에서 제외(naverPub _mcap_weighted_vol 동일).
+            # annotate의 market_cap(최신 시총 상수)과 별도 — 가중에는 per-date mcap만 사용.
             breadth_df = breadth_df.tail(BREADTH_WINDOW)
             target_index = pd.DatetimeIndex(breadth_df.index)
             w_sum = np.zeros(len(target_index), dtype=float)
@@ -4804,19 +4863,15 @@ def run_market_dashboard(
                 ratio = ratio[~ratio.index.isna()]
                 ratio = ratio.reindex(target_index)
 
-                # 최신 시가총액 상수 가중(근사). per-date mcap 컬럼이 일자별로 다르면 그 값을 사용.
-                if "market_cap" in df.columns:
-                    mc_s = pd.to_numeric(df["market_cap"], errors="coerce")
+                if "mcap" in df.columns:
+                    mc_s = pd.to_numeric(df["mcap"], errors="coerce")
                     mc_s.index = pd.to_datetime(df.index, errors="coerce").normalize()
                     mc_s = mc_s[~mc_s.index.isna()].reindex(target_index)
-                    # 상수(전 구간 동일)면 ffill/bfill로 채움
-                    if mc_s.notna().any():
-                        mc_s = mc_s.ffill().bfill()
                 else:
                     mc_s = pd.Series(np.nan, index=target_index)
-                mc = pd.to_numeric(mc_s, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                mc = pd.to_numeric(mc_s, errors="coerce").to_numpy(dtype=float)
                 r = ratio.to_numpy(dtype=float)
-                mask = np.isfinite(r) & (mc > 0)
+                mask = np.isfinite(r) & np.isfinite(mc) & (mc > 0)
                 if mask.any():
                     w_sum[mask] += r[mask] * mc[mask]
                     w_mcap[mask] += mc[mask]
@@ -5680,7 +5735,7 @@ def run_market_dashboard(
                     chunk = need_db[i : i + chunk_size]
                     ph = ",".join(["%s"] * len(chunk))
                     q = f"""
-                        SELECT ticker, date, open, high, low, close, volume
+                        SELECT ticker, date, open, high, low, close, volume, mcap
                         FROM krx_ohlcv
                         WHERE date >= %s AND ticker IN ({ph})
                     """
@@ -6353,6 +6408,28 @@ def run_market_dashboard(
                 "" if pd.isna(x) else str(int(float(x))) for x in pd.to_numeric(df.get("rs_rank"), errors="coerce").fillna(np.nan)
             ]
             high_flag_col = ["" if pd.isna(x) else str(x) for x in df.get("신고가여부", [""] * n_rows)]
+            for _w in (20, 50, 120):
+                _col = f"pos_{_w}"
+                if _col not in df.columns:
+                    df[_col] = np.nan
+            _pos20_vals, _pos50_vals, _pos120_vals = [], [], []
+            for _tk in df["ticker"].astype(str).tolist():
+                _odf = ohlcv_data.get(str(_tk)) if isinstance(ohlcv_data, dict) else None
+                if _odf is None or getattr(_odf, "empty", True) or "close" not in getattr(_odf, "columns", []):
+                    _pos20_vals.append(np.nan)
+                    _pos50_vals.append(np.nan)
+                    _pos120_vals.append(np.nan)
+                    continue
+                _pp = _price_position_close(_odf["close"], windows=(20, 50, 120))
+                _pos20_vals.append(_pp.get(20, np.nan))
+                _pos50_vals.append(_pp.get(50, np.nan))
+                _pos120_vals.append(_pp.get(120, np.nan))
+            df["pos_20"] = _pos20_vals
+            df["pos_50"] = _pos50_vals
+            df["pos_120"] = _pos120_vals
+            pos20_col = [f"{x:.2f}" if np.isfinite(x) else "" for x in pd.to_numeric(df["pos_20"], errors="coerce")]
+            pos50_col = [f"{x:.2f}" if np.isfinite(x) else "" for x in pd.to_numeric(df["pos_50"], errors="coerce")]
+            pos120_col = [f"{x:.2f}" if np.isfinite(x) else "" for x in pd.to_numeric(df["pos_120"], errors="coerce")]
             theme_col = [_fmt_theme_cell(df["theme_str"].iloc[i]) for i in range(n_rows)]
             price_col = [_fmt_price(df["close"].iloc[i]) for i in range(n_rows)]
             atr_col = [f"{x:.4f}" if np.isfinite(x) else "" for x in df["atr_over_close"]]
@@ -6410,6 +6487,9 @@ def run_market_dashboard(
                 _uf(),
                 _uf(),
                 _uf(),
+                _uf(),
+                _uf(),
+                _uf(),
             ]
 
             def _sv_num_attr(x) -> str:
@@ -6450,6 +6530,9 @@ def run_market_dashboard(
                 ("시총 전체비중", "right"),
                 ("RS순위", "right"),
                 ("신고가여부", "center"),
+                ("주가위치(20)", "right"),
+                ("주가위치(50)", "right"),
+                ("주가위치(120)", "right"),
             ]
             parts: list[str] = [
                 f'<div class="mj-html-table-wrap"><h3 style="margin:10px 0 6px 0;font-size:1.05rem;">{html.escape(market_name)} 거래대금 상위 100</h3>',
@@ -6530,6 +6613,15 @@ def run_market_dashboard(
                 )
                 parts.append(
                     f'<td style="text-align:center;color:{cells_font_color[19][i]}">{html.escape(str(high_flag_col[i]))}</td>'
+                )
+                parts.append(
+                    f'<td style="text-align:right;color:{cells_font_color[20][i]}"{_sv_num_attr(df["pos_20"].iloc[i])}>{pos20_col[i]}</td>'
+                )
+                parts.append(
+                    f'<td style="text-align:right;color:{cells_font_color[21][i]}"{_sv_num_attr(df["pos_50"].iloc[i])}>{pos50_col[i]}</td>'
+                )
+                parts.append(
+                    f'<td style="text-align:right;color:{cells_font_color[22][i]}"{_sv_num_attr(df["pos_120"].iloc[i])}>{pos120_col[i]}</td>'
                 )
                 parts.append("</tr>")
             parts.append("</tbody></table></div>")
@@ -6625,6 +6717,12 @@ def run_market_dashboard(
         except Exception:
             _er_high = {}
 
+        _er_pos: dict[str, dict[int, float]] = {}
+        for _tk_pos in _er_tickers:
+            _odf = ohlcv_data.get(str(_tk_pos)) if isinstance(ohlcv_data, dict) else None
+            if _odf is None or getattr(_odf, "empty", True) or "close" not in getattr(_odf, "columns", []):
+                continue
+            _er_pos[str(_tk_pos)] = _price_position_close(_odf["close"], windows=(20, 50, 120))
         div_tbl_energy_k = _mj_html_energy_top50_by_market(
             df_k,
             market_label="코스피",
@@ -6639,6 +6737,7 @@ def run_market_dashboard(
             chg5_map=_er_chg5,
             rs_rank_map=_er_rs,
             high_flags=_er_high,
+            pos_map=_er_pos,
         )
         div_tbl_energy_q = _mj_html_energy_top50_by_market(
             df_q,
@@ -6654,6 +6753,7 @@ def run_market_dashboard(
             chg5_map=_er_chg5,
             rs_rank_map=_er_rs,
             high_flags=_er_high,
+            pos_map=_er_pos,
         )
 
         try:
