@@ -117,7 +117,7 @@ if str(_ROOT) not in sys.path:
 from env_config import load_project_env, require_env, db_url, db_connect_kwargs
 load_project_env()
 from indicators_core import atr_wilder, energy_ratio, rs_avg, talent_up_count
-from exclusions import drop_excluded, filter_tickers
+from exclusions import drop_excluded, filter_common_stock_df, filter_tickers
 
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
@@ -7173,6 +7173,183 @@ def _announce_krx_reports_from_disk(len_rs: int, len_bo: int) -> None:
         _open_if_file(p_vs)
 
 
+# 투자자 순매수 상위표 — naverPub collect_investor.INVESTOR_TOP_GROUPS 와 동일 순서·정의
+_INVESTOR_TOP_GROUPS = [
+    ("6000", "연기금등", None),
+    ("3000", "투신", None),
+    ("3100", "사모", None),
+    ("1000", "금융투자", None),
+    ("7050", "기관합계", None),
+    ("FOREIGN", "외국인", ("9000", "9001")),
+]
+
+
+def write_investor_net_buy_top_html(
+    engine,
+    output_base_dir: str | None = None,
+    quiet: bool = False,
+) -> str | None:
+    """
+    기준일(최신) 투자자구분별 순매수금액(net_val) Top20 → 투자자_순매수상위.html.
+    외국인 = 9000+9001 종목별 합산. 전역제외·보통주(이름) 필터.
+    """
+    base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
+    out_dir = os.path.join(base, date.today().strftime("%Y-%m-%d"))
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "투자자_순매수상위.html")
+
+    try:
+        ref_df = pd.read_sql_query(
+            "SELECT MAX(`date`) AS d FROM krx_investor_trade_krx", con=engine
+        )
+    except Exception as e:
+        if not quiet:
+            print(f"실패: 투자자 순매수 기준일 조회 ({type(e).__name__}: {e})")
+        return None
+    if ref_df is None or ref_df.empty or pd.isna(ref_df.iloc[0]["d"]):
+        html_doc = """<!doctype html><html lang="ko"><head><meta charset="utf-8"/><title>투자자 순매수 상위</title></head>
+<body><p><code>krx_investor_trade_krx</code> 데이터가 없습니다. 투자자 수집(KRX 12010) 후 다시 실행하세요.</p></body></html>"""
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        if not quiet:
+            print(f"완료: 투자자 순매수 HTML 저장(0건): {out_path}")
+        return out_path
+
+    ref_d = pd.to_datetime(ref_df.iloc[0]["d"]).date()
+
+    def _load_top(codes: tuple[str, ...]) -> pd.DataFrame:
+        if len(codes) == 1:
+            q = """
+                SELECT i.ticker, t.종목명 AS name, i.net_val, i.net_qty
+                FROM krx_investor_trade_krx i
+                LEFT JOIN krx_ticker t
+                  ON t.종목코드 = i.ticker
+                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
+                WHERE i.date = %s AND i.invst_tp_cd = %s
+                  AND i.net_val IS NOT NULL
+            """
+            df = pd.read_sql_query(q, con=engine, params=(ref_d, codes[0]))
+        else:
+            ph = ",".join(["%s"] * len(codes))
+            q = f"""
+                SELECT i.ticker,
+                       MAX(t.종목명) AS name,
+                       SUM(i.net_val) AS net_val,
+                       SUM(i.net_qty) AS net_qty
+                FROM krx_investor_trade_krx i
+                LEFT JOIN krx_ticker t
+                  ON t.종목코드 = i.ticker
+                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
+                WHERE i.date = %s AND i.invst_tp_cd IN ({ph})
+                GROUP BY i.ticker
+                HAVING SUM(i.net_val) IS NOT NULL
+            """
+            df = pd.read_sql_query(q, con=engine, params=(ref_d, *codes))
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = filter_common_stock_df(df, "ticker", "name")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df["net_val"] = pd.to_numeric(df["net_val"], errors="coerce")
+        df["net_qty"] = pd.to_numeric(df["net_qty"], errors="coerce")
+        df = df.dropna(subset=["net_val"]).sort_values("net_val", ascending=False).head(20)
+        return df.reset_index(drop=True)
+
+    def _fmt_eok(v) -> str:
+        try:
+            x = float(v) / 1e8
+        except (TypeError, ValueError):
+            return ""
+        if not np.isfinite(x):
+            return ""
+        return f"{x:,.1f}"
+
+    def _fmt_qty(v) -> str:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if not np.isfinite(x):
+            return ""
+        return f"{int(round(x)):,}"
+
+    def _table_html(label: str, df: pd.DataFrame) -> str:
+        title = f"{label} 순매수금액 Top20 · 기준일 {ref_d}"
+        if df is None or df.empty:
+            return (
+                f"<section><h2>{html.escape(title)}</h2>"
+                "<p style='color:#666;font-size:13px;'>데이터 없음</p></section>"
+            )
+        rows = []
+        for i, r in df.iterrows():
+            nv = r.get("net_val")
+            col = _krx_chg_font_color(nv)  # 양수 빨강
+            rows.append(
+                "<tr>"
+                f"<td style='text-align:center'{_html_sort_num_attr(i + 1)}>{i + 1}</td>"
+                f"<td style='text-align:center'>{html.escape(str(r.get('ticker') or ''))}</td>"
+                f"<td style='text-align:left'>{html.escape(str(r.get('name') or ''))}</td>"
+                f"<td style='text-align:right;color:{col}'{_html_sort_num_attr(nv)}>{_fmt_eok(nv)}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(r.get('net_qty'))}>{_fmt_qty(r.get('net_qty'))}</td>"
+                "</tr>"
+            )
+        return (
+            f"<section><h2>{html.escape(title)}</h2>"
+            "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' "
+            "style='border-collapse:collapse;font-size:12px;width:100%;background:#fff;'>"
+            "<thead><tr>"
+            "<th>순위</th><th>티커</th><th>종목명</th>"
+            "<th>순매수금액(억)</th><th>순매수량</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></section>"
+        )
+
+    sections = []
+    for key, label, codes in _INVESTOR_TOP_GROUPS:
+        use = codes if codes else (key,)
+        try:
+            df = _load_top(use)
+        except Exception as e:
+            if not quiet:
+                print(f"경고: {label} Top 조회 실패 ({e})")
+            df = pd.DataFrame()
+        sections.append(_table_html(label, df))
+
+    html_doc = f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>투자자 순매수 상위 ({ref_d})</title>
+  <style>
+    body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #111; background: #fafafa; }}
+    h1 {{ padding: 16px 20px; margin: 0; font-size: 1.25rem; background: #fff; border-bottom: 1px solid #e0e0e0; }}
+    .note {{ padding: 10px 20px; font-size: 13px; color: #444; background: #fff; border-bottom: 1px solid #eee; line-height: 1.5; }}
+    section {{ padding: 16px 20px 8px; }}
+    section h2 {{ font-size: 1.05rem; margin: 0 0 10px; }}
+  </style>
+</head>
+<body>
+  <h1>투자자별 순매수금액 상위</h1>
+  <div class="note">
+    기준일: <strong>{ref_d}</strong> (<code>krx_investor_trade_krx</code> 최신 <code>date</code>).<br/>
+    순서: 연기금등(6000) → 투신(3000) → 사모(3100) → 금융투자(1000) → 기관합계(7050) → 외국인(9000+9001 합산).<br/>
+    순매수금액(억) = <code>net_val</code>/1e8 (양수 빨강). 전역제외·보통주(이름) 필터 적용.<br/>
+    파일: {html.escape(os.path.basename(out_path))}
+  </div>
+  {"".join(sections)}
+{KRX_SORTABLE_TABLE_CSS_JS}
+</body>
+</html>"""
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html_doc)
+    if not quiet:
+        print(f"완료: 투자자 순매수 HTML 저장: {out_path}")
+    return out_path
+
+
+
 def main():
     engine = _create_engine()
     ticker_list = _load_latest_ticker_list(engine)
@@ -7203,8 +7380,10 @@ def main():
             quiet=False,
             memory_cache=memory_cache,
         )
+        write_investor_net_buy_top_html(engine, quiet=False)
     else:
         print("\n[2/2] 교집합 종목이 없어, 저장된 리포트를 안내합니다.")
+        write_investor_net_buy_top_html(engine, quiet=False)
         _announce_krx_reports_from_disk(len_rs=len(rs_set), len_bo=len(bo_set))
 
 
