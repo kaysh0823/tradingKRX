@@ -179,6 +179,42 @@ _INVESTOR_OSC_COLS = ("inst_net_osc", "frgn_net_osc", "frgn_hold_osc")
 _INVESTOR_OSC_REQUIRED = ("inst_net_osc", "frgn_net_osc")
 
 
+def _csi_grade(last):
+    for col in ("csi", "csi_fast", "csi_slow"):
+        if col not in last.index:
+            return "-"
+    try:
+        csi = float(last["csi"])
+        fast = float(last["csi_fast"])
+        slow = float(last["csi_slow"])
+        if any(np.isnan(v) for v in (csi, fast, slow)):
+            return "-"
+        if csi > fast and csi > slow:
+            return "◎"
+        if csi < fast and csi < slow:
+            return "●"
+        return "○"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _osc_two_day_rise(series):
+    """연속 두 구간 상승(당일>전일>전전일)."""
+    if series is None or len(series) < 3:
+        return "-"
+    try:
+        v0 = float(series.iloc[-1])
+        v1 = float(series.iloc[-2])
+        v2 = float(series.iloc[-3])
+        if any(np.isnan(v) for v in (v0, v1, v2)):
+            return "-"
+        if v0 > v1 and v1 > v2:
+            return "매집"
+        return "-"
+    except Exception:
+        return "-"
+
+
 def _normalize_ticker(ticker=None, ohlcv_df=None):
     if ticker is not None and str(ticker).strip():
         return str(ticker).strip().zfill(6)
@@ -587,7 +623,7 @@ holidays = ['2023-08-15', '2023-09-28', '2023-09-29', '2023-10-02', '2023-10-03'
             '2025-01-01', '2025-01-27', '2025-01-28', '2025-01-29', '2025-01-30', '2025-03-03', '2025-05-01', '2025-05-05', '2025-05-06',
             '2025-06-03', '2025-06-06', '2025-08-15', '2025-10-03', '2025-10-06', '2025-10-07', '2025-10-08', '2025-10-09',
             '2025-12-25', '2025-12-31', '2026-01-01', '2026-02-16', '2026-02-17', '2026-02-18', '2026-03-02', '2026-05-01',
-            '2026-05-05', '2026-05-25', '2026-06-03']
+            '2026-05-05', '2026-05-25', '2026-06-03', '2026-07-17']
 
 
 audit_ticker = ['006620', '001705', '005440', '272210', '298040', '322000', '329180', '375500', '383220', '456010', '460930',
@@ -4007,6 +4043,10 @@ def export_screening_summary_html(
                         "50일신고가": "",
                         "120일신고가": "",
                         "250일신고가": "",
+                        "밴드스퀴즈": "",
+                        "CSI": "",
+                        "기관OSC": "",
+                        "외국인OSC": "",
                         "_sort_sn": scr or "",
                         "_sort_tk": tkz,
                         "_sort_nm": str(name) if name is not None else "",
@@ -4024,6 +4064,10 @@ def export_screening_summary_html(
                         "_sort_50": "",
                         "_sort_120": "",
                         "_sort_250": "",
+                        "_sort_bsq": None,
+                        "_sort_csi": "",
+                        "_sort_inst": "",
+                        "_sort_frgn": "",
                     }
                 )
                 continue
@@ -4046,6 +4090,24 @@ def export_screening_summary_html(
             hi50 = _flag_nd_close_high(idf, 50)
             hi120 = _flag_nd_close_high(idf, 120)
             hi250 = _flag_nd_close_high(idf, 250)
+            idf2, _ = _ensure_investor_osc_on_df(idf, tk)
+            bsq_v = (
+                float(last["band20_q"])
+                if "band20_q" in last.index and pd.notna(last.get("band20_q"))
+                else np.nan
+            )
+            bsq_disp = f"{bsq_v:.2f}" if np.isfinite(bsq_v) else ""
+            csi_disp = _csi_grade(last)
+            inst_osc = (
+                _osc_two_day_rise(idf2["inst_net_osc"])
+                if "inst_net_osc" in idf2.columns
+                else "-"
+            )
+            frgn_osc = (
+                _osc_two_day_rise(idf2["frgn_net_osc"])
+                if "frgn_net_osc" in idf2.columns
+                else "-"
+            )
             rows.append(
                 {
                     "스크리닝명": scr_name,
@@ -4065,6 +4127,10 @@ def export_screening_summary_html(
                     "50일신고가": hi50,
                     "120일신고가": hi120,
                     "250일신고가": hi250,
+                    "밴드스퀴즈": bsq_disp,
+                    "CSI": csi_disp,
+                    "기관OSC": inst_osc,
+                    "외국인OSC": frgn_osc,
                     "_sort_sn": scr_name or "",
                     "_sort_tk": tkz,
                     "_sort_nm": str(name) if name is not None else "",
@@ -4082,6 +4148,10 @@ def export_screening_summary_html(
                     "_sort_50": hi50,
                     "_sort_120": hi120,
                     "_sort_250": hi250,
+                    "_sort_bsq": float(bsq_v) if np.isfinite(bsq_v) else None,
+                    "_sort_csi": csi_disp,
+                    "_sort_inst": inst_osc,
+                    "_sort_frgn": frgn_osc,
                 }
             )
         sum_df = pd.DataFrame(rows)
@@ -4104,6 +4174,10 @@ def export_screening_summary_html(
             "50일신고가",
             "120일신고가",
             "250일신고가",
+            "밴드스퀴즈",
+            "CSI",
+            "기관OSC",
+            "외국인OSC",
         ]
         sort_cols = [
             "_sort_sn",
@@ -4123,6 +4197,10 @@ def export_screening_summary_html(
             "_sort_50",
             "_sort_120",
             "_sort_250",
+            "_sort_bsq",
+            "_sort_csi",
+            "_sort_inst",
+            "_sort_frgn",
         ]
         sort_types = [
             "str",
@@ -4138,6 +4216,10 @@ def export_screening_summary_html(
             "num",
             "num",
             "num",
+            "num",
+            "str",
+            "str",
+            "str",
             "num",
             "str",
             "str",
@@ -4161,6 +4243,10 @@ def export_screening_summary_html(
             "50일 신고가 여부",
             "120일 신고가여부",
             "250일 신고가여부",
+            "밴드스퀴즈",
+            "CSI",
+            "기관OSC",
+            "외국인OSC",
         ]
 
         def _sort_attr(stype, raw):
