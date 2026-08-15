@@ -175,6 +175,8 @@ _INVESTOR_OSC_PERIOD = 20
 _INVESTOR_CUM_DAYS = 5
 _INVESTOR_OSC_SMOOTH = 2
 _INVESTOR_OSC_COLS = ("inst_net_osc", "frgn_net_osc", "frgn_hold_osc")
+# 패널 표시 게이트: 차트에 그리는 두 지표만 요구 (보유율 OSC는 계산만)
+_INVESTOR_OSC_REQUIRED = ("inst_net_osc", "frgn_net_osc")
 
 
 def _normalize_ticker(ticker=None, ohlcv_df=None):
@@ -261,7 +263,7 @@ def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
 def _has_investor_osc_data(df, min_valid=5):
     if df is None or df.empty:
         return False
-    for col in _INVESTOR_OSC_COLS:
+    for col in _INVESTOR_OSC_REQUIRED:
         if col not in df.columns:
             return False
         if pd.Series(df[col]).notna().sum() < min_valid:
