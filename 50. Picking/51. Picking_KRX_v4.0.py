@@ -4338,9 +4338,10 @@ def export_screening_summary_html(
 <title>스크리닝 요약</title>
 <style>
 body {{ margin:16px; font-family:Segoe UI,Malgun Gothic,sans-serif; }}
-table.s {{ border-collapse:collapse; font-size:13px; }}
-table.s th, table.s td {{ border:1px solid #ccc; padding:6px 10px; }}
-table.s th {{ background:#f0f4f8; text-align:center; white-space:nowrap; }}
+table.s {{ border-collapse:collapse; width:100%; table-layout:fixed; font-size:11px; }}
+table.s th, table.s td {{ border:1px solid #ccc; padding:3px 4px; word-break:break-word; overflow-wrap:anywhere; }}
+table.s th {{ background:#f0f4f8; text-align:center; white-space:normal; line-height:1.15; }}
+table.s thead th {{ position:sticky; top:0; z-index:2; box-shadow:inset 0 -1px 0 #ccc; }}
 table.s th.sortable {{ cursor:pointer; user-select:none; }}
 table.s th.sortable:hover {{ background:#dde8f2; }}
 table.s th.sort-asc::after {{ content:" \\25B2"; font-size:0.65em; opacity:0.85; }}
@@ -4351,9 +4352,11 @@ table.s td:nth-child(10),
 table.s td:nth-child(11),
 table.s td:nth-child(12),
 table.s td:nth-child(13),
-table.s td:nth-child(14) {{ text-align:right; }}
+table.s td:nth-child(14),
+table.s td:nth-child(18) {{ text-align:right; }}
 table.s td:nth-child(6), table.s td:nth-child(7), table.s td:nth-child(8),
-table.s td:nth-child(15), table.s td:nth-child(16), table.s td:nth-child(17) {{ text-align:center; }}
+table.s td:nth-child(15), table.s td:nth-child(16), table.s td:nth-child(17),
+table.s td:nth-child(19), table.s td:nth-child(20), table.s td:nth-child(21) {{ text-align:center; }}
 table.s tbody tr:nth-child(even) {{ background:#fafafa; }}
 </style></head><body>
 {body}
