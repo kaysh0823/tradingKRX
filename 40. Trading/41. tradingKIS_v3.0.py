@@ -203,11 +203,48 @@ def _load_investor_trading(engine, ticker):
     try:
         inv = pd.read_sql(query, engine, params={"ticker": t})
     except Exception:
-        return pd.DataFrame()
-    if inv.empty:
-        return inv
-    inv["date"] = pd.to_datetime(inv["date"], errors="coerce")
-    return inv.dropna(subset=["date"]).set_index("date")
+        inv = pd.DataFrame()
+    if inv is not None and not inv.empty:
+        inv["date"] = pd.to_datetime(inv["date"], errors="coerce")
+        inv = inv.dropna(subset=["date"]).set_index("date")
+        inv.index = pd.to_datetime(inv.index, errors="coerce").normalize()
+        inv = inv[~inv.index.isna()]
+    else:
+        inv = pd.DataFrame()
+
+    # 롱: 연기금등(6000)·투신(3000)·사모(3100) → 와이드 컬럼으로 피벗 병합
+    q_long = """
+        SELECT `date`, invst_tp_cd, net_qty
+        FROM krx_investor_trade_krx
+        WHERE ticker = %(ticker)s AND invst_tp_cd IN ('6000','3000','3100')
+        ORDER BY `date`
+    """
+    try:
+        long_df = pd.read_sql(q_long, engine, params={"ticker": t})
+    except Exception:
+        long_df = pd.DataFrame()
+    if long_df is not None and not long_df.empty:
+        long_df["date"] = pd.to_datetime(long_df["date"], errors="coerce")
+        long_df = long_df.dropna(subset=["date"])
+        long_df["net_qty"] = pd.to_numeric(long_df["net_qty"], errors="coerce")
+        long_df["invst_tp_cd"] = long_df["invst_tp_cd"].astype(str)
+        piv = long_df.pivot_table(
+            index="date", columns="invst_tp_cd", values="net_qty", aggfunc="sum"
+        )
+        rename = {
+            "6000": "연기금등_순매매량",
+            "3000": "투신_순매매량",
+            "3100": "사모_순매매량",
+        }
+        piv = piv.rename(columns=rename)
+        keep = [c for c in ("연기금등_순매매량", "투신_순매매량", "사모_순매매량") if c in piv.columns]
+        if keep:
+            piv = piv[keep].copy()
+            piv.index = pd.to_datetime(piv.index, errors="coerce").normalize()
+            piv = piv[~piv.index.isna()]
+            if not inv.empty:
+                inv = inv.join(piv, how="left")
+    return inv
 
 
 def _stochastic_osc(series, period=_INVESTOR_OSC_PERIOD, smooth=_INVESTOR_OSC_SMOOTH):
@@ -231,6 +268,15 @@ def _compute_investor_oscillators(investor_df):
     out["inst_net_osc"] = _stochastic_osc(inst.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
     out["frgn_net_osc"] = _stochastic_osc(frgn.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
     out["frgn_hold_osc"] = _stochastic_osc(hold)
+    if "연기금등_순매매량" in inv.columns:
+        pension = pd.to_numeric(inv["연기금등_순매매량"], errors="coerce").fillna(0)
+        out["pension_net_osc"] = _stochastic_osc(pension.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
+    if "투신_순매매량" in inv.columns:
+        trust = pd.to_numeric(inv["투신_순매매량"], errors="coerce").fillna(0)
+        out["trust_net_osc"] = _stochastic_osc(trust.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
+    if "사모_순매매량" in inv.columns:
+        private = pd.to_numeric(inv["사모_순매매량"], errors="coerce").fillna(0)
+        out["private_net_osc"] = _stochastic_osc(private.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
     return out
 
 
@@ -247,7 +293,9 @@ def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
     d = d[~d.index.isna()]
     inv_cols = (
         "기관_순매매량", "외국인_순매매량", "외국인_보유율",
+        "연기금등_순매매량", "투신_순매매량", "사모_순매매량",
         "inst_net_osc", "frgn_net_osc", "frgn_hold_osc",
+        "pension_net_osc", "trust_net_osc", "private_net_osc",
     )
     if investor_df is None or investor_df.empty:
         for col in inv_cols:
@@ -1433,7 +1481,7 @@ def _csi_grade(last):
 
 
 def _osc_two_day_rise(series):
-    """연속 두 구간 상승(당일>전일>전전일)."""
+    """연속 두 구간 상승=매집, 연속 두 구간 하락=분산."""
     if series is None or len(series) < 3:
         return "-"
     try:
@@ -1444,6 +1492,8 @@ def _osc_two_day_rise(series):
             return "-"
         if v0 > v1 and v1 > v2:
             return "매집"
+        if v0 < v1 and v1 < v2:
+            return "분산"
         return "-"
     except Exception:
         return "-"
@@ -1626,6 +1676,9 @@ def dashboard_column_alignments(columns):
         "MACD히스토",
         "CSI",
         "기관OSC",
+        "국민연금등OSC",
+        "투신OSC",
+        "사모OSC",
         "외국인OSC",
     }
     return ["right" if c in rights else "center" if c in centers else "left" for c in columns]
@@ -1646,6 +1699,8 @@ def _dashboard_cell_sort_key(column, raw):
         return -100.0
     if s == "매집":
         return 50.0
+    if s == "분산":
+        return -50.0
     if s == "O":
         return 1.0
     if s == "X":
@@ -1981,6 +2036,9 @@ def build_position_dashboard_df(
             "밴드스퀴즈": _fmt_float_simple(_f("band20_q", 6), 2),
             "CSI": _csi_grade(last),
             "기관OSC": _osc_two_day_rise(df["inst_net_osc"]) if "inst_net_osc" in df.columns else "-",
+            "국민연금등OSC": _osc_two_day_rise(df["pension_net_osc"]) if "pension_net_osc" in df.columns else "-",
+            "투신OSC": _osc_two_day_rise(df["trust_net_osc"]) if "trust_net_osc" in df.columns else "-",
+            "사모OSC": _osc_two_day_rise(df["private_net_osc"]) if "private_net_osc" in df.columns else "-",
             "외국인OSC": _osc_two_day_rise(df["frgn_net_osc"]) if "frgn_net_osc" in df.columns else "-",
             "당일에너지배율": er_day_s,
             "3일에너지배율": er3_s,

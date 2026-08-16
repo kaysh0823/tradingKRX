@@ -199,7 +199,7 @@ def _csi_grade(last):
 
 
 def _osc_two_day_rise(series):
-    """연속 두 구간 상승(당일>전일>전전일)."""
+    """연속 두 구간 상승=매집, 연속 두 구간 하락=분산."""
     if series is None or len(series) < 3:
         return "-"
     try:
@@ -210,6 +210,8 @@ def _osc_two_day_rise(series):
             return "-"
         if v0 > v1 and v1 > v2:
             return "매집"
+        if v0 < v1 and v1 < v2:
+            return "분산"
         return "-"
     except Exception:
         return "-"
@@ -238,11 +240,48 @@ def _load_investor_trading(engine, ticker):
     try:
         inv = pd.read_sql(query, engine, params={"ticker": t})
     except Exception:
-        return pd.DataFrame()
-    if inv.empty:
-        return inv
-    inv["date"] = pd.to_datetime(inv["date"], errors="coerce")
-    return inv.dropna(subset=["date"]).set_index("date")
+        inv = pd.DataFrame()
+    if inv is not None and not inv.empty:
+        inv["date"] = pd.to_datetime(inv["date"], errors="coerce")
+        inv = inv.dropna(subset=["date"]).set_index("date")
+        inv.index = pd.to_datetime(inv.index, errors="coerce").normalize()
+        inv = inv[~inv.index.isna()]
+    else:
+        inv = pd.DataFrame()
+
+    # 롱: 연기금등(6000)·투신(3000)·사모(3100) → 와이드 컬럼으로 피벗 병합
+    q_long = """
+        SELECT `date`, invst_tp_cd, net_qty
+        FROM krx_investor_trade_krx
+        WHERE ticker = %(ticker)s AND invst_tp_cd IN ('6000','3000','3100')
+        ORDER BY `date`
+    """
+    try:
+        long_df = pd.read_sql(q_long, engine, params={"ticker": t})
+    except Exception:
+        long_df = pd.DataFrame()
+    if long_df is not None and not long_df.empty:
+        long_df["date"] = pd.to_datetime(long_df["date"], errors="coerce")
+        long_df = long_df.dropna(subset=["date"])
+        long_df["net_qty"] = pd.to_numeric(long_df["net_qty"], errors="coerce")
+        long_df["invst_tp_cd"] = long_df["invst_tp_cd"].astype(str)
+        piv = long_df.pivot_table(
+            index="date", columns="invst_tp_cd", values="net_qty", aggfunc="sum"
+        )
+        rename = {
+            "6000": "연기금등_순매매량",
+            "3000": "투신_순매매량",
+            "3100": "사모_순매매량",
+        }
+        piv = piv.rename(columns=rename)
+        keep = [c for c in ("연기금등_순매매량", "투신_순매매량", "사모_순매매량") if c in piv.columns]
+        if keep:
+            piv = piv[keep].copy()
+            piv.index = pd.to_datetime(piv.index, errors="coerce").normalize()
+            piv = piv[~piv.index.isna()]
+            if not inv.empty:
+                inv = inv.join(piv, how="left")
+    return inv
 
 
 def _stochastic_osc(series, period=_INVESTOR_OSC_PERIOD, smooth=_INVESTOR_OSC_SMOOTH):
@@ -266,6 +305,15 @@ def _compute_investor_oscillators(investor_df):
     out["inst_net_osc"] = _stochastic_osc(inst.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
     out["frgn_net_osc"] = _stochastic_osc(frgn.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
     out["frgn_hold_osc"] = _stochastic_osc(hold)
+    if "연기금등_순매매량" in inv.columns:
+        pension = pd.to_numeric(inv["연기금등_순매매량"], errors="coerce").fillna(0)
+        out["pension_net_osc"] = _stochastic_osc(pension.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
+    if "투신_순매매량" in inv.columns:
+        trust = pd.to_numeric(inv["투신_순매매량"], errors="coerce").fillna(0)
+        out["trust_net_osc"] = _stochastic_osc(trust.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
+    if "사모_순매매량" in inv.columns:
+        private = pd.to_numeric(inv["사모_순매매량"], errors="coerce").fillna(0)
+        out["private_net_osc"] = _stochastic_osc(private.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
     return out
 
 
@@ -282,7 +330,9 @@ def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
     d = d[~d.index.isna()]
     inv_cols = (
         "기관_순매매량", "외국인_순매매량", "외국인_보유율",
+        "연기금등_순매매량", "투신_순매매량", "사모_순매매량",
         "inst_net_osc", "frgn_net_osc", "frgn_hold_osc",
+        "pension_net_osc", "trust_net_osc", "private_net_osc",
     )
     if investor_df is None or investor_df.empty:
         for col in inv_cols:
@@ -4046,6 +4096,9 @@ def export_screening_summary_html(
                         "밴드스퀴즈": "",
                         "CSI": "",
                         "기관OSC": "",
+                        "국민연금등OSC": "",
+                        "투신OSC": "",
+                        "사모OSC": "",
                         "외국인OSC": "",
                         "_sort_sn": scr or "",
                         "_sort_tk": tkz,
@@ -4067,6 +4120,9 @@ def export_screening_summary_html(
                         "_sort_bsq": None,
                         "_sort_csi": "",
                         "_sort_inst": "",
+                        "_sort_pension": "",
+                        "_sort_trust": "",
+                        "_sort_private": "",
                         "_sort_frgn": "",
                     }
                 )
@@ -4103,6 +4159,21 @@ def export_screening_summary_html(
                 if "inst_net_osc" in idf2.columns
                 else "-"
             )
+            pension_osc = (
+                _osc_two_day_rise(idf2["pension_net_osc"])
+                if "pension_net_osc" in idf2.columns
+                else "-"
+            )
+            trust_osc = (
+                _osc_two_day_rise(idf2["trust_net_osc"])
+                if "trust_net_osc" in idf2.columns
+                else "-"
+            )
+            private_osc = (
+                _osc_two_day_rise(idf2["private_net_osc"])
+                if "private_net_osc" in idf2.columns
+                else "-"
+            )
             frgn_osc = (
                 _osc_two_day_rise(idf2["frgn_net_osc"])
                 if "frgn_net_osc" in idf2.columns
@@ -4130,6 +4201,9 @@ def export_screening_summary_html(
                     "밴드스퀴즈": bsq_disp,
                     "CSI": csi_disp,
                     "기관OSC": inst_osc,
+                    "국민연금등OSC": pension_osc,
+                    "투신OSC": trust_osc,
+                    "사모OSC": private_osc,
                     "외국인OSC": frgn_osc,
                     "_sort_sn": scr_name or "",
                     "_sort_tk": tkz,
@@ -4151,6 +4225,9 @@ def export_screening_summary_html(
                     "_sort_bsq": float(bsq_v) if np.isfinite(bsq_v) else None,
                     "_sort_csi": csi_disp,
                     "_sort_inst": inst_osc,
+                    "_sort_pension": pension_osc,
+                    "_sort_trust": trust_osc,
+                    "_sort_private": private_osc,
                     "_sort_frgn": frgn_osc,
                 }
             )
@@ -4177,6 +4254,9 @@ def export_screening_summary_html(
             "밴드스퀴즈",
             "CSI",
             "기관OSC",
+            "국민연금등OSC",
+            "투신OSC",
+            "사모OSC",
             "외국인OSC",
         ]
         sort_cols = [
@@ -4200,6 +4280,9 @@ def export_screening_summary_html(
             "_sort_bsq",
             "_sort_csi",
             "_sort_inst",
+            "_sort_pension",
+            "_sort_trust",
+            "_sort_private",
             "_sort_frgn",
         ]
         sort_types = [
@@ -4221,6 +4304,9 @@ def export_screening_summary_html(
             "str",
             "str",
             "num",
+            "str",
+            "str",
+            "str",
             "str",
             "str",
             "str",
@@ -4246,6 +4332,9 @@ def export_screening_summary_html(
             "밴드스퀴즈",
             "CSI",
             "기관OSC",
+            "국민연금등OSC",
+            "투신OSC",
+            "사모OSC",
             "외국인OSC",
         ]
 
@@ -4356,7 +4445,8 @@ table.s td:nth-child(14),
 table.s td:nth-child(18) {{ text-align:right; }}
 table.s td:nth-child(6), table.s td:nth-child(7), table.s td:nth-child(8),
 table.s td:nth-child(15), table.s td:nth-child(16), table.s td:nth-child(17),
-table.s td:nth-child(19), table.s td:nth-child(20), table.s td:nth-child(21) {{ text-align:center; }}
+table.s td:nth-child(19), table.s td:nth-child(20), table.s td:nth-child(21),
+table.s td:nth-child(22), table.s td:nth-child(23), table.s td:nth-child(24) {{ text-align:center; }}
 table.s tbody tr:nth-child(even) {{ background:#fafafa; }}
 </style></head><body>
 {body}
