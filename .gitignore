@@ -8,5 +8,6 @@ venv/
 .env
 *.log
 naverPub/
+50. Picking/cache/
 
 # archive/ 는 구버전 추적 유지 — ignore 하지 않음 (archive/README.md)
