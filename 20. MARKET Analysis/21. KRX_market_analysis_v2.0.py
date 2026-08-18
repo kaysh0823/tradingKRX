@@ -7188,7 +7188,7 @@ _INVESTOR_TOP_GROUPS = [
     ("3100", "사모", None),
     ("1000", "금융투자", None),
     ("7050", "기관합계", None),
-    ("FOREIGN", "외국인", ("9000", "9001")),
+    ("FOREIGN", "외국인", ("9000",)),      # 기존 ("9000","9001") → 9001 제외
 ]
 
 
@@ -7199,7 +7199,7 @@ def write_investor_net_buy_top_html(
 ) -> str | None:
     """
     기준일(최신) 투자자구분별 순매수금액(net_val) Top20 → 투자자_순매수상위.html.
-    외국인 = 9000+9001 종목별 합산. 전역제외·보통주(이름) 필터.
+    외국인=9000(기타외국인 9001 제외). 전역제외·보통주(이름) 필터.
     당일표: 당일상승률·5거래일·RS점수. 각 그룹 아래 최근 20거래일 일별 Top20 추이.
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
@@ -7619,7 +7619,7 @@ def write_investor_net_buy_top_html(
   <h1>투자자별 순매수금액 상위</h1>
   <div class="note">
     기준일: <strong>{ref_d}</strong> (<code>krx_investor_trade_krx</code> 최신 <code>date</code>).<br/>
-    순서: 연기금등(6000) → 투신(3000) → 사모(3100) → 금융투자(1000) → 기관합계(7050) → 외국인(9000+9001 합산).<br/>
+    순서: 연기금등(6000) → 투신(3000) → 사모(3100) → 금융투자(1000) → 기관합계(7050) → 외국인=9000(기타외국인 9001 제외).<br/>
     순매수금액(억) = <code>net_val</code>/1e8 (양수 빨강). 전역제외·보통주(이름) 필터 적용.<br/>
     <strong>당일상승률</strong>: 기준일 종가 ÷ 전거래일 종가 − 1.
     <strong>5거래일</strong>: 기준일 종가 ÷ 5거래일 전 종가 − 1.

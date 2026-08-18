@@ -129,8 +129,12 @@ from indicators_core import (
     bollinger_band_width,
     bollinger_band_width_q,
     energy_ratio,
+    investor_osc_frame,
     rs_avg,
     talent_up_share,
+    INVESTOR_FOREIGN_CODES,
+    INVESTOR_INST_CODES,
+    INVESTOR_OSC_CUM_DAYS,
 )
 
 
@@ -170,13 +174,17 @@ CHART_PERIOD_DAYS = 252
 # CSI (Pine Script: close loc length)
 _CSI_LENGTH = 20
 
-# --- 투자자 OSC (krx_investor_trading) ---
-_INVESTOR_OSC_PERIOD = 20
-_INVESTOR_CUM_DAYS = 5
-_INVESTOR_OSC_SMOOTH = 2
-_INVESTOR_OSC_COLS = ("inst_net_osc", "frgn_net_osc", "frgn_hold_osc")
-# 패널 표시 게이트: 차트에 그리는 두 지표만 요구 (보유율 OSC는 계산만)
-_INVESTOR_OSC_REQUIRED = ("inst_net_osc", "frgn_net_osc")
+# --- 투자자 OSC (krx_investor_trade_krx net_val, indicators_core 정본, 누적 INVESTOR_OSC_CUM_DAYS일) ---
+_INVESTOR_OSC_COLS = ("inst_net_osc", "frgn_net_osc")
+_INVESTOR_OSC_REQUIRED = _INVESTOR_OSC_COLS
+# 기관OSC = 연기금+투신+사모 (7050 합계 아님). 외국인OSC = 9000.
+_INVESTOR_OSC_GROUPS = {
+    "inst_net_osc": INVESTOR_INST_CODES,
+    "frgn_net_osc": INVESTOR_FOREIGN_CODES,
+    "pension_net_osc": ("6000",),
+    "trust_net_osc": ("3000",),
+    "private_net_osc": ("3100",),
+}
 
 
 def _csi_grade(last):
@@ -228,96 +236,30 @@ def _normalize_ticker(ticker=None, ohlcv_df=None):
 
 
 def _load_investor_trading(engine, ticker):
+    """krx_investor_trade_krx 롱 테이블에서 금액(net_val) 시계열을 로드."""
     if engine is None or ticker is None:
         return pd.DataFrame()
     t = str(ticker).strip().zfill(6)
     query = """
-        SELECT date, `기관_순매매량`, `외국인_순매매량`, `외국인_보유율`
-        FROM krx_investor_trading
-        WHERE ticker = %(ticker)s
-        ORDER BY date
-    """
-    try:
-        inv = pd.read_sql(query, engine, params={"ticker": t})
-    except Exception:
-        inv = pd.DataFrame()
-    if inv is not None and not inv.empty:
-        inv["date"] = pd.to_datetime(inv["date"], errors="coerce")
-        inv = inv.dropna(subset=["date"]).set_index("date")
-        inv.index = pd.to_datetime(inv.index, errors="coerce").normalize()
-        inv = inv[~inv.index.isna()]
-    else:
-        inv = pd.DataFrame()
-
-    # 롱: 연기금등(6000)·투신(3000)·사모(3100) → 와이드 컬럼으로 피벗 병합
-    q_long = """
-        SELECT `date`, invst_tp_cd, net_qty
+        SELECT `date`, invst_tp_cd, net_val
         FROM krx_investor_trade_krx
-        WHERE ticker = %(ticker)s AND invst_tp_cd IN ('6000','3000','3100')
+        WHERE ticker = %(ticker)s AND invst_tp_cd IN ('6000','3000','3100','9000')
         ORDER BY `date`
     """
     try:
-        long_df = pd.read_sql(q_long, engine, params={"ticker": t})
+        df = pd.read_sql(query, engine, params={"ticker": t})
     except Exception:
-        long_df = pd.DataFrame()
-    if long_df is not None and not long_df.empty:
-        long_df["date"] = pd.to_datetime(long_df["date"], errors="coerce")
-        long_df = long_df.dropna(subset=["date"])
-        long_df["net_qty"] = pd.to_numeric(long_df["net_qty"], errors="coerce")
-        long_df["invst_tp_cd"] = long_df["invst_tp_cd"].astype(str)
-        piv = long_df.pivot_table(
-            index="date", columns="invst_tp_cd", values="net_qty", aggfunc="sum"
-        )
-        rename = {
-            "6000": "연기금등_순매매량",
-            "3000": "투신_순매매량",
-            "3100": "사모_순매매량",
-        }
-        piv = piv.rename(columns=rename)
-        keep = [c for c in ("연기금등_순매매량", "투신_순매매량", "사모_순매매량") if c in piv.columns]
-        if keep:
-            piv = piv[keep].copy()
-            piv.index = pd.to_datetime(piv.index, errors="coerce").normalize()
-            piv = piv[~piv.index.isna()]
-            if not inv.empty:
-                inv = inv.join(piv, how="left")
-    return inv
-
-
-def _stochastic_osc(series, period=_INVESTOR_OSC_PERIOD, smooth=_INVESTOR_OSC_SMOOTH):
-    s = pd.to_numeric(series, errors="coerce")
-    lo = s.rolling(period, min_periods=period).min()
-    hi = s.rolling(period, min_periods=period).max()
-    raw = 100 * (s - lo) / (hi - lo).replace(0, np.nan)
-    return raw.ewm(span=smooth, adjust=False).mean().clip(0, 100)
-
-
-def _compute_investor_oscillators(investor_df):
-    if investor_df is None or investor_df.empty:
         return pd.DataFrame()
-    inv = investor_df.copy()
-    inv.index = pd.to_datetime(inv.index, errors="coerce").normalize()
-    inv = inv[~inv.index.isna()].sort_index()
-    inst = pd.to_numeric(inv.get("기관_순매매량"), errors="coerce").fillna(0)
-    frgn = pd.to_numeric(inv.get("외국인_순매매량"), errors="coerce").fillna(0)
-    hold = pd.to_numeric(inv.get("외국인_보유율"), errors="coerce")
-    out = inv.copy()
-    out["inst_net_osc"] = _stochastic_osc(inst.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
-    out["frgn_net_osc"] = _stochastic_osc(frgn.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
-    out["frgn_hold_osc"] = _stochastic_osc(hold)
-    if "연기금등_순매매량" in inv.columns:
-        pension = pd.to_numeric(inv["연기금등_순매매량"], errors="coerce").fillna(0)
-        out["pension_net_osc"] = _stochastic_osc(pension.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
-    if "투신_순매매량" in inv.columns:
-        trust = pd.to_numeric(inv["투신_순매매량"], errors="coerce").fillna(0)
-        out["trust_net_osc"] = _stochastic_osc(trust.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
-    if "사모_순매매량" in inv.columns:
-        private = pd.to_numeric(inv["사모_순매매량"], errors="coerce").fillna(0)
-        out["private_net_osc"] = _stochastic_osc(private.rolling(_INVESTOR_CUM_DAYS, min_periods=1).sum())
-    return out
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["invst_tp_cd"] = df["invst_tp_cd"].astype(str).str.strip()
+    df["net_val"] = pd.to_numeric(df["net_val"], errors="coerce")
+    return df.dropna(subset=["date"])
 
 
 def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
+    """investor_osc_frame 결과(inst_net_osc, frgn_net_osc 등)를 날짜 기준 join."""
     if ohlcv_df is None or ohlcv_df.empty:
         return ohlcv_df
     t = _normalize_ticker(ticker, ohlcv_df)
@@ -328,22 +270,32 @@ def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
         d = d.set_index("date")
     d.index = pd.to_datetime(d.index, errors="coerce").normalize()
     d = d[~d.index.isna()]
-    inv_cols = (
-        "기관_순매매량", "외국인_순매매량", "외국인_보유율",
-        "연기금등_순매매량", "투신_순매매량", "사모_순매매량",
-        "inst_net_osc", "frgn_net_osc", "frgn_hold_osc",
-        "pension_net_osc", "trust_net_osc", "private_net_osc",
-    )
+    osc_cols = tuple(_INVESTOR_OSC_GROUPS.keys())
     if investor_df is None or investor_df.empty:
-        for col in inv_cols:
+        for col in osc_cols:
             d[col] = np.nan
         return d
-    inv = _compute_investor_oscillators(investor_df)
-    merged = d.join(inv, how="left")
-    for col in inv_cols:
-        if col in merged.columns:
-            d[col] = merged[col]
-    return d
+    osc = investor_osc_frame(investor_df, groups=_INVESTOR_OSC_GROUPS)
+    if osc is None or osc.empty:
+        for col in osc_cols:
+            d[col] = np.nan
+        return d
+    osc = osc.copy()
+    osc.index = pd.to_datetime(osc.index, errors="coerce").normalize()
+    osc = osc[~osc.index.isna()]
+    left = d.reset_index()
+    if left.columns[0] != "date":
+        left = left.rename(columns={left.columns[0]: "date"})
+    left["date"] = pd.to_datetime(left["date"], errors="coerce").normalize()
+    osc_reset = osc.reset_index()
+    if osc_reset.columns[0] != "date":
+        osc_reset = osc_reset.rename(columns={osc_reset.columns[0]: "date"})
+    osc_reset["date"] = pd.to_datetime(osc_reset["date"], errors="coerce").normalize()
+    for col in osc_cols:
+        if col in left.columns:
+            left = left.drop(columns=[col])
+    merged = left.merge(osc_reset, on="date", how="left")
+    return merged.set_index("date")
 
 
 def _has_investor_osc_data(df, min_valid=5):
@@ -3267,11 +3219,11 @@ def gen_chart(df, typeP, sector_df, rs_df, period, money, risk, save_jpeg=False,
         try:
             investor_graphs = [
                 go.Scatter(
-                    x=df.index, y=df["inst_net_osc"], name="기관순매수 OSC",
+                    x=df.index, y=df["inst_net_osc"], name="기관(연기금+투신+사모) 순매수금액 OSC",
                     line=dict(color="#2E86DE", width=1.8),
                 ),
                 go.Scatter(
-                    x=df.index, y=df["frgn_net_osc"], name="외국인순매수 OSC",
+                    x=df.index, y=df["frgn_net_osc"], name="외국인(9000) 순매수금액 OSC",
                     line=dict(color="#E74C3C", width=1.8),
                 ),
             ]
@@ -4351,6 +4303,11 @@ def export_screening_summary_html(
             10: "최근 120거래일 중 종가가 시가 대비 +10% 이상 상승한 날의 비중(%)",
             12: "전체 보통주 시가총액 합 대비 해당 종목 시가총액 비중(%)",
             13: "전체 보통주 당일 거래대금 합 대비 해당 종목 거래대금 비중(%)",
+            19: "기관(연기금+투신+사모) 순매수금액 OSC. 기관합계(7050)가 아님.",
+            20: "국민연금등(6000) 순매수금액 OSC",
+            21: "투신(3000) 순매수금액 OSC",
+            22: "사모(3100) 순매수금액 OSC",
+            23: "외국인(9000) 순매수금액 OSC",
         }
         ths = "".join(
             f'<th class="sortable" data-col="{i}" title="{html_module.escape(th_titles.get(i, "클릭: 정렬"))}">'
@@ -4415,7 +4372,9 @@ def export_screening_summary_html(
 """
         body = f"""
 <h2 style="font-family:Segoe UI,Malgun Gothic,sans-serif">스크리닝 요약 ({html_module.escape(folder_name)})</h2>
-<p style="font-family:Segoe UI,Malgun Gothic,sans-serif">행 수: {n_rows}</p>
+<p style="font-family:Segoe UI,Malgun Gothic,sans-serif">행 수: {n_rows}.
+기관OSC는 연기금+투신+사모 순매수금액 OSC(누적 {INVESTOR_OSC_CUM_DAYS}일)이며 기관합계(7050)가 아닙니다.
+외국인OSC는 9000 순매수금액 OSC입니다.</p>
 <table id="summaryTable" class="s">
 <thead><tr>{ths}</tr></thead>
 <tbody>{"".join(trs)}</tbody>

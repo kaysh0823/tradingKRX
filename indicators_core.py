@@ -12,11 +12,13 @@
 - Talent = 전일종가 대비 일간등락률 ≥ +10% 일수 비중을 20/50/120에 0.5/0.3/0.2 가중합성
 - Band Width raw = (BB상단−하단)/중심 = (2·nσ·std)/SMA (window=20, nσ=2, std ddof=1)
 - Band Width q = (raw − rollmin(raw,125)) / (rollmax − rollmin)  → 0~1
+- 투자자 OSC = 5일 누적 net_val의 stochastic(20, smooth=2).
+  기관=6000+3000+3100 (7050 아님), 외국인=9000 단독 (9001 제외)
 """
 from __future__ import annotations
 
 import re
-from typing import Optional, Sequence, Union
+from typing import Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,12 @@ RS_AVG_COLS_D = ("rs_20d", "rs_50d", "rs_120d", "rs_200d")
 # 가중평균 정본 (합=1). 키는 기간 정규화명; frame 컬럼 rs_20 / rs_20d 모두 매핑.
 RS_AVG_WEIGHTS = {"rs_20": 0.1, "rs_50": 0.2, "rs_120": 0.3, "rs_200": 0.4}
 _RS_PERIODS_DESC = (200, 120, 50, 20)  # 매칭 시 긴 기간 우선(200 ⊃ 20 방지)
+
+INVESTOR_OSC_PERIOD = 20
+INVESTOR_OSC_CUM_DAYS = 5  # 누적일 5일 통일 (수량 차트 10일 → 금액 OSC 5일)
+INVESTOR_OSC_SMOOTH = 2
+INVESTOR_INST_CODES = ("6000", "3000", "3100")  # 기관 = 연기금등+투신+사모 (7050 아님)
+INVESTOR_FOREIGN_CODES = ("9000",)  # 외국인 = 9000 단독 (기타외국인 9001 제외)
 
 
 def true_range(
@@ -359,3 +367,81 @@ def bollinger_band_width_q(
     rmax = raw.rolling(lb, min_periods=lb).max()
     denom = (rmax - rmin).replace(0, np.nan)
     return (raw - rmin) / denom
+
+
+def stochastic_osc(
+    series: pd.Series,
+    period: int = INVESTOR_OSC_PERIOD,
+    smooth: int = INVESTOR_OSC_SMOOTH,
+) -> pd.Series:
+    """
+    Stochastic oscillator 0~100.
+
+    lo=rolling(period).min(), hi=rolling(period).max()
+    raw = 100*(s-lo)/(hi-lo)  ((hi-lo)==0 → NaN)
+    return EMA(raw, span=smooth).clip(0,100)
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    n = int(period)
+    lo = s.rolling(n, min_periods=n).min()
+    hi = s.rolling(n, min_periods=n).max()
+    raw = 100.0 * (s - lo) / (hi - lo).replace(0, np.nan)
+    return raw.ewm(span=int(smooth), adjust=False).mean().clip(0, 100)
+
+
+def investor_net_osc(
+    net_val_series: pd.Series,
+    cum_days: int = INVESTOR_OSC_CUM_DAYS,
+    period: int = INVESTOR_OSC_PERIOD,
+    smooth: int = INVESTOR_OSC_SMOOTH,
+) -> pd.Series:
+    """결측 0 채움 → rolling(cum_days, min_periods=1).sum() → stochastic_osc. 금액(net_val)."""
+    s = pd.to_numeric(net_val_series, errors="coerce").fillna(0)
+    cum = s.rolling(int(cum_days), min_periods=1).sum()
+    return stochastic_osc(cum, period=period, smooth=smooth)
+
+
+def investor_osc_frame(
+    long_df: pd.DataFrame,
+    groups: Optional[Mapping[str, Sequence[str]]] = None,
+) -> pd.DataFrame:
+    """
+    투자자 롱테이블 → 일자 인덱스 OSC.
+
+    long_df 컬럼: [date, invst_tp_cd, net_val]  (금액 기준. net_qty 사용 금지)
+    groups 기본: inst_net_osc=6000+3000+3100, frgn_net_osc=9000
+    """
+    if groups is None:
+        groups = {
+            "inst_net_osc": INVESTOR_INST_CODES,
+            "frgn_net_osc": INVESTOR_FOREIGN_CODES,
+        }
+    cols = list(groups.keys())
+    if long_df is None or getattr(long_df, "empty", True):
+        return pd.DataFrame(columns=cols)
+    df = long_df.copy()
+    if "date" not in df.columns or "invst_tp_cd" not in df.columns or "net_val" not in df.columns:
+        raise ValueError("long_df must have columns: date, invst_tp_cd, net_val")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df["invst_tp_cd"] = df["invst_tp_cd"].astype(str).str.strip()
+    df["net_val"] = pd.to_numeric(df["net_val"], errors="coerce")
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    piv = df.pivot_table(
+        index="date",
+        columns="invst_tp_cd",
+        values="net_val",
+        aggfunc="sum",
+    )
+    piv.index = pd.to_datetime(piv.index, errors="coerce").normalize()
+    piv = piv[~piv.index.isna()].sort_index()
+    out = pd.DataFrame(index=piv.index)
+    for name, codes in groups.items():
+        code_list = [str(c).strip() for c in codes]
+        net = None
+        for c in code_list:
+            part = pd.to_numeric(piv[c], errors="coerce") if c in piv.columns else pd.Series(0.0, index=piv.index)
+            net = part if net is None else net.add(part, fill_value=0)
+        out[name] = investor_net_osc(net if net is not None else pd.Series(0.0, index=piv.index))
+    return out[cols]
