@@ -12,6 +12,8 @@
 - Talent = 전일종가 대비 일간등락률 ≥ +10% 일수 비중을 20/50/120에 0.5/0.3/0.2 가중합성
 - Band Width raw = (BB상단−하단)/중심 = (2·nσ·std)/SMA (window=20, nσ=2, std ddof=1)
 - Band Width q = (raw − rollmin(raw,125)) / (rollmax − rollmin)  → 0~1
+- 주가위치 = (종가 − N일 종가최저)/(N일 종가최고 − 최저), 전 구간 종가 기준.
+  고가·저가 기준 사용 금지. 대표 창=120, 표시 창=(20,50,120).
 - 투자자 OSC = 5일 누적 net_val의 stochastic(20, smooth=2).
   기관=6000+3000+3100 (7050 아님), 외국인=9000 단독 (9001 제외)
 """
@@ -29,6 +31,9 @@ ENERGY_DIR_K = 15.0
 TALENT_UP = 0.10
 TALENT_WINDOWS = (20, 50, 120)
 TALENT_WEIGHTS = (0.5, 0.3, 0.2)
+# 주가위치 정본: 전 구간 종가 기준 (고가·저가 금지)
+PRICE_POS_WINDOW = 120  # 정렬·대표 지표
+PRICE_POS_WINDOWS = (20, 50, 120)  # 표시 대상 창
 RS_AVG_COLS = ("rs_20", "rs_50", "rs_120", "rs_200")
 RS_AVG_COLS_D = ("rs_20d", "rs_50d", "rs_120d", "rs_200d")
 # 가중평균 정본 (합=1). 키는 기간 정규화명; frame 컬럼 rs_20 / rs_20d 모두 매핑.
@@ -329,6 +334,48 @@ def talent_score(
             }
         )
     return out
+
+
+def price_position(close: ArrayLike, window: int) -> float:
+    """
+    주가위치 = (종가 − N일 종가최저)/(N일 종가최고 − 최저), 전 구간 종가 기준.
+    고가·저가 기준 사용 금지.
+
+    최근 window 구간 종가의 hi=max, lo=min, pos=(last−lo)/(hi−lo).
+    분모<=0 · 결측 · 길이 < window → NaN. 결과는 [0,1] clip.
+    """
+    s = pd.to_numeric(pd.Series(close), errors="coerce")
+    w = int(window)
+    if w <= 0 or len(s) < w:
+        return float("nan")
+    win = s.iloc[-w:]
+    if int(win.notna().sum()) < w:
+        return float("nan")
+    try:
+        cur = float(win.iloc[-1])
+        hi = float(win.max())
+        lo = float(win.min())
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(cur) and np.isfinite(hi) and np.isfinite(lo)):
+        return float("nan")
+    denom = hi - lo
+    if denom <= 0:
+        return float("nan")
+    return float(np.clip((cur - lo) / denom, 0.0, 1.0))
+
+
+def price_positions(
+    close: ArrayLike,
+    windows: Sequence[int] = PRICE_POS_WINDOWS,
+) -> dict:
+    """
+    복수 창 주가위치. 반환: {f"pos_{w}": price_position(close, w) for w in windows}.
+
+    주가위치 = (종가 − N일 종가최저)/(N일 종가최고 − 최저), 전 구간 종가 기준.
+    고가·저가 기준 사용 금지.
+    """
+    return {f"pos_{int(w)}": price_position(close, int(w)) for w in windows}
 
 
 def bollinger_band_width(

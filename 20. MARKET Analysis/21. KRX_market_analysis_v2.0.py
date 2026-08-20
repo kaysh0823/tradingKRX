@@ -116,7 +116,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from env_config import load_project_env, require_env, db_url, db_connect_kwargs
 load_project_env()
-from indicators_core import atr_wilder, energy_ratio, rs_avg, talent_up_count
+from indicators_core import atr_wilder, energy_ratio, price_positions, rs_avg, talent_up_count
 from exclusions import drop_excluded, filter_common_stock_df, filter_tickers
 
 #!/usr/bin/env python
@@ -3958,32 +3958,6 @@ def _calc_pct_b_last(df: pd.DataFrame, timeperiod: int = 20) -> float | None:
 
 
 
-def _price_position_close(close, windows=(20, 50, 120)) -> dict:
-    """주가위치_N = (종가 − N일 종가최저)/(N일 종가최고 − 최저), clip [0,1]. 종가 기준."""
-    s = pd.to_numeric(close, errors="coerce")
-    out = {int(w): np.nan for w in windows}
-    if s is None or len(s) == 0:
-        return out
-    try:
-        cur = float(s.iloc[-1])
-    except Exception:
-        return out
-    if not np.isfinite(cur):
-        return out
-    for w in windows:
-        w = int(w)
-        if len(s) < w:
-            continue
-        win = s.iloc[-w:]
-        hi = float(pd.to_numeric(win, errors="coerce").max())
-        lo = float(pd.to_numeric(win, errors="coerce").min())
-        denom = hi - lo
-        if not (np.isfinite(hi) and np.isfinite(lo) and denom > 0):
-            continue
-        out[w] = float(np.clip((cur - lo) / denom, 0.0, 1.0))
-    return out
-
-
 def _calc_ohlcv_chg_and_elapsed(df: pd.DataFrame) -> dict:
     """당일·3거래일 전 대비 등락률(%), 현재가, %b, 이전 신고가 경과일수."""
     out = {
@@ -4286,7 +4260,7 @@ def write_volatility_spread_top100_html(
             th = th[:95] + "…"
         tk = str(ticker)
         market = "KOSPI" if tk in kospi_tv_set else ("KOSDAQ" if tk in kosdaq_tv_set else "")
-        _pp = _price_position_close(df["close"], windows=(20, 50, 120)) if "close" in df.columns else {}
+        _pp = price_positions(df["close"]) if "close" in df.columns else {}
         rows.append(
             {
                 "ticker": tk,
@@ -4296,9 +4270,9 @@ def write_volatility_spread_top100_html(
                 "rs_rank": rs_rank_map.get(tk),
                 "rs_score": rs_score_map.get(tk),
                 "tv_rank": rank_map.get(tk),
-                "pos_20": _pp.get(20, np.nan),
-                "pos_50": _pp.get(50, np.nan),
-                "pos_120": _pp.get(120, np.nan),
+                "pos_20": _pp.get("pos_20", np.nan),
+                "pos_50": _pp.get("pos_50", np.nan),
+                "pos_120": _pp.get("pos_120", np.nan),
                 "current_price": extra["current_price"],
                 "pct_b": extra["pct_b"],
                 "chg_1d_pct": extra["chg_1d_pct"],
@@ -6481,10 +6455,10 @@ def run_market_dashboard(
                     _pos50_vals.append(np.nan)
                     _pos120_vals.append(np.nan)
                     continue
-                _pp = _price_position_close(_odf["close"], windows=(20, 50, 120))
-                _pos20_vals.append(_pp.get(20, np.nan))
-                _pos50_vals.append(_pp.get(50, np.nan))
-                _pos120_vals.append(_pp.get(120, np.nan))
+                _pp = price_positions(_odf["close"])
+                _pos20_vals.append(_pp.get("pos_20", np.nan))
+                _pos50_vals.append(_pp.get("pos_50", np.nan))
+                _pos120_vals.append(_pp.get("pos_120", np.nan))
             df["pos_20"] = _pos20_vals
             df["pos_50"] = _pos50_vals
             df["pos_120"] = _pos120_vals
@@ -6783,7 +6757,12 @@ def run_market_dashboard(
             _odf = ohlcv_data.get(str(_tk_pos)) if isinstance(ohlcv_data, dict) else None
             if _odf is None or getattr(_odf, "empty", True) or "close" not in getattr(_odf, "columns", []):
                 continue
-            _er_pos[str(_tk_pos)] = _price_position_close(_odf["close"], windows=(20, 50, 120))
+            _pp = price_positions(_odf["close"])
+            _er_pos[str(_tk_pos)] = {
+                20: _pp.get("pos_20", np.nan),
+                50: _pp.get("pos_50", np.nan),
+                120: _pp.get("pos_120", np.nan),
+            }
         div_tbl_energy_k = _mj_html_energy_top50_by_market(
             df_k,
             market_label="코스피",

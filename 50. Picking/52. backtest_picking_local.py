@@ -143,7 +143,7 @@ from env_config import load_project_env, db_url, db_connect_kwargs  # noqa: E402
 load_project_env()
 
 from exclusions import filter_common_stock_df, filter_tickers  # noqa: E402
-from indicators_core import rs_avg, talent_up_share  # noqa: E402
+from indicators_core import PRICE_POS_WINDOW, price_position, rs_avg, talent_up_share  # noqa: E402
 
 log = logging.getLogger("backtest_picking_local")
 
@@ -185,7 +185,6 @@ WEIGHT_SETS: dict[str, dict[str, float]] = {
 DIAG_FACTORS = ("tv5_turn",)
 
 MARKETS = ("KOSPI", "KOSDAQ")
-PRICE_POS_WINDOW = 120
 HOLDING_DAYS = SHORT_HOLDING_DAYS
 WEIGHT_STEP = 0.1
 WARMUP_DAYS = max(PRICE_POS_WINDOW + 10, 130)
@@ -201,7 +200,7 @@ SIZE_NEUTRAL_CSV = Path(__file__).resolve().parent / "decile_size_neutral_tv5.cs
 RUN_MODE = "both"
 PANEL_CACHE_DIR = Path(__file__).resolve().parent / "cache"
 # 지표·유니버스 정의 변경 시 값을 올리거나 FORCE_REBUILD_PANEL_CACHE=True로 재생성.
-PANEL_CACHE_VERSION = "rank_ic_v4_short"
+PANEL_CACHE_VERSION = "rank_ic_v5_pos_close"
 FORCE_REBUILD_PANEL_CACHE = False
 N_DECILES = 10
 N_MCAP_TERCILES = 3
@@ -638,7 +637,6 @@ def build_factor_panel_local(
         universe["RS"] = np.nan
 
     u_hist = hist[hist["ticker"].isin(universe_tickers)].copy()
-    win120_dates = set(dates[-PRICE_POS_WINDOW:]) if len(dates) >= PRICE_POS_WINDOW else set()
     pos_map: dict[str, float] = {}
     talent_map: dict[str, float] = {}
     for tk, g in u_hist.groupby("ticker"):
@@ -647,18 +645,9 @@ def build_factor_panel_local(
             continue
         close = pd.to_numeric(g["close"], errors="coerce")
         talent_map[tk] = float(talent_up_share(close, 120))
-
-        if not win120_dates:
-            continue
-        win = g[g["date"].isin(win120_dates)]
-        if len(win) < PRICE_POS_WINDOW:
-            continue
-        cur = float(g["close"].iloc[-1])
-        hi = float(win["high"].max())
-        lo = float(win["low"].min())
-        denom = hi - lo
-        if np.isfinite(cur) and np.isfinite(hi) and np.isfinite(lo) and denom > 0:
-            pos_map[tk] = float(np.clip((cur - lo) / denom, 0.0, 1.0))
+        p = price_position(close, PRICE_POS_WINDOW)
+        if np.isfinite(p):
+            pos_map[tk] = float(p)
 
     universe["주가위치"] = universe["ticker"].map(pos_map)
     universe["talent"] = universe["ticker"].map(talent_map)
