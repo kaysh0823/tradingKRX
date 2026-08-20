@@ -160,6 +160,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 money = 100000000
 risk = 0.005
 
+# 스크리닝·요약표 표시 유니버스 시총 하한 (naverPub / 21 리포트 표시와 동일)
+DISPLAY_MCAP_MIN = 300_000_000_000  # 3,000억
+
 # 성능 최적화 설정
 MAX_WORKERS_DATA_LOAD = 10  # 데이터 로딩용 워커 수
 MAX_WORKERS_INDICATORS = 8  # 지표 계산용 워커 수
@@ -955,7 +958,7 @@ def run_screening(indicators_data, volume_data, rs_df, ticker_list, audit_ticker
             except Exception:
                 pass
 
-        if len(i) >= 120 and i.iloc[-1].open > 0 and ticker_list.loc[_tk]['시가총액'] > 200000000000\
+        if len(i) >= 120 and i.iloc[-1].open > 0 and ticker_list.loc[_tk]['시가총액'] >= DISPLAY_MCAP_MIN\
             and _tk not in audit_ticker:
                 debug_counts['passed_basic_filter'] += 1
                 ticker = i.iloc[0].ticker
@@ -4016,6 +4019,9 @@ def export_screening_summary_html(
             name = r.get("company", "")
             th = theme_map.get(tkz, "")
             mc_raw = mcap_map.get(tkz, np.nan)
+            # 표시: 시총 ≥ DISPLAY_MCAP_MIN (스크리닝 유니버스와 동일)
+            if not (np.isfinite(mc_raw) and float(mc_raw) >= DISPLAY_MCAP_MIN):
+                continue
             ms_raw = mcap_share_map.get(tkz, np.nan)
             vs_raw = tv_share_map.get(tkz, np.nan)
             mcap_disp = f"{mc_raw:,.0f}" if np.isfinite(mc_raw) and mc_raw > 0 else ""
@@ -4373,6 +4379,7 @@ def export_screening_summary_html(
         body = f"""
 <h2 style="font-family:Segoe UI,Malgun Gothic,sans-serif">스크리닝 요약 ({html_module.escape(folder_name)})</h2>
 <p style="font-family:Segoe UI,Malgun Gothic,sans-serif">행 수: {n_rows}.
+표시: 시총 3,000억 이상 (스크리닝 유니버스와 동일).
 기관OSC는 연기금+투신+사모 순매수금액 OSC(누적 {INVESTOR_OSC_CUM_DAYS}일)이며 기관합계(7050)가 아닙니다.
 외국인OSC는 9000 순매수금액 OSC입니다.</p>
 <table id="summaryTable" class="s">

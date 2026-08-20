@@ -171,6 +171,19 @@ except Exception:
 DEFAULT_DB_URL = db_url()
 DEFAULT_OUTPUT_BASE_DIR = r"C:\Users\hachi\OneDrive\01. Trading\picking\KRX"
 
+# 계산 모수 = 시장 전체 보통주(전역제외, 시총 하한 없음)
+# 리포트 표 표시/선정 필터만 시총 ≥ 3,000억
+DISPLAY_MCAP_MIN = 300_000_000_000
+
+
+def _filter_display_mcap(df: pd.DataFrame, mcap_col: str = "mcap") -> pd.DataFrame:
+    """표시용: 시총 ≥ DISPLAY_MCAP_MIN. 지표 계산·breadth 유니버스에는 쓰지 않는다."""
+    if df is None or getattr(df, "empty", True) or mcap_col not in df.columns:
+        return df
+    mc = pd.to_numeric(df[mcap_col], errors="coerce")
+    return df[mc.notna() & (mc >= DISPLAY_MCAP_MIN)].copy()
+
+
 # kor_stock_db: 일별 리포트 표 스냅샷 (KRX_market_analysis 산출물)
 _KRX_ANALYSIS_TABLES = frozenset(
     {
@@ -430,6 +443,10 @@ def _build_rs20_long_df(_rs20: pd.DataFrame, dates20: list, mkt: str) -> pd.Data
         d_ts = pd.Timestamp(d).normalize()
         dkey = d_ts.date()
         dd = _rs[(_rs["market_type"] == mkt_u) & (_rs["_d_norm"] == d_ts)].copy()
+        if dd.empty:
+            continue
+        if "mcap" in dd.columns:
+            dd = _filter_display_mcap(dd)
         if dd.empty:
             continue
         dd = dd.sort_values("_rs_avg", ascending=False, na_position="last").head(20).reset_index(drop=True)
@@ -2147,6 +2164,7 @@ def write_rs_high_list_html(
         df_rs_talent_top50["tv_rank_prev"] = pd.to_numeric(
             df_rs_talent_top50["ticker"].astype(str).map(prev_tv_map_rs), errors="coerce"
         )
+        df_rs_talent_top50 = _filter_display_mcap(df_rs_talent_top50)
         df_rs_talent_top50 = (
             df_rs_talent_top50.sort_values("Talent120", ascending=False, na_position="last")
             .head(50)
@@ -2535,6 +2553,8 @@ def write_rs_high_list_html(
 
     k = df[df["market_type"] == "KOSPI"].copy().sort_values("_rs_avg", ascending=False, na_position="last")
     qm = df[df["market_type"] == "KOSDAQ"].copy().sort_values("_rs_avg", ascending=False, na_position="last")
+    k = _filter_display_mcap(k)
+    qm = _filter_display_mcap(qm)
     _theme_blurb_k = _rs_top_theme_terms_html(k, "코스피 (KOSPI)")
     _theme_blurb_q = _rs_top_theme_terms_html(qm, "코스닥 (KOSDAQ)")
 
@@ -2585,6 +2605,12 @@ def write_rs_high_list_html(
                         _rs20[c] = pd.to_numeric(_rs20.get(c), errors="coerce")
                 _rs20["_rs_avg"] = rs_avg(frame=_rs20, cols=("rs_20d", "rs_50d", "rs_120d", "rs_200d"))
                 _rs20["name"] = _rs20.get("name", "").fillna("").astype(str)
+                _mcap_by_tk = (
+                    df.set_index(df["ticker"].astype(str))["mcap"].to_dict()
+                    if "mcap" in df.columns
+                    else {}
+                )
+                _rs20["mcap"] = _rs20["ticker"].astype(str).map(_mcap_by_tk)
 
                 _rs20_chg_map: dict[tuple[str, str], float] = {}
                 try:
@@ -2627,6 +2653,13 @@ def write_rs_high_list_html(
                         dkey = pd.Timestamp(d).strftime("%Y-%m-%d")
                         dd = _rs20[(_rs20["market_type"] == mkt) & (_rs20["date"] == pd.Timestamp(d))].copy()
                         row = {"date": dkey}
+                        if dd.empty:
+                            for c in cols:
+                                row[c] = ""
+                            rows_20.append(row)
+                            prev_set = set()
+                            continue
+                        dd = _filter_display_mcap(dd)
                         if dd.empty:
                             for c in cols:
                                 row[c] = ""
@@ -2708,6 +2741,7 @@ def write_rs_high_list_html(
   <div class="note">
     기준일: <strong>{ref_d}</strong> (<code>krx_relative_strength</code> 최신 <code>date</code>).<br/>
     조건: 최신일 <code>krx_relative_strength</code> 전 종목. 순위: 시장별 <strong>rs_avg</strong>(0.4·rs_200+0.3·rs_120+0.2·rs_50+0.1·rs_20) 내림차순(평균 컬럼 미표시).<br/>
+    <strong>표시: 시총 3,000억 이상</strong> (계산 모수는 시장 전체 보통주·전역제외).<br/>
     테마는 <code>krx_theme_stock</code> 기준입니다.<br/>
     <strong>당일 상승률(%)</strong>: 최신 종가 ÷ 직전 거래일 종가 − 1. <strong>5일 상승률(%)</strong>: 최신 종가 ÷ 5거래일 전 종가 − 1.<br/>
     Talent(20/50/120일) 표는 동일 폴더 <a href="{html.escape(os.path.basename(out_talent_path))}"><code>{html.escape(os.path.basename(out_talent_path))}</code></a>를 참고하세요.<br/>
@@ -2728,7 +2762,7 @@ def write_rs_high_list_html(
   <section>
     <h2>2. 코스피 — 최근 20거래일 일별 RS Top20</h2>
     <div class="note" style="margin: 0 0 10px 0;">
-      해당 시장 전체 유니버스에서 일별 rs_20·50·120·200d 산술평균 상위 20입니다. 각 칸은 <code>종목명(티커)</code>와 RS10·AVG 요약입니다.<br/>
+      해당 시장 전체 유니버스에서 일별 rs_20·50·120·200d 산술평균 상위 20입니다(표시: 시총 3,000억 이상). 각 칸은 <code>종목명(티커)</code>와 RS10·AVG 요약입니다.<br/>
       <strong>볼드</strong>: 전일 Top20에 있던 종목이 당일에도 포함된 경우(시장별 표에만 적용).
     </div>
     <div class="rs20-wrap">
@@ -2774,6 +2808,7 @@ def write_rs_high_list_html(
   <div class="note">
     기준일: <strong>{ref_d}</strong> (<code>krx_relative_strength</code> / OHLCV 최신 구간).<br/>
     Talent(일) = 최근 N거래일 중 (전일종가 대비 등락률 ≥ +10%)인 <strong>날 수</strong>. 칼럼: <strong>Talent20</strong>·<strong>Talent50</strong>·<strong>Talent120</strong>.<br/>
+    <strong>표시: 시총 3,000억 이상</strong> (계산 모수는 시장 전체 보통주·전역제외).<br/>
     RS 리스트(전 종목 · rs_avg 정렬) 유니버스의 Talent120 평균 {_fmt_talent_stat(talent_mean_all)} / 상위5% {_fmt_talent_stat(talent_p95_all)} 입니다.<br/>
     <strong>당일 상승률(%)</strong>·<strong>5일 상승률(%)</strong>은 테마 옆 칼럼입니다.<br/>
     <strong>1절 요약표</strong>: 코스피·코스닥 각 RS 시장순위 상위 100(최대 200종)을 합친 뒤 Talent120(일)가 높은 순으로 상위 50만 표시합니다. RS시장순위는 거래대금 순위 오른쪽에 둡니다.<br/>
@@ -3149,6 +3184,9 @@ def write_120d_breakout_list_html(
             _r = out_df.loc[_mask, "last_trade_value"].rank(ascending=False, method="min")
             out_df.loc[_mask, "tv_rank"] = _r
 
+    # 표시 직전: 시총 ≥ DISPLAY_MCAP_MIN
+    out_df = _filter_display_mcap(out_df)
+
     # 표 정렬: 시장별 거래대금 순위(1등이 최상단)
     out_df = out_df.sort_values(["market", "tv_rank"], ascending=[True, True], na_position="last").reset_index(drop=True)
 
@@ -3439,6 +3477,7 @@ def write_120d_breakout_list_html(
   <div class="note">
     기준일(OHLCV 최신): <strong>{ref_d.strftime('%Y-%m-%d')}</strong><br/>
     조건: <strong>당일(D-0) 종가</strong>가 <strong>전일(D-1) 기준 N일 최고 종가</strong>를 상향 돌파(&gt;)한 종목. 섹션 순서 N = 200 → 120 → 50.<br/>
+    <strong>표시: 시총 3,000억 이상</strong> (계산·판정은 시장 전체 보통주·전역제외).<br/>
     이전 신고가 경과일수: 전일(D-1) 기준 N일 최고 종가(도달일, 가장 최근 도달)로부터 당일(D-0)까지의 <strong>거래일 간격</strong>.<br/>
     경과일수: <strong>당일(D-0) 포함 최근 N거래일 최저 종가</strong>(도달일, 가장 최근 도달)로부터 당일(D-0)까지의 <strong>거래일 간격</strong>.<br/>
     최저가대비 상승률(%): (당일(D-0) 종가 ÷ (당일 포함 최근 N거래일 최저 종가) − 1) × 100.<br/>
@@ -4314,6 +4353,19 @@ def write_volatility_spread_top100_html(
     full_df["tv_rank_prev"] = pd.to_numeric(
         full_df["ticker"].astype(str).map(_prev_tv_vol_map), errors="coerce"
     )
+    # 표시 직전 시총 필터 (유니버스 교집합 계산은 유지)
+    if "시가총액" in ticker_list_idx.columns:
+        full_df["mcap"] = pd.to_numeric(
+            full_df["ticker"].map(
+                lambda t: ticker_list_idx.loc[t, "시가총액"]
+                if t in ticker_list_idx.index
+                else np.nan
+            ),
+            errors="coerce",
+        )
+    else:
+        full_df["mcap"] = np.nan
+    full_df = _filter_display_mcap(full_df)
 
     _sort_cols = ["clv_avg", "net_dir", "drb_avg"]
     k_df = full_df[full_df["market"] == "KOSPI"].sort_values(
@@ -4553,6 +4605,7 @@ def write_volatility_spread_top100_html(
     {rs_top100_note}
     기준일(OHLCV 최신): <strong>{html.escape(ref_note) if ref_note else '—'}</strong><br/>
     {univ_line}
+    <strong>표시: 시총 3,000억 이상</strong> (유니버스 교집합·지표 계산은 시총 하한 없음).<br/>
     <strong>CLV(5일 평균)</strong> = ((종가−저가)−(고가−종가))÷(고가−저가) 의 5일 평균. +1에 가까울수록 종가가 당일 레인지 상단(상승 쪽 마감 우세), −1은 하단.<br/>
     <strong>순방향변동(5일)</strong> = 최근 5거래일 양(+) 일수익률 합 − 음(−) 일수익률 절대값 합(%p). 실제 누적 방향 성과.<br/>
     <strong>DRB(5일 평균)</strong> = ((종가−저가)−(고가−종가))÷전일종가 의 5일 평균(%). 일중 상·하단 압력을 전일 종가 대비로 본 방향 레인지 편향.<br/>
@@ -7236,6 +7289,27 @@ def write_investor_net_buy_top_html(
     ref_d = pd.to_datetime(ref_df.iloc[0]["d"]).date()
     _, rs_score_map = _load_latest_rs_rank_and_score_maps(engine)
 
+    # 표시 필터용 최신 시총 (종목코드 → mcap)
+    inv_mcap_map: dict[str, float] = {}
+    try:
+        _tl = pd.read_sql_query(
+            """
+            SELECT 종목코드 AS ticker, 시가총액 AS mcap
+            FROM krx_ticker
+            WHERE 기준일 = (SELECT MAX(기준일) FROM krx_ticker)
+              AND 종목구분 = '보통주'
+            """,
+            con=engine,
+        )
+        if _tl is not None and not _tl.empty:
+            inv_mcap_map = {
+                str(r["ticker"]).zfill(6): float(pd.to_numeric(r["mcap"], errors="coerce"))
+                for _, r in _tl.iterrows()
+                if pd.notna(pd.to_numeric(r["mcap"], errors="coerce"))
+            }
+    except Exception:
+        inv_mcap_map = {}
+
     INV_RANK_DAYS = 20
     INV_RANK_N = 20
     RANK_IMPROVE = "#d32f2f"
@@ -7314,6 +7388,10 @@ def write_investor_net_buy_top_html(
             return pd.DataFrame()
         df["net_val"] = pd.to_numeric(df["net_val"], errors="coerce")
         df["net_qty"] = pd.to_numeric(df["net_qty"], errors="coerce")
+        df["mcap"] = df["ticker"].astype(str).str.zfill(6).map(inv_mcap_map)
+        df = _filter_display_mcap(df)
+        if df.empty:
+            return pd.DataFrame()
         df = df.dropna(subset=["net_val"]).sort_values("net_val", ascending=False).head(20)
         return df.reset_index(drop=True)
 
@@ -7426,9 +7504,13 @@ def write_investor_net_buy_top_html(
         raw["ticker"] = raw["ticker"].astype(str)
         raw["name"] = raw["name"].fillna("").astype(str)
         raw = raw.dropna(subset=["net_val"])
+        raw["mcap"] = raw["ticker"].str.zfill(6).map(inv_mcap_map)
         rows: list[dict] = []
         for d in plot_dates:
             g = raw[raw["trade_date"] == d].copy()
+            if g.empty:
+                continue
+            g = _filter_display_mcap(g)
             if g.empty:
                 continue
             g = g.sort_values("net_val", ascending=False).head(INV_RANK_N).reset_index(drop=True)
@@ -7620,7 +7702,8 @@ def write_investor_net_buy_top_html(
   <div class="note">
     기준일: <strong>{ref_d}</strong> (<code>krx_investor_trade_krx</code> 최신 <code>date</code>).<br/>
     순서: 연기금등(6000) → 투신(3000) → 사모(3100) → 금융투자(1000) → 기관합계(7050) → 외국인=9000(기타외국인 9001 제외).<br/>
-    순매수금액(억) = <code>net_val</code>/1e8 (양수 빨강). 전역제외·보통주(이름) 필터 적용.<br/>
+    순매수금액(억) = <code>net_val</code>/1e8 (양수 빨강). 전역제외·보통주(이름) 필터 적용.
+    <strong>표시: 시총 3,000억 이상</strong>.<br/>
     <strong>당일상승률</strong>: 기준일 종가 ÷ 전거래일 종가 − 1.
     <strong>5거래일</strong>: 기준일 종가 ÷ 5거래일 전 종가 − 1.
     <strong>RS점수</strong>: rs_avg 가중 백분위(0~100).<br/>
