@@ -15,8 +15,6 @@ import os
 import sys
 from pathlib import Path
 
-os.environ["REPO_ROOT"] = r"C:\Users\hachi\OneDrive\02. Project\tradingKRX"
-print(repr(os.getenv("DB_USER")), repr(os.getenv("DB_PASSWORD")))
 
 def _find_repo_root():
     """env_config.find_repo_root 와 동일 규칙 (import 전용 인라인)."""

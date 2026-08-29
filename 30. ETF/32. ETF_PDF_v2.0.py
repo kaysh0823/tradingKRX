@@ -124,6 +124,8 @@ KRX [13108] PDF 수집 + 구성비중 스냅샷 대시보드 (32. ETF_PDF_v2.0)
 
 종목코드(ETF) 딕셔너리 {코드: 종목명} × 수집일자 조합을 조회·저장한 뒤,
 DB최근 / 전일 / 3일전 / 일주일전 / 2주일전 비중 비교표를 만듭니다.
+연속 시점 변화(chainΔ)와 vs최근_* 를 함께 산출·표시합니다.
+(ETF PDF 수집·시각화는 본 파일 단일 — 구 33. ETF_PDF_GRAPH 는 폐기.)
 
 동작 방식 (KRX 정보데이터시스템 내부 API를 그대로 사용):
   · 로그인      : POST MDCCOMS001D1.cmd  (중복로그인 시 skipDup=Y 재전송)
@@ -321,9 +323,10 @@ SNAPSHOT_DEFS = [
     ("일주일전", 5),
     ("2주일전", 10),
 ]
-CHAIN_COMPARE = [
-    ("DB최근", "전일"),       # 전일대비 (DB최근 − 전일)
-    ("전일", "3일전"),
+# 연속 시점 체인: (현재, 직전) → chainΔ_현재 = weight[현재] − weight[직전]
+# 기본은 전일을 건너뛴 3구간. ("DB최근","전일") 등을 앞에 넣으면 전일 구간도 포함.
+SNAPSHOT_CHAIN = [
+    ("DB최근", "3일전"),
     ("3일전", "일주일전"),
     ("일주일전", "2주일전"),
 ]
@@ -947,8 +950,8 @@ def build_snapshot_wide(
     for name, _ in SNAPSHOT_DEFS:
         wide[f"_miss_{name}"] = wide[name].isna()
 
-    # 비교용: 결측=0 (이탈→비중축소, 신규→비중확대)
-    for cur, prev in CHAIN_COMPARE:
+    # chainΔ: 결측=0 (이탈→비중축소, 신규→비중확대). vs최근_* 는 그대로 병기.
+    for cur, prev in SNAPSHOT_CHAIN:
         # 스냅샷 자체가 없으면(날짜 데이터 부족) 해당 비교는 NaN 유지
         if snaps.get(cur) is None or snaps.get(prev) is None:
             wide[f"chainΔ_{cur}"] = np.nan
@@ -966,14 +969,11 @@ def build_snapshot_wide(
     if top_n is not None:
         latest_rank = wide.sort_values("DB최근", ascending=False, na_position="last")
         pick = set(latest_rank.head(top_n)["티커"].tolist())
-        # 이탈·큰 변화 종목도 포함
-        for col in (
-            "vs최근_전일",
-            "vs최근_3일전",
-            "vs최근_일주일전",
-            "vs최근_2주일전",
-            "chainΔ_DB최근",
-        ):
+        # 이탈·큰 변화 종목도 포함 (vs최근 + chainΔ)
+        chg_cols = [
+            f"vs최근_{n}" for n, _ in SNAPSHOT_DEFS if n != "DB최근"
+        ] + [f"chainΔ_{cur}" for cur, _ in SNAPSHOT_CHAIN]
+        for col in chg_cols:
             if col not in wide.columns:
                 continue
             tmp = wide.dropna(subset=[col]).copy()
@@ -990,7 +990,9 @@ def build_snapshot_wide(
     # 정렬: 당일 비중 높은 순, 이탈(당일 없음)은 변화 절대값 큰 순으로 뒤에
     wide["_sort_w"] = wide["DB최근"].fillna(-1e9)
     wide["_sort_exit"] = wide["_miss_DB최근"].astype(int)
-    if "vs최근_전일" in wide.columns:
+    if "chainΔ_DB최근" in wide.columns:
+        wide["_sort_chg"] = wide["chainΔ_DB최근"].fillna(0).abs()
+    elif "vs최근_전일" in wide.columns:
         wide["_sort_chg"] = wide["vs최근_전일"].fillna(0).abs()
     elif "vs최근_3일전" in wide.columns:
         wide["_sort_chg"] = wide["vs최근_3일전"].fillna(0).abs()
@@ -1061,7 +1063,8 @@ def render_etf_weight_table(wide: pd.DataFrame, snaps: dict) -> str:
             )
     thead = "<tr>" + "".join(ths) + "</tr>"
 
-    chain_delta_for = {cur: f"chainΔ_{cur}" for cur, _prev in CHAIN_COMPARE}
+    chain_delta_for = {cur: f"chainΔ_{cur}" for cur, _prev in SNAPSHOT_CHAIN}
+    chain_legend = ", ".join(f"{cur}←{prev}" for cur, prev in SNAPSHOT_CHAIN) or "(없음)"
 
     rows = []
     for i, r in wide.iterrows():
@@ -1080,8 +1083,6 @@ def render_etf_weight_table(wide: pd.DataFrame, snaps: dict) -> str:
             miss = bool(r.get(f"_miss_{name}", False))
             dcol = chain_delta_for.get(name)
             delta = r.get(dcol, np.nan) if dcol else np.nan
-            if name == "2주일전":
-                delta = np.nan
             # '이탈' 표시는 당일(DB최근)에만 — 과거에만 있던 종목
             inner, style = _fmt_weight_cell(w, delta, missing=(miss and name == "DB최근"))
             style_attr = f' style="{style}"' if style else ""
@@ -1094,10 +1095,10 @@ def render_etf_weight_table(wide: pd.DataFrame, snaps: dict) -> str:
         + "</thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
-        + "<p class='hint'>셀 색: 직전 시점 대비 비중확대=초록 / 비중축소=빨강 (농도=|변화|). "
-        "괄호=직전 대비 pp 변화. "
+        + "<p class='hint'>셀 색·괄호: <strong>chainΔ</strong> = 연속 시점 간 변화(직전 스냅샷 대비 pp). "
+        "비중확대=초록 / 비중축소=빨강 (농도=|변화|). "
         "과거에만 있고 당일에 없으면 <strong>이탈</strong>(당일 비중 0)으로 표시·집계합니다. "
-        "DB최근←전일(전일대비), 전일←3일전, 3일전←일주일전, 일주일전←2주일전.</p>"
+        f"체인: {html.escape(chain_legend)}.</p>"
     )
 
 
@@ -1233,10 +1234,10 @@ def render_summary_section(universe: pd.DataFrame) -> str:
         ),
     ]
     for col, label in (
-        ("vs최근_전일", "전일대비"),
-        ("vs최근_3일전", "3일전 대비"),
-        ("vs최근_일주일전", "일주일전 대비"),
-        ("vs최근_2주일전", "2주일전 대비"),
+        ("vs최근_전일", "전일대비(vs최근)"),
+        ("vs최근_3일전", "3일전 대비(vs최근)"),
+        ("vs최근_일주일전", "일주일전 대비(vs최근)"),
+        ("vs최근_2주일전", "2주일전 대비(vs최근)"),
     ):
         cards.append(
             _rank_table_html(
@@ -1249,12 +1250,32 @@ def render_summary_section(universe: pd.DataFrame) -> str:
             )
         )
 
+    # chainΔ: 연속 시점 구간별 (직전 스냅샷 대비)
+    for i, (cur, prev) in enumerate(SNAPSHOT_CHAIN):
+        col = f"chainΔ_{cur}"
+        prefix = "직전 구간 " if i == 0 else ""
+        label = f"{prefix}chainΔ {cur}←{prev}"
+        cards.append(
+            _rank_table_html(
+                universe, col, f"{label} · 비중확대 TOP{SUMMARY_TOP_N}", as_delta=True, direction="up"
+            )
+        )
+        cards.append(
+            _rank_table_html(
+                universe, col, f"{label} · 비중축소 TOP{SUMMARY_TOP_N}", as_delta=True, direction="down"
+            )
+        )
+
+    chain_legend = ", ".join(f"{cur}←{prev}" for cur, prev in SNAPSHOT_CHAIN) or "(없음)"
     return (
         "<section class='summary-block' id='summary'>"
         "<h2>전체 요약 순위</h2>"
         "<p class='meta'>모든 ETF 구성종목을 합쳐 순위를 매깁니다. "
-        "변화는 <strong>비중확대</strong>·<strong>비중축소</strong>를 각각 따로 집계합니다 "
-        "(값 = DB최근 − 과거, pp; 미편입은 0으로 처리 → 이탈은 비중축소, 신규는 비중확대). "
+        "변화는 <strong>비중확대</strong>·<strong>비중축소</strong>를 각각 따로 집계합니다. "
+        "<strong>vs최근_*</strong> = DB최근 − 과거 스냅샷(pp). "
+        "<strong>chainΔ</strong> = 연속 시점 간 변화(직전 스냅샷 대비; "
+        f"{html.escape(chain_legend)}). "
+        "미편입은 0으로 처리 → 이탈은 비중축소, 신규는 비중확대. "
         "비중 상위(제외)는 삼성전자·SK하이닉스를 빼고 집계합니다.</p>"
         "<div class='rank-grid'>"
         + "".join(cards)
@@ -1444,6 +1465,7 @@ def build_dashboard_html(df: pd.DataFrame) -> str:
     <h1>ETF PDF 구성비중 스냅샷</h1>
     <p class="sub">기준(DB최근) {latest_str} · ETF {df['ETF코드'].nunique()}개
        · 비교: DB최근 / 전일(T-1) / 3일전(T-3) / 일주일전(T-5) / 2주일전(T-10)
+       · chainΔ = 연속 시점 간 변화(직전 스냅샷 대비)
        · <code>{PDF_TABLE}</code></p>
     <p class="sub">{snapshot_meta_html(snaps)}</p>
     <nav class="nav">{''.join(nav_links)}</nav>

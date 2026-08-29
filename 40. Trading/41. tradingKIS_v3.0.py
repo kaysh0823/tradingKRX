@@ -253,11 +253,11 @@ def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
     left = d.reset_index()
     if left.columns[0] != "date":
         left = left.rename(columns={left.columns[0]: "date"})
-    left["date"] = pd.to_datetime(left["date"], errors="coerce").normalize()
+    left["date"] = pd.to_datetime(left["date"], errors="coerce").dt.normalize()
     osc_reset = osc.reset_index()
     if osc_reset.columns[0] != "date":
         osc_reset = osc_reset.rename(columns={osc_reset.columns[0]: "date"})
-    osc_reset["date"] = pd.to_datetime(osc_reset["date"], errors="coerce").normalize()
+    osc_reset["date"] = pd.to_datetime(osc_reset["date"], errors="coerce").dt.normalize()
     for col in osc_cols:
         if col in left.columns:
             left = left.drop(columns=[col])
@@ -604,7 +604,7 @@ holidays = ['2023-08-15', '2023-09-28', '2023-09-29', '2023-10-02', '2023-10-03'
             '2025-01-01', '2025-01-27', '2025-01-28', '2025-01-29', '2025-01-30', '2025-03-03', '2025-05-01', '2025-05-05', '2025-05-06',
             '2025-06-03', '2025-06-06', '2025-08-15', '2025-10-03', '2025-10-06', '2025-10-07', '2025-10-08', '2025-10-09',
             '2025-12-25', '2025-12-31', '2026-01-01', '2026-02-16', '2026-02-17', '2026-02-18', '2026-03-02', '2026-05-01',
-            '2026-05-05', '2026-05-25', '2026-07-17', '2025-08-17']
+            '2026-05-05', '2026-05-25', '2026-07-17', '2026-08-17']
 
 
 
