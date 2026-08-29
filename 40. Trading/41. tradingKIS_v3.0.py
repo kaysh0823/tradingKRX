@@ -225,6 +225,54 @@ def _load_investor_trading(engine, ticker):
     return df.dropna(subset=["date"])
 
 
+def _load_foreign_holding(engine, ticker):
+    """krx_foreign_holding 에서 date, frgn_ratio(%) 로드."""
+    if engine is None or ticker is None:
+        return pd.DataFrame()
+    t = str(ticker).strip().zfill(6)
+    query = """
+        SELECT `date`, frgn_ratio
+        FROM krx_foreign_holding
+        WHERE ticker = %(ticker)s
+        ORDER BY `date`
+    """
+    try:
+        df = pd.read_sql(query, engine, params={"ticker": t})
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["frgn_ratio"] = pd.to_numeric(df["frgn_ratio"], errors="coerce")
+    return df.dropna(subset=["date"])
+
+
+def _merge_frgn_ratio_on_date(left_df, fh_df):
+    """left_df(date 컬럼)에 frgn_ratio left join. 실패 시 NaN 컬럼만 추가."""
+    out = left_df.copy()
+    if "frgn_ratio" in out.columns:
+        out = out.drop(columns=["frgn_ratio"])
+    if fh_df is None or fh_df.empty:
+        out["frgn_ratio"] = np.nan
+        return out
+    fh = fh_df.copy()
+    fh["date"] = pd.to_datetime(fh["date"], errors="coerce").dt.normalize()
+    fh = fh.dropna(subset=["date"]).drop_duplicates(subset=["date"], keep="last")
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    return out.merge(fh[["date", "frgn_ratio"]], on="date", how="left")
+
+
+def _frgn_ratio_axis_range(series):
+    """min/max ± 5% 여유. 유효값 없으면 None."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return None
+    lo, hi = float(s.min()), float(s.max())
+    span = hi - lo
+    pad = span * 0.05 if span > 0 else max(abs(hi) * 0.05, 0.5)
+    return [lo - pad, hi + pad]
+
+
 def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
     """investor_osc_frame 결과(inst_net_osc, frgn_net_osc 등)를 날짜 기준 join."""
     if ohlcv_df is None or ohlcv_df.empty:
@@ -238,15 +286,22 @@ def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
     d.index = pd.to_datetime(d.index, errors="coerce").normalize()
     d = d[~d.index.isna()]
     osc_cols = tuple(_INVESTOR_OSC_GROUPS.keys())
+    fh = _load_foreign_holding(engine, t)
     if investor_df is None or investor_df.empty:
         for col in osc_cols:
             d[col] = np.nan
-        return d
+        left = d.reset_index()
+        if left.columns[0] != "date":
+            left = left.rename(columns={left.columns[0]: "date"})
+        return _merge_frgn_ratio_on_date(left, fh).set_index("date")
     osc = investor_osc_frame(investor_df, groups=_INVESTOR_OSC_GROUPS)
     if osc is None or osc.empty:
         for col in osc_cols:
             d[col] = np.nan
-        return d
+        left = d.reset_index()
+        if left.columns[0] != "date":
+            left = left.rename(columns={left.columns[0]: "date"})
+        return _merge_frgn_ratio_on_date(left, fh).set_index("date")
     osc = osc.copy()
     osc.index = pd.to_datetime(osc.index, errors="coerce").normalize()
     osc = osc[~osc.index.isna()]
@@ -262,6 +317,7 @@ def _attach_investor_osc(ohlcv_df, engine, ticker=None, investor_df=None):
         if col in left.columns:
             left = left.drop(columns=[col])
     merged = left.merge(osc_reset, on="date", how="left")
+    merged = _merge_frgn_ratio_on_date(merged, fh)
     return merged.set_index("date")
 
 
@@ -1760,7 +1816,8 @@ def write_position_dashboard_html(output_path, df):
   <h1>종목 현황 요약</h1>
   <p id="hint">헤더를 클릭하면 내림차순 ↔ 오름차순으로 정렬됩니다.
     <strong>연두</strong> = 정렬 기준 상위 7개, <strong>노랑</strong> = 그 다음 3개(8~10위).
-    기관OSC는 연기금+투신+사모 순매수금액 OSC이며 기관합계(7050)가 아닙니다. 외국인OSC는 9000 순매수금액 OSC입니다.</p>
+    기관OSC는 연기금+투신+사모 순매수금액 OSC이며 기관합계(7050)가 아닙니다. 외국인OSC는 9000 순매수금액 OSC입니다.
+    외국인 지분율(%) = KRX 12023 외국인보유량 기준.</p>
   <div class="wrap">
     <table id="tbl">
       <thead><tr id="hdr"></tr></thead>
@@ -2552,7 +2609,10 @@ def gen_chart(df, sector_df, rs_df, period, trade_data=None):
         if _n_rows == 7
         else (0.15, 0.35, 0.15, 0.12, 0.12, 0.11)
     )
-    _spec_row = [{"secondary_y": False}, {"secondary_y": False}]
+    specs = []
+    for i in range(_n_rows):
+        sec = _inv_row is not None and (i + 1) == _inv_row
+        specs.append([{"secondary_y": sec}, {"secondary_y": False}])
     fig = make_subplots(
         rows=_n_rows, cols=2,
         row_heights=_row_heights,
@@ -2561,7 +2621,7 @@ def gen_chart(df, sector_df, rs_df, period, trade_data=None):
         shared_yaxes=False,
         vertical_spacing=0.02,
         horizontal_spacing=0.01,
-        specs=[_spec_row] * _n_rows,
+        specs=specs,
     )
     
     # Row 1: Sector Performance
@@ -2820,9 +2880,24 @@ def gen_chart(df, sector_df, rs_df, period, trade_data=None):
         except (KeyError, TypeError):
             investor_graphs = []
 
-    if investor_graphs:
+    if investor_graphs and _inv_row is not None:
+        # 외국인 지분율 bar (우축) — 선보다 앞에 그려 뒤에 보이도록
+        if "frgn_ratio" in df.columns and pd.Series(df["frgn_ratio"]).notna().any():
+            fig.add_trace(
+                go.Bar(
+                    x=df.index,
+                    y=df["frgn_ratio"],
+                    name="외국인 지분율",
+                    marker=dict(color="#00897B", line=dict(width=0)),
+                    opacity=0.55,
+                    showlegend=True,
+                ),
+                row=_inv_row,
+                col=1,
+                secondary_y=True,
+            )
         for g in investor_graphs:
-            fig.add_trace(g, _inv_row, 1)
+            fig.add_trace(g, _inv_row, 1, secondary_y=False)
 
 
     # Row 1, Col 2: y축 레이블 숨기기
@@ -2836,11 +2911,23 @@ def gen_chart(df, sector_df, rs_df, period, trade_data=None):
         fig.update_yaxes(autorange=True, row=_csi_row, col=1, showgrid=True, gridwidth=1, gridcolor='rgba(128, 128, 128, 0.2)')
         fig.add_hline(y=0, row=_csi_row, col=1, line=dict(color='rgba(128, 128, 128, 0.5)', width=1, dash='dash'))
 
-    # Row 7, Col 1: 투자자 OSC (0~100)
+    # Row 7, Col 1: 투자자 OSC (좌 0~100) + 외국인 지분율(우 %)
     if row7_panel == "investor" and _inv_row is not None:
-        fig.update_yaxes(range=[0, 100], row=_inv_row, col=1, showgrid=True, gridwidth=1, gridcolor='rgba(128, 128, 128, 0.2)')
+        fig.update_yaxes(
+            range=[0, 100], row=_inv_row, col=1, secondary_y=False,
+            showgrid=True, gridwidth=1, gridcolor='rgba(128, 128, 128, 0.2)',
+        )
         fig.add_hline(y=80, row=_inv_row, col=1, line=dict(color='rgba(255, 107, 107, 0.5)', width=1, dash='dash'))
         fig.add_hline(y=20, row=_inv_row, col=1, line=dict(color='rgba(78, 205, 196, 0.5)', width=1, dash='dash'))
+        yr = _frgn_ratio_axis_range(df["frgn_ratio"]) if "frgn_ratio" in df.columns else None
+        if yr is not None:
+            fig.update_yaxes(
+                range=yr,
+                row=_inv_row,
+                col=1,
+                secondary_y=True,
+                showgrid=False,
+            )
     elif row6_panel != "csi" and _inv_row is None:
         fig.update_yaxes(range=[0, 100], row=_csi_row, col=1, showgrid=True, gridwidth=1, gridcolor='rgba(128, 128, 128, 0.2)')
 

@@ -155,7 +155,7 @@ KRX_HEADERS = {
 OTP_URL = 'https://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd'
 DOWN_URL = 'https://data.krx.co.kr/comm/fileDn/download_csv/download.cmd'
 
-# 로그인 엔드포인트 (32. ETF_PDF_v2.0.py 와 동일)
+# 로그인 엔드포인트 (31. ETF_v7.0.py 와 동일)
 _KRX_BASE = 'https://data.krx.co.kr'
 LOGIN_PAGE = f'{_KRX_BASE}/contents/MDC/COMS/client/MDCCOMS001.cmd'
 LOGIN_JSP = f'{_KRX_BASE}/contents/MDC/COMS/client/view/login.jsp?site=mdc'

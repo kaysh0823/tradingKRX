@@ -12,8 +12,8 @@ alwaysApply: true
 
 - **10. OHLCV** — 데이터 수집. 전종목 OHLCV·지수 등 원천 데이터를 KRX에서 받아 DB에 적재.
 - **20. MARKET Analysis** — 시장 대시보드/분석. breadth(맥클레란·Zweig·ADR·CVI), 변동성, 모멘텀 등 시장 전체 지표.
-- **30. ETF** — ETF 수직 분석. ETF 시세·PDF(구성종목) 수집과 분석.
-  ETF PDF 수집·시각화는 `32. ETF_PDF_v2.0.py` 단일 파일(구 33 GRAPH 폐기·흡수).
+- **30. ETF** — ETF 수직 분석. ETF 시세·PDF 수집과 분석·대시보드를
+  `31. ETF_v7.0.py` 단일 파일에서 수행.
 - **40. Trading** — 현재 보유 종목 분석 (KIS 등 계좌 연동).
 - **50. Picking** — 종목 선정 전략 수립·실행 (스크리닝 패턴, picking 점수).
 - **naverPub** — 외부 발행용. 매일 외부 클라우드(VPS)에서 자동으로 시장을 분석해

@@ -8,6 +8,8 @@ v4.0: OHLCV + KRX 종목/ETF 정보(krx_info_v3.0) 통합.
        본 파일만 실행하면 종목·ETF 적재 후 OHLCV 수집까지 수행.
        일봉 원천: KRX MDCSTAT01501 일자 CSV (전종목 1요청/일). 종목별 크롤링 금지.
        투자자별 매매: KRX 12010 MDCSTAT02401 (일자×투자자구분 CSV). frgn.naver 제거.
+       외국인보유량: KRX 12023 MDCSTAT03701 → krx_foreign_holding.
+       (레거시 krx_investor_trading.외국인_보유율 은 미갱신.)
 """
 
 
@@ -1813,6 +1815,250 @@ def collect_krx_investor_trade_by_days(session, mycursor, con, dates, ohlcv_univ
     }
 
 
+# ---------------------------------------------------------------------------
+# 외국인보유량(개별종목) — KRX 12023 (MDCSTAT03701) 전종목 일별 CSV
+# ---------------------------------------------------------------------------
+# 스펙 실측(2026-08-28 OTP CSV):
+#   menuId=MDC0201020501 / screen=[12023] 외국인보유량(개별종목)
+#   bld=dbms/MDC/STAT/standard/MDCSTAT03701
+#   OTP params: searchType=1, mktId=ALL, trdDd, share=1, money=1, csvxls_isNo=false
+#   CSV: 종목코드,종목명,종가,대비,등락률,상장주식수,
+#        외국인 보유수량,외국인 지분율,외국인 한도수량,외국인 한도소진율
+# ---------------------------------------------------------------------------
+BLD_FOREIGN_HOLDING = 'dbms/MDC/STAT/standard/MDCSTAT03701'
+FOREIGN_HOLDING_KRX_REFERER = (
+    'https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020501'
+)
+FOREIGN_HOLDING_FULL_BACKFILL = False  # True면 krx_ohlcv 전 구간 강제 재수집
+
+
+def ensure_krx_foreign_holding_table(mycursor, con):
+    mycursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS krx_foreign_holding (
+            `date` DATE NOT NULL,
+            ticker VARCHAR(16) NOT NULL,
+            close DOUBLE NULL,
+            listed_shares BIGINT NULL,
+            frgn_shares BIGINT NULL,
+            frgn_ratio DECIMAL(10,4) NULL,
+            frgn_limit_shares BIGINT NULL,
+            frgn_limit_used DECIMAL(10,4) NULL,
+            PRIMARY KEY (`date`, ticker),
+            INDEX idx_fh_date (`date`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    con.commit()
+
+
+def resolve_foreign_holding_plan(mycursor, biz_day, full_backfill=False):
+    """
+    DB MAX(date) 증분. DB 비었거나 full_backfill=True 이면
+    krx_ohlcv 이력 전 구간(MIN~biz_day) 백필.
+    dates는 거래일만 (krx_ohlcv / krx_index_ohlcv / 주말제외 폴백).
+    """
+    end = _as_plain_date(biz_day)
+    mycursor.execute('SELECT MAX(`date`) FROM krx_foreign_holding')
+    row = mycursor.fetchone()
+    db_max = _as_plain_date(row[0]) if row else None
+    plan = {
+        'mode': 'skip',
+        'db_max': db_max,
+        'biz_day': end,
+        'from_date': None,
+        'dates': [],
+        'date_source': '',
+        'message': '',
+    }
+    if end is None:
+        plan['message'] = '기준영업일 없음 — 스킵'
+        return plan
+
+    need_full = bool(full_backfill) or db_max is None
+    if need_full:
+        mycursor.execute('SELECT MIN(`date`), MAX(`date`) FROM krx_ohlcv')
+        ohlcv_row = mycursor.fetchone()
+        ohlcv_min = _as_plain_date(ohlcv_row[0]) if ohlcv_row else None
+        ohlcv_max = _as_plain_date(ohlcv_row[1]) if ohlcv_row else None
+        if ohlcv_min is None:
+            plan['message'] = 'krx_ohlcv 비어 있음 — 외국인보유량 백필 스킵'
+            return plan
+        start = ohlcv_min
+        end_use = end if ohlcv_max is None else min(end, ohlcv_max)
+        if start > end_use:
+            plan['message'] = f'백필 구간 없음 (ohlcv={ohlcv_min}~{ohlcv_max}, 기준일={end})'
+            return plan
+        plan['mode'] = 'full_backfill' if full_backfill else 'initial'
+        plan['from_date'] = start
+        dates, src = _trading_ymd_range_from_db(mycursor, start, end_use)
+        plan['dates'] = dates
+        plan['date_source'] = src
+        plan['message'] = (
+            f'{"강제 전구간" if full_backfill else "DB 비어 있음 →"} 백필 '
+            f'{start}~{end_use} (거래일 {len(dates)}일, 출처={src})'
+        )
+        return plan
+
+    if db_max >= end:
+        plan['mode'] = 'skip'
+        plan['from_date'] = db_max
+        plan['message'] = f'이미 적재됨 (DB 최신={db_max}, 기준일={end}) — 수집 스킵'
+        return plan
+
+    start = db_max + timedelta(days=1)
+    plan['mode'] = 'incremental'
+    plan['from_date'] = start
+    dates, src = _trading_ymd_range_from_db(mycursor, start, end)
+    plan['dates'] = dates
+    plan['date_source'] = src
+    plan['message'] = (
+        f'증분 수집 {start}~{end} (DB 최신={db_max}, '
+        f'거래일 {len(dates)}일, 출처={src})'
+    )
+    return plan
+
+
+def parse_krx_foreign_holding_csv(df, day_str):
+    """12023 CSV → krx_foreign_holding 적재용 DataFrame."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    d = df.copy()
+    d.columns = d.columns.str.replace(' ', '')
+    rename = {
+        '종목코드': 'ticker',
+        '종가': 'close',
+        '상장주식수': 'listed_shares',
+        '외국인보유수량': 'frgn_shares',
+        '외국인지분율': 'frgn_ratio',
+        '외국인한도수량': 'frgn_limit_shares',
+        '외국인한도소진율': 'frgn_limit_used',
+    }
+    d = d.rename(columns={k: v for k, v in rename.items() if k in d.columns})
+    if 'ticker' not in d.columns:
+        raise ValueError(f'12023 CSV에 종목코드 없음: {list(d.columns)}')
+    d['ticker'] = _krx_pad_ticker(d['ticker'])
+    for c in (
+        'close', 'listed_shares', 'frgn_shares',
+        'frgn_ratio', 'frgn_limit_shares', 'frgn_limit_used',
+    ):
+        if c in d.columns:
+            d[c] = _krx_num_series(d[c])
+        else:
+            d[c] = np.nan
+    d['date'] = datetime.strptime(day_str, '%Y%m%d').date()
+    cols = [
+        'date', 'ticker', 'close', 'listed_shares', 'frgn_shares',
+        'frgn_ratio', 'frgn_limit_shares', 'frgn_limit_used',
+    ]
+    return d[cols].dropna(subset=['ticker'])
+
+
+def download_krx_foreign_holding_csv(session, day_str):
+    """
+    12023 전종목 일별 CSV. 짧은/빈 응답은 휴장·무데이터로 빈 DF 반환.
+    """
+    content = get_krx_csv(
+        session,
+        BLD_FOREIGN_HOLDING,
+        {
+            'searchType': '1',
+            'mktId': 'ALL',
+            'trdDd': day_str,
+            'share': '1',
+            'money': '1',
+        },
+        empty_ok=True,
+        min_bytes=100,
+    )
+    if content is None or len(content) < 100:
+        return pd.DataFrame(), content or b''
+    try:
+        raw = pd.read_csv(BytesIO(content), encoding='EUC-KR')
+    except Exception:
+        return pd.DataFrame(), content
+    if raw is None or len(raw) == 0:
+        return pd.DataFrame(), content
+    return raw, content
+
+
+def upsert_krx_foreign_holding(mycursor, con, day_df, batch_size=1000):
+    if day_df is None or day_df.empty:
+        return 0
+    sql = """
+    INSERT INTO krx_foreign_holding
+      (`date`, ticker, close, listed_shares, frgn_shares,
+       frgn_ratio, frgn_limit_shares, frgn_limit_used)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s) AS new
+    ON DUPLICATE KEY UPDATE
+      close=new.close,
+      listed_shares=new.listed_shares,
+      frgn_shares=new.frgn_shares,
+      frgn_ratio=new.frgn_ratio,
+      frgn_limit_shares=new.frgn_limit_shares,
+      frgn_limit_used=new.frgn_limit_used
+    """
+    rows = []
+    for r in day_df.itertuples(index=False):
+        tup = []
+        for v in r:
+            if isinstance(v, float) and (math.isnan(v) or pd.isna(v)):
+                tup.append(None)
+            elif not isinstance(v, (bytes, bytearray)) and pd.isna(v):
+                tup.append(None)
+            else:
+                tup.append(v)
+        rows.append(tuple(tup))
+    for i in range(0, len(rows), batch_size):
+        mycursor.executemany(sql, rows[i:i + batch_size])
+        con.commit()
+    return len(rows)
+
+
+def collect_foreign_holding(session, mycursor, con, dates):
+    """거래일 목록 순회. 빈/짧은 CSV는 조용히 스킵."""
+    total_rows = 0
+    ok_days = 0
+    empty_days = 0
+    error_items = []
+    print(f'  · 요청 예정: 거래일 {len(dates)}일 (12023 1 CSV/일)')
+    for day in tqdm(dates, desc='KRX 12023 외국인보유량 CSV'):
+        try:
+            raw, content = download_krx_foreign_holding_csv(session, day)
+            if content is not None and len(content) < 100:
+                empty_days += 1
+                print(f'  · {day} 데이터 없음 → skip (짧은 응답)')
+                continue
+            if raw is None or len(raw) == 0:
+                empty_days += 1
+                print(f'  · {day} 데이터 없음 → skip (빈 CSV)')
+                continue
+            parsed = parse_krx_foreign_holding_csv(raw, day)
+            if parsed.empty:
+                empty_days += 1
+                print(f'  · {day} 파싱 후 빈 DF → skip')
+                continue
+            n = upsert_krx_foreign_holding(mycursor, con, parsed)
+            total_rows += n
+            ok_days += 1
+            _save_krx_csv_backup(content, 'foreign_holding', day)
+            print(f'  · {day} 적재: {n}행')
+        except Exception as e:
+            error_items.append(day)
+            print(f'  ⚠️ {day} 외국인보유량 수집 실패: {e}')
+            print(traceback.format_exc())
+    print(
+        f'  · 12023 완료: 적재거래일={ok_days}, 빈스킵={empty_days}, '
+        f'실패일={len(error_items)}, 행={total_rows}'
+    )
+    return {
+        'ok_days': ok_days,
+        'empty_days': empty_days,
+        'error_items': error_items,
+        'rows': total_rows,
+    }
+
+
 ensure_krx_investor_trade_krx_table(mycursor, con)
 ensure_krx_investor_trading_wide_table(mycursor, con)
 print('✓ krx_investor_trade_krx / krx_investor_trading 테이블 확인')
@@ -2133,6 +2379,51 @@ if error_list_investor:
     print(f'\n⚠️ 투자자 12010 수집 실패 항목 수: {len(error_list_investor)}')
     if len(error_list_investor) <= 15:
         print(f'실패: {error_list_investor}')
+
+
+### 외국인보유량(개별종목) — KRX 12023 (MDCSTAT03701)
+
+print('\n - 외국인보유량(개별종목) 데이터를 저장합니다. (KRX 12023 MDCSTAT03701)')
+ensure_krx_foreign_holding_table(mycursor, con)
+print('✓ krx_foreign_holding 테이블 확인')
+
+fh_plan = resolve_foreign_holding_plan(
+    mycursor, biz_day, full_backfill=FOREIGN_HOLDING_FULL_BACKFILL
+)
+print(f'   {fh_plan["message"]}')
+
+error_list_foreign_holding = []
+krx_fh_session = rq.Session()
+krx_fh_session.headers.update({
+    'User-Agent': KRX_INFO_HEADERS.get('User-Agent', 'Mozilla/5.0'),
+    'Referer': FOREIGN_HOLDING_KRX_REFERER,
+})
+if not krx_login(krx_fh_session):
+    raise RuntimeError('KRX 로그인 실패(외국인보유량 12023). KRX_ID/KRX_PW 확인')
+
+if fh_plan['mode'] == 'skip' or not fh_plan['dates']:
+    print('   (이미 적재됨 — 12023 CSV 스킵)')
+else:
+    print(
+        f'   대상 구간: {fh_plan["dates"][0]}~{fh_plan["dates"][-1]} '
+        f'(거래일 {len(fh_plan["dates"])}일'
+        f', 출처={fh_plan.get("date_source", "?")})'
+    )
+    fh_stats = collect_foreign_holding(
+        krx_fh_session, mycursor, con, fh_plan['dates']
+    )
+    error_list_foreign_holding = list(fh_stats.get('error_items') or [])
+    print(
+        f'   요약: 수집거래일={fh_stats.get("ok_days", 0)}, '
+        f'행={fh_stats.get("rows", 0)}, 실패={len(error_list_foreign_holding)}'
+    )
+
+krx_fh_session.close()
+
+if error_list_foreign_holding:
+    print(f'\n⚠️ 외국인보유량 12023 수집 실패 일수: {len(error_list_foreign_holding)}')
+    if len(error_list_foreign_holding) <= 15:
+        print(f'실패: {error_list_foreign_holding}')
 
 
 # --- KIS API — 종목별 투자자매매동향(일별) [비활성화: ENABLE_KIS_INVESTOR_TRADE_KIS=False] ---
