@@ -1233,6 +1233,16 @@ def calculate_volume_band_parallel(ohlcv_data, max_workers=6):
 
 PATTERN_REGISTRY = {}   # code -> {"fn","group","name","params"}
 
+# 폐기 — h20·h60 모두 베이스라인(__BASE__) 이하이거나 죽은 코드
+DISABLED_PATTERNS = {
+    "p13", "p14", "p17", "p27", "p34", "p43", "p61",
+    "p25", "p26",   # p24 와 중복(Jaccard 0.72/0.36), 성과 동일 → p24 로 통합
+}
+
+# 강등 — 성과가 베이스라인과 동일하고 히트가 과다(전체의 55%).
+#        선정 목록에는 넣지 않고 참고용으로만 계산한다.
+REFERENCE_PATTERNS = {"p71", "p81", "p93"}
+
 def pattern(code, group, name, **params):
     def deco(fn):
         PATTERN_REGISTRY[code] = {
@@ -2265,6 +2275,8 @@ def screen_all(indicators_data, rs_df=None, **ctx):
                     ):
                         if _code not in PATTERN_REGISTRY:
                             continue
+                        if _code in DISABLED_PATTERNS:
+                            continue
                         if _code == "p29a" and len(_buckets["p29a"]) >= 49:
                             continue
                         if _code == "p29b" and (len(_buckets["p29a"]) < 49 or _p29_matched):
@@ -2281,6 +2293,8 @@ def screen_all(indicators_data, rs_df=None, **ctx):
                             if _code in ("p29a", "p29b"):
                                 _p29_matched = True
                             _buckets[_code].append(i)
+                            if _code in REFERENCE_PATTERNS:
+                                continue
                             listed = i.iloc[-1][['ticker', 'name']].to_list()
                             listed.insert(0, 'p29' if _code in ('p29a', 'p29b') else _code)
                             listed.insert(0, i.index[-1])
@@ -2306,7 +2320,12 @@ def screen_all(indicators_data, rs_df=None, **ctx):
     print("=" * 80)
     print(f"📊 패턴별 선정 건수 (합계 {sum(_cnt.values())} / 발동 {len(_hit)}개 패턴)")
     for _k in sorted(_cnt):
-        print(f"   · {_k}: {_cnt[_k]}건")
+        if _k in DISABLED_PATTERNS:
+            print(f"   · {_k}: - [폐기]")
+        elif _k in REFERENCE_PATTERNS:
+            print(f"   · {_k}: {_cnt[_k]}건 [참고]")
+        else:
+            print(f"   · {_k}: {_cnt[_k]}건")
     print("=" * 80)
 
     return {
@@ -4932,3 +4951,59 @@ if __name__ == "__main__":
 # %% 2) 차트 생성 — 패턴 선택 (셀1 실행 후 Run Cell)
 if __name__ == "__main__":
     cell2_charts(pattern="p22")
+
+# 새 셀을 51 파일 맨 끝에 추가한다 (셀2 아래).
+
+# %% 3) 원본 표현식 대조 (셀1 실행 후 Run Cell)
+def cell3_verify_original():
+    """
+    HEAD 커밋의 인라인 표현식을 그대로 옮겨 세고,
+    레지스트리 결과와 비교한다. 리팩터 검증 전용.
+    """
+    ref = {c: 0 for c in ("p93", "p81", "p92", "p71", "p22")}
+    n_atr = 0
+    for k, i in indicators_data.items():
+        idc = i.iloc
+        _tk = str(k)
+        try:
+            if not (len(i) >= 120 and i.iloc[-1].open > 0
+                    and ticker_list.loc[_tk]['시가총액'] >= DISPLAY_MCAP_MIN
+                    and _tk not in audit_ticker):
+                continue
+            close = i.iloc[-1].close
+            if not ((idc[-1].atr14 / close) < 0.1
+                    and idc[-1].mtr7 / close < 0.2
+                    and idc[-1].box7 / close < 0.3):
+                continue
+        except Exception:
+            continue
+        n_atr += 1
+
+        if idc[-1].band20_q < 0.8 and idc[-1].band20_q > idc[-6].band20_q:
+            ref["p93"] += 1
+        if idc[-1].band20_q > idc[-2].band20_q and idc[-1].csi > idc[-2].csi:
+            ref["p81"] += 1
+        if idc[-1].band20_q < 0.2 and idc[-1].atr_q < 0.2 \
+            and (idc[-1].max10 > idc[-11].max50 or idc[-1].max10 > idc[-11].max125
+                 or idc[-1].max20 > idc[-21].max50 or idc[-1].max20 > idc[-21].max125
+                 or idc[-1].max50 > idc[-51].max50 or idc[-1].max50 > idc[-51].max125):
+            ref["p92"] += 1
+        if idc[-1].mtr7 > idc[-8].atr14 * 1.5 and idc[-1].close < idc[-1].max5 \
+            and idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 \
+            and idc[-1].sma120 > idc[-1].sma200:
+            ref["p71"] += 1
+        if idc[-1].max10 > 0 and idc[-1].min50 > 0:
+            _d50 = idc[-1].max50 - idc[-1].min50
+            _d5 = idc[-1].max5 - idc[-1].min5
+            if _d50 > 0 and _d5 > 0 and idc[-1].min50 > 0:
+                if idc[-1].max10 / idc[-1].min50 > 1.9 and idc[-1].high < idc[-1].max10:
+                    ref["p22"] += 1
+
+    print(f"[verify] ATR 통과 {n_atr}종목")
+    for c in ("p93", "p81", "p92", "p71", "p22"):
+        print(f"   · {c}: 원본식 {ref[c]}건")
+
+if __name__ == "__main__":
+    cell3_verify_original()
+
+# py_compile 만 확인하고 실행하지 않는다.
