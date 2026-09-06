@@ -506,6 +506,45 @@ BLD_STOCK_OHLCV = 'dbms/MDC/STAT/standard/MDCSTAT01501'
 # DB 비어 있을 때만: 최근 N거래일 분량(캘린더 여유 포함) 또는 지정 시작일
 OHLCV_INITIAL_TRADING_DAYS = 250
 OHLCV_INITIAL_START = None  # 예: '20240101' — 지정 시 초기 백필 시작일(YYYYMMDD)
+# 지정 시 해당 날짜만 강제 재수집(형식 'YYYYMMDD'). 비우면 평소 동작.
+OHLCV_REFETCH_DATES = ['20260507']         # 예: ['20260508', '20260514']
+# ('YYYYMMDD','YYYYMMDD') 지정 시 해당 구간 전 거래일 재수집. None이면 미사용.
+OHLCV_REFETCH_RANGE = ('20220711', '20260901')      # 예: ('20220711', '20260901')
+WEEKLY_REBUILD = False  # True: 주봉 테이블 전량 삭제 후 일봉→W-FRI 재적재
+
+
+def _purge_weekly_table(mycursor, con, table_name: str) -> int:
+    """주봉 테이블 전량 삭제. 삭제 행 수 반환."""
+    mycursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+    n_before = int(mycursor.fetchone()[0] or 0)
+    mycursor.execute(f"DELETE FROM `{table_name}`")
+    con.commit()
+    print(f"  · {table_name} 전량 삭제: {n_before}행")
+    return n_before
+
+
+def _log_weekly_label_validation(mycursor, table_name: str) -> None:
+    """W-FRI 라벨(금요일) 검증 — DAYOFWEEK 분포 로그."""
+    mycursor.execute(
+        f"""
+        SELECT DAYOFWEEK(`date`) AS dow, COUNT(*) AS cnt
+        FROM `{table_name}`
+        GROUP BY DAYOFWEEK(`date`)
+        """
+    )
+    rows = mycursor.fetchall()
+    if not rows:
+        print(f"  · 주봉 라벨 검증 ({table_name}): 데이터 없음")
+        return
+    # MySQL DAYOFWEEK: 1=일 … 6=금 … 7=토
+    fri = sum(int(cnt) for dow, cnt in rows if int(dow) == 6)
+    other = sum(int(cnt) for dow, cnt in rows if int(dow) != 6)
+    print(f"  · 주봉 라벨 검증 ({table_name}): 금요일 {fri}행 / 기타 {other}행")
+    if other > 0:
+        detail = ", ".join(
+            f"dow={int(dow)}:{int(cnt)}" for dow, cnt in sorted(rows, key=lambda x: x[0])
+        )
+        print(f"  ⚠️ {table_name} — W-FRI 외 라벨 {other}행 (분포: {detail})")
 
 
 def _as_plain_date(v):
@@ -643,6 +682,22 @@ def parse_krx_stock_ohlcv_day_csv(df, day_str):
         'open', 'high', 'low', 'close', 'volume',
         'trading_value', 'mcap', 'chg_pct',
     ]
+    # 거래정지: OHLV 전부 0/결측이고 종가(기준가)만 있는 행 → 체결가가 아니므로 제외
+    _px = d[['open', 'high', 'low']].fillna(0)
+    _halt = (_px <= 0).all(axis=1) & (d['volume'].fillna(0) <= 0)
+    if _halt.any():
+        print(f"  · {day_str} 거래정지 추정 행 제외: {int(_halt.sum())}건 "
+              f"(예: {d.loc[_halt, 'ticker'].head(5).tolist()})")
+    d = d[~_halt]
+
+    _bad = (
+        (d['high'] < d[['open', 'close']].max(axis=1)) |
+        (d['low'] > d[['open', 'close']].min(axis=1))
+    )
+    if _bad.any():
+        print(f"  ⚠️ {day_str} OHLC 정합성 위반 {int(_bad.sum())}건: "
+              f"{d.loc[_bad, 'ticker'].head(5).tolist()}")
+
     return d[cols].dropna(subset=['ticker', 'close'])
 
 
@@ -712,6 +767,39 @@ def resolve_ohlcv_collect_plan(
     - MAX == biz_day: 스킵
     - MAX < biz_day: (MAX+1일) ~ biz_day 캘린더 순회(휴장은 CSV 빈응답으로 스킵)
     """
+    if OHLCV_REFETCH_DATES:
+        plan_dates = [str(d) for d in OHLCV_REFETCH_DATES]
+        print(f"⚠️ 강제 재수집 모드: {plan_dates}")
+        end = _as_plain_date(biz_day)
+        return {
+            'mode': 'refetch',
+            'table': table,
+            'db_max': None,
+            'biz_day': end,
+            'from_date': None,
+            'to_date': end,
+            'dates': plan_dates,
+            'message': f'강제 재수집: {plan_dates}',
+        }
+
+    if OHLCV_REFETCH_RANGE:
+        _f, _t = OHLCV_REFETCH_RANGE
+        start_d = _as_plain_date(_f)
+        end_d = _as_plain_date(_t)
+        plan_dates = _calendar_ymd_range(start_d, end_d)
+        print(f"⚠️ 구간 재수집 모드: {_f}~{_t} ({len(plan_dates)}일)")
+        end = end_d or _as_plain_date(biz_day)
+        return {
+            'mode': 'refetch_range',
+            'table': table,
+            'db_max': None,
+            'biz_day': end,
+            'from_date': start_d,
+            'to_date': end_d,
+            'dates': plan_dates,
+            'message': f'구간 재수집: {_f}~{_t} ({len(plan_dates)}일)',
+        }
+
     end = _as_plain_date(biz_day)
     mycursor.execute(f'SELECT MAX(`date`) FROM `{table}`')
     row = mycursor.fetchone()
@@ -819,6 +907,37 @@ def upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols, batch_size=1000):
     return {'total': len(rows), 'inserted': inserted, 'updated': updated}
 
 
+def detect_price_adjustment(mycursor, day_df, day_str, tol=0.02, top=10):
+    """CSV 등락률로 역산한 전일종가 vs DB 전일종가 불일치 → 소급 조정 의심 종목."""
+    d = day_df.dropna(subset=['close', 'chg_pct']).copy()
+    d = d[d['chg_pct'] > -100]
+    d['implied_prev'] = d['close'] / (1 + d['chg_pct'] / 100.0)
+    day_d = _as_plain_date(day_str)
+    if day_d is None:
+        return []
+    mycursor.execute(
+        "SELECT ticker, close FROM krx_ohlcv "
+        "WHERE date = (SELECT MAX(date) FROM krx_ohlcv WHERE date < %s)",
+        (day_d,),
+    )
+    prev = {r[0]: float(r[1]) for r in mycursor.fetchall() if r[1]}
+    hits = []
+    for _, r in d.iterrows():
+        p = prev.get(r['ticker'])
+        if not p or p <= 0:
+            continue
+        ratio = r['implied_prev'] / p
+        if abs(ratio - 1) > tol:
+            hits.append((r['ticker'], round(ratio, 3)))
+    if hits:
+        hits.sort(key=lambda x: -abs(x[1] - 1))
+        print(f"  ⚠️ {day_str} 소급 조정 의심 {len(hits)}종목 "
+              f"(상위 {top}): {hits[:top]}")
+        print(f"     → 해당 종목은 과거 구간 재수집이 필요합니다 "
+              f"(OHLCV_REFETCH_RANGE)")
+    return hits
+
+
 def collect_krx_ohlcv_by_days(session, mycursor, con, dates, ticker_filter=None):
     """
     거래일(캘린더) 루프로 MDCSTAT01501 일자 CSV 수집·upsert.
@@ -837,9 +956,16 @@ def collect_krx_ohlcv_by_days(session, mycursor, con, dates, ticker_filter=None)
             if day_df is None or day_df.empty:
                 empty_days += 1
                 continue
+            if OHLCV_REFETCH_DATES:
+                _s = day_df[day_df['ticker'].isin(['001130', '356860', '001230'])]
+                print(
+                    f"[refetch] {day} 표본:\n"
+                    f"{_s[['ticker', 'open', 'high', 'low', 'close', 'volume']]}"
+                )
             if ticker_filter is not None:
                 day_df = day_df[day_df['ticker'].isin(ticker_filter)]
             stats = upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols)
+            detect_price_adjustment(mycursor, day_df, day)
             total_rows += stats['total']
             inserted_rows += stats['inserted']
             updated_rows += stats['updated']
@@ -867,7 +993,11 @@ def build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=50):
     """
     krx_ohlcv 일봉 → 주봉(금요일 기준 W-FRI) 리샘플 후 krx_ohlcv_week upsert.
     종목별 네이버 요청 없이 DB만 사용.
+    WEEKLY_REBUILD=True 이면 적재 전 krx_ohlcv_week 전량 삭제.
     """
+    if WEEKLY_REBUILD:
+        print('  · WEEKLY_REBUILD=True — krx_ohlcv_week 재구축(전량 삭제 후 재적재)')
+        _purge_weekly_table(mycursor, con, 'krx_ohlcv_week')
     query = """
         INSERT INTO krx_ohlcv_week (ticker, date, open, high, low, close, volume)
         VALUES (%s, %s, %s, %s, %s, %s, %s) AS new
@@ -920,6 +1050,92 @@ def build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=50):
             print(traceback.format_exc())
     if commit_counter > 0:
         con.commit()
+    _log_weekly_label_validation(mycursor, 'krx_ohlcv_week')
+    return error_list
+
+
+def ensure_krx_etf_ohlcv_week_table(mycursor, con):
+    """krx_etf_ohlcv_week — 스키마는 krx_ohlcv_week 와 동일 (PK ticker+date, INDEX date)."""
+    mycursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS krx_etf_ohlcv_week (
+            ticker VARCHAR(10) NOT NULL,
+            `date` DATE NOT NULL,
+            open DECIMAL(15, 2),
+            high DECIMAL(15, 2),
+            low DECIMAL(15, 2),
+            close DECIMAL(15, 2),
+            volume BIGINT,
+            PRIMARY KEY (ticker, `date`),
+            INDEX idx_date (`date`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    con.commit()
+
+
+def build_weekly_etf_ohlcv_from_daily(mycursor, con, etf_codes, batch_size=50):
+    """
+    krx_etf_ohlcv 일봉 → 주봉(금요일 기준 W-FRI) 리샘플 후 krx_etf_ohlcv_week upsert.
+    주식판 build_weekly_ohlcv_from_daily 와 동일 패턴.
+    WEEKLY_REBUILD=True 이면 적재 전 krx_etf_ohlcv_week 전량 삭제.
+    """
+    if WEEKLY_REBUILD:
+        print('  · WEEKLY_REBUILD=True — krx_etf_ohlcv_week 재구축(전량 삭제 후 재적재)')
+        _purge_weekly_table(mycursor, con, 'krx_etf_ohlcv_week')
+    query = """
+        INSERT INTO krx_etf_ohlcv_week (ticker, date, open, high, low, close, volume)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) AS new
+        ON DUPLICATE KEY UPDATE
+        open=new.open, high=new.high, low=new.low, close=new.close, volume=new.volume
+    """
+    commit_counter = 0
+    error_list = []
+    for ticker in tqdm(etf_codes, desc='ETF주봉(일봉→리샘플)'):
+        try:
+            mycursor.execute(
+                """
+                SELECT `date`, open, high, low, close, volume
+                FROM krx_etf_ohlcv WHERE ticker=%s ORDER BY `date`
+                """,
+                (ticker,),
+            )
+            rows = mycursor.fetchall()
+            if not rows:
+                continue
+            price = pd.DataFrame(rows, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+            price['date'] = pd.to_datetime(price['date'])
+            price = price.set_index('date').sort_index()
+            for c in ('open', 'high', 'low', 'close', 'volume'):
+                price[c] = pd.to_numeric(price[c], errors='coerce')
+            week = price.resample('W-FRI').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+            }).dropna(subset=['close'])
+            if week.empty:
+                continue
+            week = week.reset_index()
+            week['ticker'] = ticker
+            week = week[['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']]
+            args = fetch_ohlcv_args_only_changed(
+                mycursor, 'krx_etf_ohlcv_week', ticker, week, ['open', 'high', 'low', 'close', 'volume']
+            )
+            if args:
+                mycursor.executemany(query, args)
+                commit_counter += 1
+                if commit_counter >= batch_size:
+                    con.commit()
+                    commit_counter = 0
+        except Exception:
+            error_list.append(ticker)
+            print(ticker)
+            print(traceback.format_exc())
+    if commit_counter > 0:
+        con.commit()
+    _log_weekly_label_validation(mycursor, 'krx_etf_ohlcv_week')
     return error_list
 
 
@@ -2538,6 +2754,17 @@ print(' - 주봉 데이터를 저장합니다. (일봉 DB → W-FRI 리샘플)')
 error_list = build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=batch_size)
 if error_list:
     print(f'⚠️ 주봉 리샘플 실패 종목 수: {len(error_list)}')
+
+### ETF 주봉 — 일봉(krx_etf_ohlcv) W-FRI 리샘플
+print(' - ETF 주봉 데이터를 저장합니다. (ETF 일봉 DB → W-FRI 리샘플)')
+ensure_krx_etf_ohlcv_week_table(mycursor, con)
+mycursor.execute("SELECT DISTINCT ticker FROM krx_etf_ohlcv ORDER BY ticker")
+etf_codes = [row[0] for row in mycursor.fetchall()]
+error_list_etf_week = build_weekly_etf_ohlcv_from_daily(
+    mycursor, con, etf_codes, batch_size=batch_size
+)
+if error_list_etf_week:
+    print(f'⚠️ ETF 주봉 리샘플 실패 종목 수: {len(error_list_etf_week)}')
 con.close()
 
 
