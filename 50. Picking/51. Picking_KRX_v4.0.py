@@ -151,9 +151,12 @@ import webbrowser
 import time
 import datetime
 import html as html_module
+import traceback
+from collections import defaultdict
 
 # 병렬 처리를 위한 추가 import
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
 ##########################################################################################################################################
@@ -174,8 +177,20 @@ SAVE_JPEG = False  # True로 설정하면 JPEG 파일도 생성 (기본값: Fals
 # --- 지표·투자자 OSC (tradingKIS_test.py와 동일, 단일 파일 내장) ---
 CHART_PERIOD_DAYS = 252
 
+# --- 일봉/주봉 공용 설정 (주봉 래퍼가 덮어씀) ---
+OHLCV_TABLE = "krx_ohlcv"
+# 이름=주봉 의미(1·2·4·13·26·52주), 값=일봉 기본 거래일
+WIN_1, WIN_2, WIN_4, WIN_13, WIN_26, WIN_52 = 5, 10, 20, 50, 120, 200
+RS_PERIODS = (10, 20, 50, 120, 200)
+USE_RS = True          # 주봉판에서 False 로 끄기 위한 플래그
+OUTPUT_SUFFIX = ""     # 주봉판이 "_week" 로 덮어씀
+SCREEN_FN = None       # 주봉 래퍼가 screen_weekly 등으로 주입
+
+# run_main() 중간 산출물 (대화식·래퍼에서 p51.CONTEXT["selected_df"] 등으로 접근)
+CONTEXT = {}
+
 # CSI (Pine Script: close loc length)
-_CSI_LENGTH = 20
+_CSI_LENGTH = WIN_4
 
 # --- 투자자 OSC (krx_investor_trade_krx net_val, indicators_core 정본, 누적 INVESTOR_OSC_CUM_DAYS일) ---
 _INVESTOR_OSC_COLS = ("inst_net_osc", "frgn_net_osc")
@@ -188,6 +203,11 @@ _INVESTOR_OSC_GROUPS = {
     "trust_net_osc": ("3000",),
     "private_net_osc": ("3100",),
 }
+
+# 지표 계산용 벌크 캐시 (None=미로드 → 단건 쿼리 폴백; dict=읽기 전용)
+_INVESTOR_CACHE = None
+_FOREIGN_CACHE = None
+_BULK_TICKER_CHUNK = 500
 
 
 def _csi_grade(last):
@@ -238,11 +258,98 @@ def _normalize_ticker(ticker=None, ohlcv_df=None):
     return None
 
 
+def _unique_tickers_zfill(tickers):
+    out = []
+    seen = set()
+    for t in tickers or []:
+        if t is None:
+            continue
+        s = str(t).strip().zfill(6)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _bulk_load_investor_trading(engine, tickers):
+    """전 종목 투자자 매매를 청크 조회 → dict[ticker, DataFrame(date, invst_tp_cd, net_val)]."""
+    result = {}
+    ut = _unique_tickers_zfill(tickers)
+    if engine is None or not ut:
+        return result
+    frames = []
+    try:
+        for i0 in range(0, len(ut), _BULK_TICKER_CHUNK):
+            chunk = ut[i0 : i0 + _BULK_TICKER_CHUNK]
+            ph = ",".join(["%s"] * len(chunk))
+            q = f"""
+                SELECT `date`, ticker, invst_tp_cd, net_val
+                FROM krx_investor_trade_krx
+                WHERE ticker IN ({ph})
+                  AND invst_tp_cd IN ('6000','3000','3100','9000')
+                ORDER BY ticker, `date`
+            """
+            part = pd.read_sql(q, engine, params=tuple(chunk))
+            if part is not None and not part.empty:
+                frames.append(part)
+    except Exception:
+        return result
+    if not frames:
+        return result
+    df = pd.concat(frames, ignore_index=True)
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.zfill(6)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["invst_tp_cd"] = df["invst_tp_cd"].astype(str).str.strip()
+    df["net_val"] = pd.to_numeric(df["net_val"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    for tk, g in df.groupby("ticker", sort=False):
+        result[str(tk)] = g[["date", "invst_tp_cd", "net_val"]].reset_index(drop=True)
+    return result
+
+
+def _bulk_load_foreign_holding(engine, tickers):
+    """전 종목 외국인 지분율을 청크 조회 → dict[ticker, DataFrame(date, frgn_ratio)]."""
+    result = {}
+    ut = _unique_tickers_zfill(tickers)
+    if engine is None or not ut:
+        return result
+    frames = []
+    try:
+        for i0 in range(0, len(ut), _BULK_TICKER_CHUNK):
+            chunk = ut[i0 : i0 + _BULK_TICKER_CHUNK]
+            ph = ",".join(["%s"] * len(chunk))
+            q = f"""
+                SELECT `date`, ticker, frgn_ratio
+                FROM krx_foreign_holding
+                WHERE ticker IN ({ph})
+                ORDER BY ticker, `date`
+            """
+            part = pd.read_sql(q, engine, params=tuple(chunk))
+            if part is not None and not part.empty:
+                frames.append(part)
+    except Exception:
+        return result
+    if not frames:
+        return result
+    df = pd.concat(frames, ignore_index=True)
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.zfill(6)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["frgn_ratio"] = pd.to_numeric(df["frgn_ratio"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    for tk, g in df.groupby("ticker", sort=False):
+        result[str(tk)] = g[["date", "frgn_ratio"]].reset_index(drop=True)
+    return result
+
+
 def _load_investor_trading(engine, ticker):
     """krx_investor_trade_krx 롱 테이블에서 금액(net_val) 시계열을 로드."""
     if engine is None or ticker is None:
         return pd.DataFrame()
     t = str(ticker).strip().zfill(6)
+    if _INVESTOR_CACHE is not None:
+        df = _INVESTOR_CACHE.get(t)
+        return df.copy() if df is not None and not df.empty else pd.DataFrame()
     query = """
         SELECT `date`, invst_tp_cd, net_val
         FROM krx_investor_trade_krx
@@ -266,6 +373,9 @@ def _load_foreign_holding(engine, ticker):
     if engine is None or ticker is None:
         return pd.DataFrame()
     t = str(ticker).strip().zfill(6)
+    if _FOREIGN_CACHE is not None:
+        df = _FOREIGN_CACHE.get(t)
+        return df.copy() if df is not None and not df.empty else pd.DataFrame()
     query = """
         SELECT `date`, frgn_ratio
         FROM krx_foreign_holding
@@ -376,7 +486,143 @@ def _investor_osc_summary(indicators_data, min_valid=5):
     return pd.DataFrame(rows)
 
 
+# --- TA-Lib 기간 가드 (timeperiod < 2 는 TA-Lib 오류) ---
+def _as_float_array(x):
+    return np.asarray(x, dtype=float)
+
+
+def _nan_like(x):
+    arr = _as_float_array(x)
+    return np.full(len(arr), np.nan, dtype=float)
+
+
+def _like(src, arr):
+    """입력 src 가 pandas Series 면 그 인덱스를 가진 Series 로 되돌린다."""
+    if isinstance(src, pd.Series):
+        return pd.Series(np.asarray(arr), index=src.index, dtype="float64")
+    return arr
+
+
+def _sma_safe(x, n):
+    n = int(n)
+    arr = _as_float_array(x)
+    if n < 2:
+        return _like(x, arr.copy())
+    return _like(x, talib.SMA(arr, n))
+
+
+def _ema_safe(x, n):
+    n = int(n)
+    arr = _as_float_array(x)
+    if n < 2:
+        return _like(x, _nan_like(x))
+    return _like(x, talib.EMA(arr, n))
+
+
+def _max_safe(x, n):
+    n = int(n)
+    arr = _as_float_array(x)
+    if n < 2:
+        return _like(x, _nan_like(x))
+    return _like(x, talib.MAX(arr, n))
+
+
+def _min_safe(x, n):
+    n = int(n)
+    arr = _as_float_array(x)
+    if n < 2:
+        return _like(x, _nan_like(x))
+    return _like(x, talib.MIN(arr, n))
+
+
+def _midprice_safe(high, low, n):
+    n = int(n)
+    h = _as_float_array(high)
+    l = _as_float_array(low)
+    if n < 2:
+        return _like(high, _nan_like(h))
+    return _like(high, talib.MIDPRICE(h, l, n))
+
+
+def _sum_safe(x, n):
+    n = int(n)
+    arr = _as_float_array(x)
+    if n < 2:
+        return _like(x, _nan_like(x))
+    return _like(x, talib.SUM(arr, n))
+
+
+def _bbands_safe(x, n, nbdevup=2, nbdevdn=2, matype=0):
+    n = int(n)
+    arr = _as_float_array(x)
+    nan = _nan_like(x)
+    if n < 2:
+        return _like(x, nan), _like(x, nan), _like(x, nan)
+    upper, middle, lower = talib.BBANDS(
+        arr, n, nbdevup=nbdevup, nbdevdn=nbdevdn, matype=matype
+    )
+    return _like(x, upper), _like(x, middle), _like(x, lower)
+
+
+def _minmax_safe(x, n):
+    n = int(n)
+    arr = _as_float_array(x)
+    nan = _nan_like(x)
+    if n < 2:
+        return _like(x, nan), _like(x, nan)
+    mn, mx = talib.MINMAX(arr, n)
+    return _like(x, mn), _like(x, mx)
+
+
+def _atr_wilder_safe(high, low, close, n):
+    n = int(n)
+    if n < 2:
+        return _like(close, _nan_like(close))
+    return atr_wilder(high, low, close, n)
+
+
+_INDICATOR_FAIL_LOCK = threading.Lock()
+_INDICATOR_FAIL_SHOWN = 0
+_INDICATOR_FAIL_TOTAL = 0
+_INDICATOR_FAIL_MAX_DETAIL = 5
+
+
+def _reset_indicator_fail_log():
+    global _INDICATOR_FAIL_SHOWN, _INDICATOR_FAIL_TOTAL
+    with _INDICATOR_FAIL_LOCK:
+        _INDICATOR_FAIL_SHOWN = 0
+        _INDICATOR_FAIL_TOTAL = 0
+
+
+def _log_indicator_fail(ticker, err):
+    global _INDICATOR_FAIL_SHOWN, _INDICATOR_FAIL_TOTAL
+    with _INDICATOR_FAIL_LOCK:
+        _INDICATOR_FAIL_TOTAL += 1
+        if _INDICATOR_FAIL_SHOWN < _INDICATOR_FAIL_MAX_DETAIL:
+            print(f"티커 {ticker} 지표 계산 실패: {err}")
+            _INDICATOR_FAIL_SHOWN += 1
+
+
+def _flush_indicator_fail_log():
+    global _INDICATOR_FAIL_SHOWN, _INDICATOR_FAIL_TOTAL
+    with _INDICATOR_FAIL_LOCK:
+        extra = _INDICATOR_FAIL_TOTAL - _INDICATOR_FAIL_SHOWN
+        if extra > 0:
+            print(f"… 지표 계산 실패 외 {extra}건")
+        _INDICATOR_FAIL_SHOWN = 0
+        _INDICATOR_FAIL_TOTAL = 0
+
+
 # --- 기술적 지표 ---
+
+def _concat_cols(d, df, tag):
+    if not df.index.equals(d.index):
+        raise ValueError(
+            f"[get_indicators] {tag} 인덱스 불일치: "
+            f"d={type(d.index).__name__}({len(d)}) vs {tag}={type(df.index).__name__}({len(df)})"
+        )
+    return pd.concat([d, df], axis=1)
+
 
 def get_indicators(d, tradeHist=None):
         
@@ -390,100 +636,100 @@ def get_indicators(d, tradeHist=None):
         # d.loc[d['open'] <= d['close'], 'upper'] = d['close']
         # d.loc[d['open'] >= d['close'], 'lower'] = d['close']
 
-        sma2 = talib.SMA(d.close, timeperiod=2)            
-        sma5 = talib.SMA(d.close, timeperiod=5)    
-        sma10 = talib.SMA(d.close, timeperiod=10)    
-        sma20 = talib.SMA(d.close, timeperiod=20)
-        sma30 = talib.SMA(d.close, timeperiod=30)
-        sma50 = talib.SMA(d.close, timeperiod=50)
-        sma60 = talib.SMA(d.close, timeperiod=60)
-        sma120 =  talib.SMA(d.close, timeperiod=120)
-        sma150 =  talib.SMA(d.close, timeperiod=150)
-        sma200 =  talib.SMA(d.close, timeperiod=200)
-        sma250 =  talib.SMA(d.close, timeperiod=250)
+        sma2 = _sma_safe(d.close,2)            
+        sma5 = _sma_safe(d.close,WIN_1)    
+        sma10 = _sma_safe(d.close,WIN_2)    
+        sma20 = _sma_safe(d.close,WIN_4)
+        sma30 = _sma_safe(d.close,30)
+        sma50 = _sma_safe(d.close,WIN_13)
+        sma60 = _sma_safe(d.close,60)
+        sma120 =  _sma_safe(d.close,WIN_26)
+        sma150 =  _sma_safe(d.close,150)
+        sma200 =  _sma_safe(d.close,WIN_52)
+        sma250 =  _sma_safe(d.close,250)
         
         sma_df = pd.DataFrame({'sma2': sma2, 'sma5': sma5, 'sma10': sma10, 'sma20': sma20, 'sma30': sma30, 'sma50': sma50, 'sma60': sma60,
                                'sma120': sma120, 'sma150': sma150, 'sma200': sma200, 'sma250': sma250})
         
-        d = pd.concat([d, sma_df], axis=1)
+        d = _concat_cols(d, sma_df, "sma_df")
         
-        d['ema20'] = talib.EMA(d.close, timeperiod=20)    
+        d['ema20'] = _ema_safe(d.close,WIN_4)    
         
-        max5 =  talib.MAX(d.high, timeperiod=5)
-        max10 =  talib.MAX(d.high, timeperiod=10)
-        max20 =  talib.MAX(d.high, timeperiod=20)
-        max50 =  talib.MAX(d.high, timeperiod=50)
-        max125 =  talib.MAX(d.high, timeperiod=125)
-        max250 =  talib.MAX(d.high, timeperiod=250)
+        max5 =  _max_safe(d.high,WIN_1)
+        max10 =  _max_safe(d.high,WIN_2)
+        max20 =  _max_safe(d.high,WIN_4)
+        max50 =  _max_safe(d.high,WIN_13)
+        max125 =  _max_safe(d.high,125)
+        max250 =  _max_safe(d.high,250)
         
-        min5 =  talib.MIN(d.low, timeperiod=5)
-        min10 =  talib.MIN(d.low, timeperiod=10)
-        min20 =  talib.MIN(d.low, timeperiod=20)
-        min50 =  talib.MIN(d.low, timeperiod=50)
-        min125 =  talib.MIN(d.low, timeperiod=125)
-        min250 =  talib.MIN(d.low, timeperiod=250)
+        min5 =  _min_safe(d.low,WIN_1)
+        min10 =  _min_safe(d.low,WIN_2)
+        min20 =  _min_safe(d.low,WIN_4)
+        min50 =  _min_safe(d.low,WIN_13)
+        min125 =  _min_safe(d.low,125)
+        min250 =  _min_safe(d.low,250)
 
-        mid5 = talib.MIDPRICE(d.high, d.low, timeperiod=5)          
-        mid10 = talib.MIDPRICE(d.high, d.low, timeperiod=10)        
-        mid20 = talib.MIDPRICE(d.high, d.low, timeperiod=20)
-        mid50 = talib.MIDPRICE(d.high, d.low, timeperiod=50)
-        mid125 = talib.MIDPRICE(d.high, d.low, timeperiod=125)
-        mid250 = talib.MIDPRICE(d.high, d.low, timeperiod=250)
+        mid5 = _midprice_safe(d.high, d.low,WIN_1)          
+        mid10 = _midprice_safe(d.high, d.low,WIN_2)        
+        mid20 = _midprice_safe(d.high, d.low,WIN_4)
+        mid50 = _midprice_safe(d.high, d.low,WIN_13)
+        mid125 = _midprice_safe(d.high, d.low,125)
+        mid250 = _midprice_safe(d.high, d.low,250)
         
         minmax_df = pd.DataFrame({'max5': max5, 'max10': max10, 'max20': max20, 'max50': max50, 'max125': max125, 'max250': max250,
                                   'min5': min5, 'min10': min10, 'min20': min20, 'min50': min50, 'min125': min125, 'min250': min250,
                                   'mid5': mid5, 'mid10': mid10, 'mid20': mid20, 'mid50': mid50, 'mid125': mid125, 'mid250': mid250})
         
-        d = pd.concat([d, minmax_df], axis=1)
+        d = _concat_cols(d, minmax_df, "minmax_df")
         
         atr4 = atr_wilder(d.high, d.low, d.close, 4)
         atr14 = atr_wilder(d.high, d.low, d.close, 14)
-        atr10 = atr_wilder(d.high, d.low, d.close, 10)
-        atr20 = atr_wilder(d.high, d.low, d.close, 20)
+        atr10 = _atr_wilder_safe(d.high, d.low, d.close, WIN_2)
+        atr20 = _atr_wilder_safe(d.high, d.low, d.close, WIN_4)
         atr30 = atr_wilder(d.high, d.low, d.close, 30)
-        # d['atr120'] = talib.ATR(d.high, d.low, d.close, timeperiod=120)
-        # d['atr56'] = talib.ATR(d.high, d.low, d.close, timeperiod=56)
+        # d['atr120'] = talib.ATR(d.high, d.low, d.close,WIN_26)
+        # d['atr56'] = talib.ATR(d.high, d.low, d.close,56)
         
         atr_df = pd.DataFrame({'atr4': atr4, 'atr10': atr10, 'atr20': atr20, 'atr30': atr30, 
                                'atr14': atr14})
         
-        d = pd.concat([d, atr_df], axis=1)
+        d = _concat_cols(d, atr_df, "atr_df")
         
         d['tr'] = talib.TRANGE(d.high, d.low, d.close)
-        # d['mtr4'] = talib.MAX(d.tr, timeperiod=4)
-        d['mtr7'] = talib.MAX(d.tr, timeperiod=7)
-        d['mtr14'] = talib.MAX(d.tr, timeperiod=14)
-        d['mtr20'] = talib.MAX(d.tr, timeperiod=20)
+        # d['mtr4'] = _max_safe(d.tr,4)
+        d['mtr7'] = _max_safe(d.tr,7)
+        d['mtr14'] = _max_safe(d.tr,14)
+        d['mtr20'] = _max_safe(d.tr,WIN_4)
 
         
-        d['maxP_index'] = talib.MAXINDEX(d.close, timeperiod=60)
-        d['minP_index'] = talib.MININDEX(d.close, timeperiod=60)
+        d['maxP_index'] = talib.MAXINDEX(d.close,60)
+        d['minP_index'] = talib.MININDEX(d.close,60)
     
-        d['maxV_index'] = talib.MAXINDEX(d.volume, timeperiod=60)
+        d['maxV_index'] = talib.MAXINDEX(d.volume,60)
         
         
-        d['slope20'] = talib.LINEARREG_ANGLE(d.typical, timeperiod=20)
-        d['slope30'] = talib.LINEARREG_ANGLE(d.typical, timeperiod=30)
-        d['slope40'] = talib.LINEARREG_ANGLE(d.typical, timeperiod=40)
+        d['slope20'] = talib.LINEARREG_ANGLE(d.typical,WIN_4)
+        d['slope30'] = talib.LINEARREG_ANGLE(d.typical,30)
+        d['slope40'] = talib.LINEARREG_ANGLE(d.typical,40)
         
         
-        upperband, middleband, lowerband = talib.BBANDS(d.close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+        upperband, middleband, lowerband = _bbands_safe(d.close,WIN_4, nbdevup=2, nbdevdn=2, matype=0)
         
         d['bol20_up'] = upperband
         d['bol20_ma'] = middleband
         d['bol20_dn'] = lowerband
         
         # 정본: indicators_core (루트·naverPub 동일). band20_q = 정규화 0~1
-        d['band20_w'] = bollinger_band_width(d.close, window=20, n_sigma=2.0)
+        d['band20_w'] = bollinger_band_width(d.close, window=WIN_4, n_sigma=2.0)
         d['band20_w_min'] = d['band20_w'].rolling(125, min_periods=125).min()
         d['band20_w_max'] = d['band20_w'].rolling(125, min_periods=125).max()
-        d['band20_q'] = bollinger_band_width_q(d.close, window=20, n_sigma=2.0, lookback=125)
+        d['band20_q'] = bollinger_band_width_q(d.close, window=WIN_4, n_sigma=2.0, lookback=125)
 
         d['atr_w'] = d.atr14 / d.close.replace(0, np.nan)
-        d['atr_w_min'], d['atr_w_max'] = talib.MINMAX(d.atr_w, timeperiod=125)
+        d['atr_w_min'], d['atr_w_max'] = _minmax_safe(d.atr_w,125)
         d['atr_q'] = (d.atr_w - d.atr_w_min) / (d.atr_w_max - d.atr_w_min).replace(0, np.nan)
 
-        upperband, middleband, lowerband = talib.BBANDS(d.close, timeperiod=50, nbdevup=2, nbdevdn=2, matype=0)
+        upperband, middleband, lowerband = _bbands_safe(d.close,WIN_13, nbdevup=2, nbdevdn=2, matype=0)
         
         d['bol50_up'] = upperband
         d['bol50_ma'] = middleband
@@ -491,7 +737,7 @@ def get_indicators(d, tradeHist=None):
         
         d['band50_w'] = (d.bol50_up - d.bol50_dn)/d.bol50_ma     
         
-        upperband, middleband, lowerband = talib.BBANDS(d.close, timeperiod=120, nbdevup=2, nbdevdn=2, matype=0)
+        upperband, middleband, lowerband = _bbands_safe(d.close,WIN_26, nbdevup=2, nbdevdn=2, matype=0)
         
         d['bol120_up'] = upperband
         d['bol120_ma'] = middleband
@@ -509,7 +755,7 @@ def get_indicators(d, tradeHist=None):
         dsprt_df = pd.DataFrame({'dsprt20': dsprt20, 'dsprt50': dsprt50, 'dsprt120': dsprt120
                                  })
         
-        d = pd.concat([d, dsprt_df], axis=1)
+        d = _concat_cols(d, dsprt_df, "dsprt_df")
 
         # CSI (screening_loop.py — indicators.py 동일)
         _atr10 = d.atr10.replace(0, np.nan)
@@ -518,22 +764,22 @@ def get_indicators(d, tradeHist=None):
         d['csi20'] = ((d.high - d.sma20) / _atr20 + (d.low - d.sma20) / _atr20) / 2
         d['csi10'] = ((d.high - d.sma10) / _atr10 + (d.low - d.sma10) / _atr10) / 2
         d['csi30'] = ((d.high - d.sma30) / _atr30 + (d.low - d.sma30) / _atr30) / 2
-        d['csi20_max'] = talib.MAX(d.csi20, timeperiod=20)
+        d['csi20_max'] = _max_safe(d.csi20,WIN_4)
 
         # CSI — Pine: cs=(close-sma(close,L))/atr(L); csi=sma(cs,2); fast=ema(cs,10); slow=ema(cs,20)
         _L = _CSI_LENGTH
-        _csi_sma = talib.SMA(d.close, timeperiod=_L)
-        _csi_atr = atr_wilder(d.high, d.low, d.close, _L)
+        _csi_sma = _sma_safe(d.close,_L)
+        _csi_atr = _atr_wilder_safe(d.high, d.low, d.close, _L)
         cs = (d.close - _csi_sma) / _csi_atr.replace(0, np.nan)
-        d["csi"] = talib.SMA(cs, timeperiod=2)
-        d["csi_fast"] = talib.EMA(cs, timeperiod=10)
-        d["csi_slow"] = talib.EMA(cs, timeperiod=20)
+        d["csi"] = _sma_safe(cs,2)
+        d["csi_fast"] = _ema_safe(cs,WIN_2)
+        d["csi_slow"] = _ema_safe(cs,WIN_4)
 
         ## momentum
         
-        d['di_P'] = talib.PLUS_DI(d.high, d.low, d.close, timeperiod=14)
-        d['di_M'] = talib.MINUS_DI(d.high, d.low, d.close, timeperiod=14)
-        d['adx'] = talib.ADX(d.high, d.low, d.close, timeperiod=14)
+        d['di_P'] = talib.PLUS_DI(d.high, d.low, d.close,14)
+        d['di_M'] = talib.MINUS_DI(d.high, d.low, d.close,14)
+        d['adx'] = talib.ADX(d.high, d.low, d.close,14)
     
         
         macd, macdsignal, macdhist = talib.MACD(d.close, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -567,30 +813,30 @@ def get_indicators(d, tradeHist=None):
        
     ### 거래량
            
-        d['vol_sma5'] = talib.SMA(d.volume, timeperiod=5)
-        d['vol_sma20'] = talib.SMA(d.volume, timeperiod=20)
-        d['vol_sma50'] = talib.SMA(d.volume, timeperiod=50)
+        d['vol_sma5'] = _sma_safe(d.volume,WIN_1)
+        d['vol_sma20'] = _sma_safe(d.volume,WIN_4)
+        d['vol_sma50'] = _sma_safe(d.volume,WIN_13)
         
-        d['vol_sum5'] = talib.SUM(d.volume, timeperiod=5)
-        d['vol_sum20'] = talib.SUM(d.volume, timeperiod=20)
-        d['vol_sum50'] = talib.SUM(d.volume, timeperiod=50)
+        d['vol_sum5'] = _sum_safe(d.volume,WIN_1)
+        d['vol_sum20'] = _sum_safe(d.volume,WIN_4)
+        d['vol_sum50'] = _sum_safe(d.volume,WIN_13)
             
-        d['vol_sum5_sma5'] = talib.SMA(d.vol_sum5, timeperiod=5)
-        d['vol_sum20_sma20'] = talib.SMA(d.vol_sum20, timeperiod=20)
+        d['vol_sum5_sma5'] = _sma_safe(d.vol_sum5,WIN_1)
+        d['vol_sum20_sma20'] = _sma_safe(d.vol_sum20,WIN_4)
                 
-        d['vol_max5'] =  talib.MAX(d.volume, timeperiod=5)
-        d['vol_max20'] =  talib.MAX(d.volume, timeperiod=20)
-        d['vol_max50'] =  talib.MAX(d.volume, timeperiod=50)
+        d['vol_max5'] =  _max_safe(d.volume,WIN_1)
+        d['vol_max20'] =  _max_safe(d.volume,WIN_4)
+        d['vol_max50'] =  _max_safe(d.volume,WIN_13)
        
         d.loc[(d['volume'] == 0) & (d['close'] != 0), ['open', 'high', 'low']] = d['close']
         
         d['obv'] = talib.OBV(d.close, d.volume)
         
-        # d['obv_slope'] = talib.LINEARREG_ANGLE(d.obv, timeperiod=20)
+        # d['obv_slope'] = talib.LINEARREG_ANGLE(d.obv,WIN_4)
         
         d['vol_vol50'] = d.volume/d.vol_sma50
         
-        d['max_vol50'] = talib.MAX(d.vol_vol50, timeperiod=50)
+        d['max_vol50'] = _max_safe(d.vol_vol50,WIN_13)
         
         # d['volume_id50'] = d['vol_max50']/d['vol_sma50']
         # d['volume_id20'] = d['vol_max20']/d['vol_sma20']
@@ -598,16 +844,16 @@ def get_indicators(d, tradeHist=None):
         ### BOX
         
         
-        box7 = talib.MAX(d.high, timeperiod=7) - talib.MIN(d.low, timeperiod=7)
-        box14 = talib.MAX(d.high, timeperiod=14) - talib.MIN(d.low, timeperiod=14)
-        box21 = talib.MAX(d.high, timeperiod=21) - talib.MIN(d.low, timeperiod=21)
-        box30 = talib.MAX(d.high, timeperiod=30) - talib.MIN(d.low, timeperiod=30)
-        box40 = talib.MAX(d.high, timeperiod=40) - talib.MIN(d.low, timeperiod=40)
-        box50 = talib.MAX(d.high, timeperiod=50) - talib.MIN(d.low, timeperiod=50)
+        box7 = _max_safe(d.high,7) - _min_safe(d.low,7)
+        box14 = _max_safe(d.high,14) - _min_safe(d.low,14)
+        box21 = _max_safe(d.high,21) - _min_safe(d.low,21)
+        box30 = _max_safe(d.high,30) - _min_safe(d.low,30)
+        box40 = _max_safe(d.high,40) - _min_safe(d.low,40)
+        box50 = _max_safe(d.high,WIN_13) - _min_safe(d.low,WIN_13)
         
         box_df = pd.DataFrame({'box7': box7, 'box14': box14, 'box21': box21, 'box30': box30, 'box40': box40, 'box50': box50})
         
-        d = pd.concat([d, box_df], axis=1)
+        d = _concat_cols(d, box_df, "box_df")
 
         
         d['pb'] = (d.close - d.bol20_dn)/(d.bol20_up - d.bol20_dn)
@@ -615,11 +861,11 @@ def get_indicators(d, tradeHist=None):
         d['sma_score'] = d['pm']  # screening_loop p14 등
         d['pc'] = (d.close - d.ch_dn2)/(d.ch_up2 - d.ch_dn2)
         
-        d['pb_max'] = talib.MAX(d.pb, timeperiod=20)
-        d['pb_min'] = talib.MIN(d.pb, timeperiod=20)
+        d['pb_max'] = _max_safe(d.pb,WIN_4)
+        d['pb_min'] = _min_safe(d.pb,WIN_4)
         
-        d['mfi'] = talib.MFI(d.high, d.low, d.close, d.volume, timeperiod=14)
-        d['willr'] = talib.WILLR(d.high, d.low, d.close, timeperiod=14)
+        d['mfi'] = talib.MFI(d.high, d.low, d.close, d.volume,14)
+        d['willr'] = talib.WILLR(d.high, d.low, d.close,14)
 
         if tradeHist is not None:
             if isinstance(tradeHist, str):
@@ -640,10 +886,10 @@ def get_indicators(d, tradeHist=None):
             d['stop_atr'] = min(d.iloc[-1].close, d.iloc[-1].open) - d.iloc[-1].atr14*1.5
             d['stop_mtr'] = min(d.iloc[-1].close, d.iloc[-1].open) - d.iloc[-1].mtr14*1 
             
-            # maxIndex = talib.MAXINDEX(d.high, timeperiod=20)
+            # maxIndex = talib.MAXINDEX(d.high,WIN_4)
     
-            # d['stop_h'] = min(d.iloc[talib.MAXINDEX(d.high, timeperiod=20).iloc[-1]].close, 
-            #                   d.iloc[talib.MAXINDEX(d.high, timeperiod=20).iloc[-1]].open) - talib.MAX(d.atr14, timeperiod=20).iloc[-1]*1.5
+            # d['stop_h'] = min(d.iloc[talib.MAXINDEX(d.high,WIN_4).iloc[-1]].close, 
+            #                   d.iloc[talib.MAXINDEX(d.high,WIN_4).iloc[-1]].open) - _max_safe(d.atr14,WIN_4).iloc[-1]*1.5
             
             d['stop_h'] = d.iloc[-1].max20 - d.iloc[-1].mtr20*1.5
 
@@ -677,14 +923,30 @@ def _ensure_investor_osc_on_df(df, ticker):
 
 ##########################################################################################################################################
 
-### 휴일을 입력
-holidays = ['2023-08-15', '2023-09-28', '2023-09-29', '2023-10-02', '2023-10-03', '2023-10-09', "2023-12-25", '2023-12-29',
-            "2024-01-01", '2024-02-09', '2024-02-12', '2024-03-01', '2024-04-10', "2024-05-06", '2024-05-01', '2024-05-15', "2024-06-06",
-            '2024-08-15', '2024-09-16', '2024-09-17', '2024-09-18', '2024-10-01', '2024-10-03', '2024-10-09', '2024-12-25', '2024-12-31',
-            '2025-01-01', '2025-01-27', '2025-01-28', '2025-01-29', '2025-01-30', '2025-03-03', '2025-05-01', '2025-05-05', '2025-05-06',
-            '2025-06-03', '2025-06-06', '2025-08-15', '2025-10-03', '2025-10-06', '2025-10-07', '2025-10-08', '2025-10-09',
-            '2025-12-25', '2025-12-31', '2026-01-01', '2026-02-16', '2026-02-17', '2026-02-18', '2026-03-02', '2026-05-01',
-            '2026-05-05', '2026-05-25', '2026-06-03', '2026-07-17', '2026-08-17']
+_TRADING_DAYS_CACHE = {}
+
+
+def _load_trading_days(engine, start, end):
+    """krx_ohlcv 실제 거래일 집합. (start, end) 캐시."""
+    key = (str(start)[:10], str(end)[:10])
+    if key in _TRADING_DAYS_CACHE:
+        return _TRADING_DAYS_CACHE[key]
+    # 휴장일은 '일봉' 달력이므로 주봉 테이블로 바뀌어도 krx_ohlcv 고정
+    q = "SELECT DISTINCT date FROM krx_ohlcv WHERE date BETWEEN %s AND %s"
+    df = pd.read_sql_query(q, con=engine, params=(key[0], key[1]))
+    out = set(pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize())
+    _TRADING_DAYS_CACHE[key] = out
+    return out
+
+
+def _nontrading_weekdays(engine, start, end):
+    """구간 내 평일 중 거래일이 아닌 날 = 휴장일 (YYYY-MM-DD 문자열)."""
+    try:
+        td = _load_trading_days(engine, start, end)
+        return [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start, end) if d not in td]
+    except Exception as e:
+        print(f"⚠️ 휴장일 자동 도출 실패: {e}")
+        return []
 
 
 audit_ticker = ['006620', '001705', '005440', '272210', '298040', '322000', '329180', '375500', '383220', '456010', '460930',
@@ -705,25 +967,32 @@ audit_ticker = ['006620', '001705', '005440', '272210', '298040', '322000', '329
                 ]
 
 audit_ticker = []
-### 서버 접속
-engine = create_engine(db_url())
-conn_str = db_url().replace('mysql+pymysql://', 'mysql://', 1)
 
-### 티커를 가져옴
-query = """
-select * from krx_ticker
-where 기준일 = (select max(기준일) from krx_ticker) and 종목구분 = '보통주';
-"""
 
-ticker_list = pd.read_sql(query, con=engine)
-# 시가총액 컬럼이 있으면 가져오고, 없으면 None으로 설정
-if '시가총액' in ticker_list.columns:
-    ticker_list = ticker_list[['종목코드', '종목명', '업종명', '시가총액']]
-else:
-    ticker_list['시가총액'] = None
-    ticker_list = ticker_list[['종목코드', '종목명', '업종명', '시가총액']]
-ticker_list = drop_excluded(ticker_list, "종목코드")
-ticker_list = ticker_list.set_index('종목코드')
+# --- 스크리닝 기본 임계값 (일봉). ctx["screen_cfg"] 로 덮어씀 ---
+def _default_screen_cfg():
+    return {
+        "min_bars": WIN_26,
+        "atr14_close_max": 0.1,
+        "mtr7_close_max": 0.2,
+        "box7_close_max": 0.3,
+        "band_squeeze_q": 0.1,
+        "band_squeeze_q2": 0.2,
+        "use_rs": USE_RS,
+    }
+
+
+def _resolve_screen_cfg(ctx):
+    cfg = _default_screen_cfg()
+    if ctx:
+        cfg.update(ctx.get("screen_cfg") or {})
+    return cfg
+
+
+### 서버 접속·티커는 run_main()에서 초기화 (import 시 실행 안 함)
+engine = None
+conn_str = None
+ticker_list = None
 
 
 # 최적화된 데이터 로딩 함수들
@@ -732,9 +1001,9 @@ def load_single_ticker_ohlcv(ticker, ticker_list, engine):
     try:
         # KRX 통일 후 name/market/mcap 등 추가 → select * + insert(name) 충돌 방지
         ohlcv = pd.read_sql_query(
-            """
+            f"""
             SELECT date, open, high, low, close, volume
-            FROM krx_ohlcv
+            FROM `{OHLCV_TABLE}`
             WHERE ticker = %s
             ORDER BY date
             """,
@@ -839,19 +1108,20 @@ def calculate_single_indicators(ticker_data):
     """단일 종목 지표 계산 (병렬 처리용)"""
     ticker, data = ticker_data
     try:
-        if len(data) >= 120:
+        if len(data) >= WIN_26:
             indicators_result = build_indicators(data, None, engine=engine, ticker=ticker)
             return ticker, indicators_result
         return ticker, None
     except Exception as e:
-        print(f"티커 {ticker} 지표 계산 실패: {e}")
+        _log_indicator_fail(ticker, e)
         return ticker, None
 
 
 def calculate_indicators_parallel(ohlcv_data, max_workers=8):
     """병렬 처리로 지표 계산"""
     indicators_data = {}
-    
+    _reset_indicator_fail_log()
+
     print(f"병렬 처리로 {len(ohlcv_data)}개 종목 지표 계산 시작...")
     print(f"사용할 워커 수: {max_workers}")
     
@@ -868,7 +1138,8 @@ def calculate_indicators_parallel(ohlcv_data, max_workers=8):
             ticker, indicators_result = future.result()
             if indicators_result is not None:
                 indicators_data[ticker] = indicators_result
-    
+
+    _flush_indicator_fail_log()
     print(f"지표 계산 완료: {len(indicators_data)}개")
     return indicators_data
 
@@ -955,48 +1226,996 @@ def calculate_volume_band_parallel(ohlcv_data, max_workers=6):
     print(f"매물대 계산 완료: {len(volume_data)}개")
     return volume_data
 
-def run_screening(indicators_data, volume_data, rs_df, ticker_list, audit_ticker):
-    """종목 스크리닝 (screening_loop.py 내장)"""
+
+# ---------------------------------------------------------------------------
+# [1] 패턴 레지스트리 골격
+# ---------------------------------------------------------------------------
+
+PATTERN_REGISTRY = {}   # code -> {"fn","group","name","params"}
+
+def pattern(code, group, name, **params):
+    def deco(fn):
+        PATTERN_REGISTRY[code] = {
+            "fn": fn, "group": group, "name": name, "params": dict(params)
+        }
+        return fn
+    return deco
+
+def _pat_params(code, ctx=None):
+    P = dict(PATTERN_REGISTRY[code]["params"])
+    if ctx:
+        P.update((ctx.get("pattern_params") or {}).get(code, {}))
+        if "rs_df" not in P and ctx.get("rs_df") is not None:
+            P["rs_df"] = ctx["rs_df"]
+        if "volume_data" not in P and ctx.get("volume_data") is not None:
+            P["volume_data"] = ctx["volume_data"]
+    return P
+
+_PAT_EXC_SHOWN = set()
+
+def _pat_exc(code):
+    if code not in _PAT_EXC_SHOWN:
+        _PAT_EXC_SHOWN.add(code)
+        print(f"⚠️ 패턴 {code} 예외 (최초 1회):\n{traceback.format_exc()}")
+
+
+# ---------------------------------------------------------------------------
+# [2] 공통 술어 (p11~p14 등에서 반복)
+# ---------------------------------------------------------------------------
+
+def ma_aligned(r):
+    return r.sma20 > r.sma50 and r.sma50 > r.sma120 and r.sma120 > r.sma200
+
+def ma_rising(d, n50=6, n120=13, n200=21):
+    last = d.iloc[-1]
+    return (last.sma50 > d.iloc[-n50].sma50
+            and last.sma120 > d.iloc[-n120].sma120
+            and last.sma200 > d.iloc[-n200].sma200)
+
+def box_pos(r, hi_col, lo_col):
+    rng = r[hi_col] - r[lo_col]
+    if not (rng > 0):
+        return np.nan          # NaN 비교는 False → 원본의 >0 가드와 동일
+    return (r["close"] - r[lo_col]) / rng
+
+
+# ---------------------------------------------------------------------------
+# [3] 추출된 패턴 함수 (p11 ~ p17)
+# ---------------------------------------------------------------------------
+
+@pattern("p11", group="이동평균", name="정배열+20일박스상단",
+         box20_lo=0.75, box20_hi=0.90, box125_lo=0.75)
+def _p11(d, P):
+    r = d.iloc[-1]
+    return bool(ma_aligned(r) and ma_rising(d)
+                and box_pos(r, "max20", "min20") < P["box20_hi"]
+                and box_pos(r, "max20", "min20") > P["box20_lo"]
+                and box_pos(r, "max125", "min125") > P["box125_lo"])
+
+
+@pattern("p12", group="이동평균", name="정배열+CSI음수",
+         box125_lo=0.75, csi_max=0)
+def _p12(d, P):
+    r = d.iloc[-1]
+    return bool(ma_aligned(r) and ma_rising(d)
+                and box_pos(r, "max125", "min125") > P["box125_lo"]
+                and (r.csi10 < P["csi_max"] or r.csi20 < P["csi_max"] or r.csi30 < P["csi_max"]))
+
+
+@pattern("p13", group="이동평균", name="정배열+20일박스+거래량축소",
+         box20_lo=0.75, box20_hi=0.90, box125_lo=0.75, vol_surge_mult=2)
+def _p13(d, P):
+    r = d.iloc[-1]
+    return bool(ma_aligned(r) and ma_rising(d)
+                and box_pos(r, "max20", "min20") < P["box20_hi"]
+                and box_pos(r, "max20", "min20") > P["box20_lo"]
+                and box_pos(r, "max125", "min125") > P["box125_lo"]
+                and (d.iloc[-21].vol_sum20 > d.iloc[-41].vol_sum20 * P["vol_surge_mult"]
+                     or d.iloc[-21].vol_sum50 > d.iloc[-71].vol_sum50 * P["vol_surge_mult"])
+                and r.vol_sum20 < d.iloc[-21].vol_sum20)
+
+
+@pattern("p14", group="이동평균", name="정배열+CSI음수+거래량축소",
+         box125_lo=0.75, csi_max=0, vol_surge_mult=2)
+def _p14(d, P):
+    r = d.iloc[-1]
+    return bool(ma_aligned(r) and ma_rising(d, n50=6, n120=6, n200=6)
+                and box_pos(r, "max125", "min125") > P["box125_lo"]
+                and (r.csi10 < P["csi_max"] or r.csi20 < P["csi_max"] or r.csi30 < P["csi_max"])
+                and (d.iloc[-21].vol_sum20 > d.iloc[-41].vol_sum20 * P["vol_surge_mult"]
+                     or d.iloc[-21].vol_sum50 > d.iloc[-71].vol_sum50 * P["vol_surge_mult"])
+                and r.vol_sum20 < d.iloc[-21].vol_sum20)
+
+
+@pattern("p15", group="이동평균", name="정배열+이평점수+ATR근접",
+         sma_score_lo=0.75, atr_mult=1.0)
+def _p15(d, P):
+    r = d.iloc[-1]
+    return bool(ma_aligned(r)
+                and r.sma_score > P["sma_score_lo"]
+                and r.close < r.sma20 + r.atr14 * P["atr_mult"])
+
+
+@pattern("p16", group="이동평균", name="정배열+20선밀착+저점상승",
+         atr_band=0.5, min_ratio_lo=0.5)
+def _p16(d, P):
+    r = d.iloc[-1]
+    rng50 = r.max50 - r.min50
+    return bool(ma_aligned(r)
+                and (r.close < r.sma20 + r.atr14 * P["atr_band"] or r.open < r.sma20 + r.atr14 * P["atr_band"])
+                and (r.close > r.sma20 - r.atr14 * P["atr_band"] or r.open > r.sma20 - r.atr14 * P["atr_band"])
+                and ma_rising(d)
+                and (rng50 > 0 and (r.min20 - r.min50) / rng50 > P["min_ratio_lo"]))
+
+
+_P17_NO_RS_WARNED = False
+
+
+@pattern("p17", group="거래량", name="거래량급증상승_축소횡보_재상승",
+         min_bars=100, surge_gain_min=15, vol_surge_ratio_min=1.3,
+         consol_range_max=20, vol_contraction_max=0.70, price_from_high_max=15,
+         price_pos_consol_min=0.4, ma50_support_mult=0.98, rs_min=70,
+         consol_breakout_mult=0.90)
+def _p17(d, P):
+    if len(d) < P["min_bars"]:
+        return False
+    try:
+        idc = d.iloc
+        # === 1단계: 거래량 급증 상승 구간 확인 (30~50일 전) ===
+        surge_start_price = idc[-50].close if len(d) >= 50 else idc[-40].close
+        surge_high_price = idc[-35:-25].high.max() if len(d) >= 35 else idc[-30:-20].high.max()
+
+        if surge_start_price > 0:
+            surge_gain = (surge_high_price - surge_start_price) / surge_start_price * 100
+        else:
+            surge_gain = 0
+
+        vol_surge_period = idc[-50:-30].volume.mean() if len(d) >= 50 else idc[-40:-25].volume.mean()
+        vol_before_surge = idc[-80:-50].volume.mean() if len(d) >= 80 else idc[-60:-40].volume.mean()
+
+        if vol_before_surge > 0:
+            vol_surge_ratio = vol_surge_period / vol_before_surge
+        else:
+            vol_surge_ratio = 0
+
+        # === 2단계: 횡보/조정 구간 확인 (최근 10~25일) ===
+        consol_high = idc[-25:-1].high.max()
+        consol_low = idc[-25:-1].low.min()
+
+        if consol_high > 0:
+            consol_range = (consol_high - consol_low) / consol_high * 100
+        else:
+            consol_range = 100
+
+        vol_consol = idc[-25:-1].volume.mean()
+
+        if vol_surge_period > 0:
+            vol_contraction = vol_consol / vol_surge_period
+        else:
+            vol_contraction = 1
+
+        # === 3단계: 현재 위치 확인 ===
+        current_price = idc[-1].close
+
+        if surge_high_price > 0:
+            price_from_high = (surge_high_price - current_price) / surge_high_price * 100
+        else:
+            price_from_high = 100
+
+        if (consol_high - consol_low) > 0:
+            price_position_in_consol = (current_price - consol_low) / (consol_high - consol_low)
+        else:
+            price_position_in_consol = 0
+
+        # === 4단계: 이동평균선 확인 ===
+        above_ma20 = current_price > idc[-1].sma20
+        ma50_support = idc[-1].sma50 >= idc[-10].sma50 * P["ma50_support_mult"]
+
+        # === 5단계: RS 확인 ===
+        global _P17_NO_RS_WARNED
+        _tk = str(idc[-1].ticker)
+        _rs_df = P.get("rs_df")
+        if _rs_df is None:
+            if not _P17_NO_RS_WARNED:
+                _P17_NO_RS_WARNED = True
+                print("⚠️ p17: rs_df 없음 — RS 조건 항상 False")
+            has_rs = False
+        else:
+            has_rs = _tk in _rs_df.index and _rs_df.loc[_tk].rs_score >= P["rs_min"]
+
+        # === 6단계: 최종 조건 ===
+        return bool(surge_gain >= P["surge_gain_min"]
+                    and vol_surge_ratio >= P["vol_surge_ratio_min"]
+                    and consol_range <= P["consol_range_max"]
+                    and vol_contraction <= P["vol_contraction_max"]
+                    and price_from_high <= P["price_from_high_max"]
+                    and price_position_in_consol >= P["price_pos_consol_min"]
+                    and above_ma20
+                    and ma50_support
+                    and has_rs
+                    and current_price > consol_high * P["consol_breakout_mult"])
+    except Exception:
+        return False
+
+
+def _extract_rs(d, P):
+    """지표 DF와 파라미터 P(rs_df 포함)에서 종목 RS 점수 추출."""
+    _tk = str(d.iloc[-1].ticker)
+    rs_df = P.get("rs_df")
+    if rs_df is not None and len(rs_df) > 0 and _tk in rs_df.index:
+        try:
+            row = rs_df.loc[_tk]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[-1]
+            return float(row.rs20_score), float(row.rs50_score), float(row.rs_score), True
+        except Exception:
+            pass
+    return 0.0, 0.0, 0.0, False
+
+
+@pattern("p21", group="신고가", name="50일신고가+음봉조정",
+         n50=6, atr_mult=1.0)
+def _p21(d, P):
+    r = d.iloc[-1]
+    return bool(r.max5 > d.iloc[-P["n50"]].max50
+                and r.close > r.max5 - r.atr14 * P["atr_mult"]
+                and r.close < r.open)
+
+
+@pattern("p22", group="신고가", name="하이앤타이트플래그",
+         surge_ratio=1.9)
+def _p22(d, P):
+    r = d.iloc[-1]
+    max_min_diff_50 = 0
+    max_min_diff_5 = 0
+    if r.max10 > 0 and r.min50 > 0:
+        max_min_diff_50 = r.max50 - r.min50
+        max_min_diff_5 = r.max5 - r.min5
+    if max_min_diff_50 > 0 and max_min_diff_5 > 0 and r.min50 > 0:
+        return bool(r.max10 / r.min50 > P["surge_ratio"]
+                    and r.high < r.max10)
+    return False
+
+
+@pattern("p23", group="신고가", name="52주신고가+눌림목+고RS",
+         n250=21, rs20_min=80, rs50_min=80, band20_q_max=1, pb_max=1)
+def _p23(d, P):
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r = d.iloc[-1]
+    return bool(r.max20 > d.iloc[-P["n250"]].max250
+                and r.close > r.sma20 and r.close < r.sma10
+                and (rs20S > P["rs20_min"] and rs50S > P["rs50_min"])
+                and (r.band20_q < P["band20_q_max"] or r.pb < P["pb_max"]))
+
+
+@pattern("p24", group="신고가", name="52주신고가+20선지지+고RS",
+         n250=21, atr_mult=1.0, rs20_min=85, rs50_min=85)
+def _p24(d, P):
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r = d.iloc[-1]
+    return bool(r.max20 > d.iloc[-P["n250"]].max250
+                and r.close < r.sma20 + r.atr14 * P["atr_mult"]
+                and r.close > r.sma20 - r.atr14 * P["atr_mult"]
+                and r.close > r.sma50
+                and (rs20S > P["rs20_min"] or rs50S > P["rs50_min"]))
+
+
+@pattern("p25", group="신고가", name="50일신고가(250대비)+20선지지+고RS",
+         n250=51, atr_mult=1.0, rs20_min=85, rs50_min=85)
+def _p25(d, P):
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r = d.iloc[-1]
+    return bool(r.max50 > d.iloc[-P["n250"]].max250
+                and r.close < r.sma20 + r.atr14 * P["atr_mult"]
+                and r.close > r.sma20 - r.atr14 * P["atr_mult"]
+                and r.close > r.sma50
+                and (rs20S > P["rs20_min"] or rs50S > P["rs50_min"]))
+
+
+@pattern("p26", group="신고가", name="10일신고가(50대비)+20선지지+고RS",
+         n50=11, atr_mult=1.0, rs20_min=85, rs50_min=85)
+def _p26(d, P):
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r = d.iloc[-1]
+    return bool(r.max10 > d.iloc[-P["n50"]].max50
+                and r.close < r.sma20 + r.atr14 * P["atr_mult"]
+                and r.close > r.sma20 - r.atr14 * P["atr_mult"]
+                and r.close > r.sma50
+                and (rs20S > P["rs20_min"] or rs50S > P["rs50_min"]))
+
+
+@pattern("p27", group="신고가", name="10일신고가(125대비)+20선지지+고RS",
+         n125=11, atr_mult=1.0, rs20_min=85, rs50_min=85, dead=True)
+def _p27(d, P):
+    # 원본 가드: (rs_df 없음 or 티커가 rs_df에 없음) and p26 미선정
+    # → 그 경우 rs20S/rs50S 가 0 이므로 내부 rs>85 가 항상 False.
+    # 즉 원본에서 p27 은 한 번도 발동하지 않는 죽은 패턴이다.
+    # 측정 단계에서 로직을 바꾸지 않기 위해 원본 동작을 그대로 보존한다.
+    # (2단계 통합 때 폐기 또는 의도대로 수정할지 결정)
+    return False
+
+
+@pattern("p28", group="신고가", name="신고가돌파봉+고RS",
+         rs20_min=80, rs50_min=80)
+def _p28(d, P):
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r1 = d.iloc[-1]
+    r2 = d.iloc[-2]
+    return bool(((r1.close > r2.max50 and r2.close < r2.max50)
+                 or (r1.close > r2.max125 and r2.close < r2.max125)
+                 or (r1.close > r2.max250 and r2.close < r2.max250))
+                and (rs20S > P["rs20_min"] or rs50S > P["rs50_min"]))
+
+
+@pattern("p29a", group="신고가", name="125일신고가+정배열+고RS(50이내)",
+         n125=6, rs20_min=80, rs50_min=80)
+def _p29a(d, P):
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r = d.iloc[-1]
+    return bool(r.max5 > d.iloc[-P["n125"]].max125
+                and r.close > d.iloc[-P["n125"]].max125
+                and (rs20S > P["rs20_min"] or rs50S > P["rs50_min"])
+                and ma_aligned(r))
+
+
+@pattern("p29b", group="신고가", name="125일신고가+정배열+고RS(50초과)",
+         n125=6, rs20_min=80, rs50_min=80)
+def _p29b(d, P):
+    return _p29a(d, P)
+
+
+@pattern("p31", group="볼린저", name="밴드수축+정배열+박스상단",
+         band_squeeze_q=0.1, n50=6, box125_lo=0.5)
+def _p31(d, P):
+    r = d.iloc[-1]
+    return bool(r.band20_q < P["band_squeeze_q"]
+                and ma_aligned(r)
+                and r.sma50 > d.iloc[-P["n50"]].sma50
+                and box_pos(r, "max125", "min125") > P["box125_lo"])
+
+
+@pattern("p32", group="볼린저", name="밴드하단근접+정배열+박스상단",
+         pb_max=0.3, n50=6, box125_lo=0.75)
+def _p32(d, P):
+    r = d.iloc[-1]
+    return bool(r.pb < P["pb_max"]
+                and ma_aligned(r)
+                and r.sma50 > d.iloc[-P["n50"]].sma50
+                and box_pos(r, "max125", "min125") > P["box125_lo"])
+
+
+@pattern("p33", group="볼린저", name="밴드상단돌파후회귀+50선배열",
+         n50=6, pb_hi=1.0, pb_lo=0.8)
+def _p33(d, P):
+    r = d.iloc[-1]
+    return bool(r.max5 > r.bol20_up
+                and r.max5 > d.iloc[-P["n50"]].max50
+                and r.pb < P["pb_hi"]
+                and r.pb > P["pb_lo"]
+                and r.sma50 > r.sma120
+                and r.sma120 > r.sma200)
+
+
+@pattern("p34", group="볼린저", name="밴드돌파+50일신고가+밴드수축",
+         n50=6, band_squeeze_q2=0.2, pb_hi=1.2, pb_lo=0.8)
+def _p34(d, P):
+    r = d.iloc[-1]
+    return bool(r.max5 > d.iloc[-P["n50"]].bol20_up
+                and r.max5 > d.iloc[-P["n50"]].max50
+                and r.band20_q < P["band_squeeze_q2"]
+                and r.pb < P["pb_hi"]
+                and r.pb > P["pb_lo"])
+
+
+@pattern("p35", group="볼린저", name="밴드근접+박스상단",
+         pb_max=1.0, box125_lo=0.75)
+def _p35(d, P):
+    r = d.iloc[-1]
+    return bool(r.pb_max < P["pb_max"]
+                and box_pos(r, "max125", "min125") > P["box125_lo"])
+
+
+@pattern("p36", group="볼린저", name="밴드스퀴즈반등+고RS",
+         band_squeeze_q2=0.2, rs_min=80)
+def _p36(d, P):
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r1 = d.iloc[-1]
+    r2 = d.iloc[-2]
+    return bool(r2.band20_q < P["band_squeeze_q2"]
+                and r1.band20_q > r2.band20_q
+                and rsS > P["rs_min"])
+
+
+_P41_NO_VOL_WARNED = False
+
+@pattern("p41", group="매물대", name="최대매물대돌파+매물집중",
+         n_prev=6, vol_p_max=40)
+def _p41(d, P):
+    global _P41_NO_VOL_WARNED
+    vol_data = P.get("volume_data")
+    if not vol_data:
+        if not _P41_NO_VOL_WARNED:
+            _P41_NO_VOL_WARNED = True
+            print("⚠️ p41: volume_data 없음 — 조건 항상 False")
+        return False
+    _tk = str(d.iloc[-1].ticker)
+    vd = vol_data.get(_tk)
+    if vd is None and hasattr(d.iloc[-1], 'ticker'):
+        vd = vol_data.get(d.iloc[-1].ticker)
+    if vd is None:
+        return False
+    try:
+        r = d.iloc[-1]
+        max_p = vd['volume_p'].idxmax()
+        return bool(r.close > max_p
+                    and d.iloc[-P["n_prev"]].close < max_p
+                    and vd['volume_p'].max() > P["vol_p_max"])
+    except Exception:
+        return False
+
+
+_P42_NO_VOL_WARNED = False
+
+@pattern("p42", group="매물대", name="최대매물대돌파+누적매물80",
+         n_prev=6, vol_cum_min=80)
+def _p42(d, P):
+    global _P42_NO_VOL_WARNED
+    vol_data = P.get("volume_data")
+    if not vol_data:
+        if not _P42_NO_VOL_WARNED:
+            _P42_NO_VOL_WARNED = True
+            print("⚠️ p42: volume_data 없음 — 조건 항상 False")
+        return False
+    _tk = str(d.iloc[-1].ticker)
+    vd = vol_data.get(_tk)
+    if vd is None and hasattr(d.iloc[-1], 'ticker'):
+        vd = vol_data.get(d.iloc[-1].ticker)
+    if vd is None:
+        return False
+    try:
+        r = d.iloc[-1]
+        max_p = vd['volume_p'].idxmax()
+        cum_row = vd.loc[max_p]
+        cum_val = cum_row.volume_p_cum
+        if hasattr(cum_val, 'iloc'):
+            cum_val = cum_val.iloc[-1]
+        return bool(r.close > max_p
+                    and d.iloc[-P["n_prev"]].close < max_p
+                    and float(cum_val) > P["vol_cum_min"])
+    except Exception:
+        return False
+
+
+@pattern("p43", group="매물대", name="변동성수축+박스압축+이평정렬",
+         min20_ratio_lo=0.75, box20_hi=0.9)
+def _p43(d, P):
+    r = d.iloc[-1]
+    rng125 = r.max125 - r.min125
+    rng20 = r.max20 - r.min20
+    rng50 = r.max50 - r.min50
+    if not (rng125 > 0 and rng20 > 0):
+        return False
+    return bool(rng20 < rng50
+                and rng50 < rng125
+                and (r.min20 - r.min125) / rng125 > P["min20_ratio_lo"]
+                and box_pos(r, "max20", "min20") < P["box20_hi"]
+                and r.sma50 > r.sma120 and r.sma120 > r.sma200)
+
+
+@pattern("p51", group="차트패턴", name="Cup with Handle(단순)",
+         min_bars=22, n200=21, max125_mult=0.75, min125_mult=1.25,
+         n20=2, max20_mult=0.9, n50=6, max50_mult=1.1, rs_min=90)
+def _p51(d, P):
+    if len(d) < P["min_bars"]:
+        return False
+    rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+    if not has_rs:
+        return False
+    r = d.iloc[-1]
+    return bool(r.sma50 > r.sma150 and r.sma150 > r.sma200
+                and r.sma200 > d.iloc[-P["n200"]].sma200
+                and r.min5 > r.max125 * P["max125_mult"]
+                and r.min5 > r.min125 * P["min125_mult"]
+                and r.close > d.iloc[-P["n20"]].max20 * P["max20_mult"]
+                and r.max5 < d.iloc[-P["n50"]].max50 * P["max50_mult"]
+                and rsS > P["rs_min"])
+
+
+@pattern("p52", group="차트패턴", name="미너비니 CWH",
+         min_bars=120, cup_depth_min=5, cup_depth_max=70,
+         handle_depth_min=5, handle_depth_max=25, handle_pos_min=40,
+         vol_drying_1_min=0.05, vol_drying_2_min=0.02,
+         tt_conditions_min=5, tt6_mult=1.20, tt7_mult=0.65, n200=21,
+         rs_min=65, pivot_ratio_min=0.80, pivot_ratio_max=1.10)
+def _p52(d, P):
+    if len(d) < P["min_bars"]:
+        return False
+    try:
+        idc = d.iloc
+        rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+
+        # === 1단계: 컵(Cup) 패턴 찾기 ===
+        cup_left_window_start = min(150, len(d)-1)
+        cup_left_window_end = min(70, len(d)-1)
+        cup_left_high = idc[-cup_left_window_start:-cup_left_window_end].high.max()
+
+        cup_bottom = idc[-70:-15].low.min()
+        cup_right_high = idc[-15:].high.max()
+
+        if not (cup_left_high > 0):
+            return False
+
+        cup_depth_pct = (cup_left_high - cup_bottom) / cup_left_high * 100
+
+        # === 2단계: 핸들(Handle) 패턴 찾기 ===
+        handle_high = idc[-15:-1].high.max()
+        handle_low = idc[-15:-1].low.min()
+
+        handle_depth_pct = (handle_high - handle_low) / cup_left_high * 100
+
+        cup_height = cup_left_high - cup_bottom
+        if cup_height > 0:
+            handle_position_pct = (handle_low - cup_bottom) / cup_height * 100
+        else:
+            handle_position_pct = 0
+
+        # === 3단계: 거래량 패턴 분석 ===
+        vol_left = idc[-100:-70].volume.mean() if len(d) >= 100 else idc[-70:-50].volume.mean()
+        vol_bottom = idc[-50:-20].volume.mean()
+        vol_handle = idc[-15:-1].volume.mean()
+        vol_recent = idc[-1].volume
+
+        vol_drying_1 = (vol_left - vol_bottom) / vol_left if vol_left > 0 else 0
+        vol_drying_2 = (vol_bottom - vol_handle) / vol_bottom if vol_bottom > 0 else 0
+        vol_surge = vol_recent / vol_handle if vol_handle > 0 else 0
+
+        # === 4단계: Trend Template 검증 (8개 조건) ===
+        tt_conditions = 0
+
+        if idc[-1].close > idc[-1].sma150 and idc[-1].close > idc[-1].sma200:
+            tt_conditions += 1
+
+        if idc[-1].sma150 > idc[-1].sma200:
+            tt_conditions += 1
+
+        if idc[-1].sma200 > idc[-P["n200"]].sma200:
+            tt_conditions += 1
+
+        if idc[-1].sma50 > idc[-1].sma150 and idc[-1].sma50 > idc[-1].sma200:
+            tt_conditions += 1
+
+        if idc[-1].close > idc[-1].sma50:
+            tt_conditions += 1
+
+        week52_low = idc[-200:].low.min() if len(d) >= 200 else idc[-120:].low.min()
+        if idc[-1].close > week52_low * P["tt6_mult"]:
+            tt_conditions += 1
+
+        week52_high = idc[-200:].high.max() if len(d) >= 200 else idc[-120:].high.max()
+        if week52_high > 0 and idc[-1].close >= week52_high * P["tt7_mult"]:
+            tt_conditions += 1
+
+        if has_rs and rsS >= P["rs_min"]:
+            tt_conditions += 1
+
+        # === 5단계: 피벗 포인트 (매수 시점) 계산 ===
+        pivot_point = handle_high
+        buy_point = pivot_point * 1.001
+        current_vs_pivot = idc[-1].close / pivot_point
+
+        # === 6단계: 최종 조건 검증 ===
+        return bool(P["cup_depth_min"] <= cup_depth_pct <= P["cup_depth_max"]
+                    and P["handle_depth_min"] <= handle_depth_pct <= P["handle_depth_max"]
+                    and handle_position_pct >= P["handle_pos_min"]
+                    and tt_conditions >= P["tt_conditions_min"]
+                    and has_rs
+                    and rsS >= P["rs_min"]
+                    and vol_drying_1 >= P["vol_drying_1_min"]
+                    and vol_drying_2 >= P["vol_drying_2_min"]
+                    and P["pivot_ratio_min"] <= current_vs_pivot <= P["pivot_ratio_max"]
+                    and idc[-1].close > idc[-1].sma50)
+    except Exception:
+        return False
+
+
+@pattern("p53", group="차트패턴", name="High Tight Flag",
+         min_bars=80, surge_pct_min=60, flag_depth_min=8, flag_depth_max=30,
+         price_from_high_max=20, vol_decrease_min=0.20, rs_min=75,
+         surge_high_mult=0.85)
+def _p53(d, P):
+    if len(d) < P["min_bars"]:
+        return False
+    try:
+        idc = d.iloc
+        rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+
+        # === 1단계: 급등 확인 (최근 25~50일) ===
+        surge_start_price = idc[-50:-40].close.min() if len(d) >= 50 else idc[-40:-30].close.min()
+        surge_high = idc[-25:-8].high.max()
+
+        if not (surge_start_price > 0):
+            return False
+
+        surge_pct = (surge_high - surge_start_price) / surge_start_price * 100
+
+        # === 2단계: 타이트한 조정 확인 (최근 8~20일) ===
+        flag_high = idc[-20:-1].high.max()
+        flag_low = idc[-20:-1].low.min()
+
+        if not (surge_high > 0):
+            return False
+
+        flag_depth_pct = (flag_high - flag_low) / surge_high * 100
+        price_from_high = (surge_high - idc[-1].close) / surge_high * 100
+
+        # === 3단계: 거래량 패턴 ===
+        vol_surge = idc[-40:-15].volume.mean()
+        vol_flag = idc[-15:-1].volume.mean()
+        vol_decrease = (vol_surge - vol_flag) / vol_surge if vol_surge > 0 else 0
+
+        # === 4단계: 이동평균선 체크 ===
+        ma_aligned = idc[-1].sma20 > idc[-1].sma50
+
+        # === 5단계: 최종 조건 (완화) ===
+        return bool(surge_pct >= P["surge_pct_min"]
+                    and P["flag_depth_min"] <= flag_depth_pct <= P["flag_depth_max"]
+                    and price_from_high <= P["price_from_high_max"]
+                    and vol_decrease >= P["vol_decrease_min"]
+                    and ma_aligned
+                    and idc[-1].close > idc[-1].sma20
+                    and has_rs
+                    and rsS >= P["rs_min"]
+                    and idc[-1].close > surge_high * P["surge_high_mult"])
+    except Exception:
+        return False
+
+
+@pattern("p54", group="차트패턴", name="VCP",
+         min_bars=120, range_contract_mult=0.9, vol_contract_mult=0.9,
+         is_tight_max=12, base_depth_max=50, ma50_mult=0.98,
+         rs_min=70, base_breakout_mult=0.80)
+def _p54(d, P):
+    if len(d) < P["min_bars"]:
+        return False
+    try:
+        idc = d.iloc
+        rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+
+        # === 1단계: 세 번의 수축 구간 정의 ===
+
+        # T1: 첫 번째 수축 (50~35일 전)
+        t1_high = idc[-50:-35].high.max()
+        t1_low = idc[-50:-35].low.min()
+        t1_range = (t1_high - t1_low) / t1_high * 100 if t1_high > 0 else 0
+        t1_vol = idc[-50:-35].volume.mean()
+
+        # T2: 두 번째 수축 (35~18일 전)
+        t2_high = idc[-35:-18].high.max()
+        t2_low = idc[-35:-18].low.min()
+        t2_range = (t2_high - t2_low) / t2_high * 100 if t2_high > 0 else 0
+        t2_vol = idc[-35:-18].volume.mean()
+
+        # T3: 세 번째 수축 (최근 18일)
+        t3_high = idc[-18:-1].high.max()
+        t3_low = idc[-18:-1].low.min()
+        t3_range = (t3_high - t3_low) / t3_high * 100 if t3_high > 0 else 0
+        t3_vol = idc[-18:-1].volume.mean()
+
+        # === 2단계: 변동성 축소 확인 (완화) ===
+
+        # 각 구간의 변동성이 감소 경향인지 (완벽하지 않아도 OK)
+        volatility_contracting = (t1_range > t2_range * P["range_contract_mult"] and t2_range > t3_range * P["range_contract_mult"])
+
+        # 거래량도 감소 경향인지
+        volume_contracting = (t1_vol > t2_vol * P["vol_contract_mult"] and t2_vol > t3_vol * P["vol_contract_mult"])
+
+        # 마지막 수축이 충분히 타이트한지 (완화)
+        is_tight = t3_range < P["is_tight_max"]
+
+        # === 3단계: 베이스 높이 확인 ===
+
+        # 전체 베이스 깊이
+        base_high = idc[-50:].high.max()
+        base_low = idc[-50:].low.min()
+        base_depth = (base_high - base_low) / base_high * 100 if base_high > 0 else 0
+
+        # === 4단계: 이동평균선 지지 ===
+
+        # 50일선 상승 중 또는 평탄
+        ma50_rising = idc[-1].sma50 >= idc[-10].sma50 * P["ma50_mult"]
+
+        # 현재가가 주요 이평선 위
+        above_ma = idc[-1].close > idc[-1].sma20
+
+        # === 5단계: 최종 조건 (완화) ===
+
+        return bool(volatility_contracting
+                    and volume_contracting
+                    and is_tight
+                    and base_depth <= P["base_depth_max"]
+                    and ma50_rising
+                    and above_ma
+                    and has_rs
+                    and rsS >= P["rs_min"]
+                    and idc[-1].close > base_high * P["base_breakout_mult"])
+    except Exception:
+        return False
+
+
+@pattern("p55", group="차트패턴", name="Flat Base",
+         min_bars=100, pre_base_gain_min=10, base_range_pct_max=25,
+         vol_dried_mult=0.85, vol_increasing_mult=1.05, ma_setup_mult=0.95,
+         base_above_ma20_mult=0.90, near_breakout_mult=0.85, rs_min=70,
+         ma50_support_mult=0.95)
+def _p55(d, P):
+    if len(d) < P["min_bars"]:
+        return False
+    try:
+        idc = d.iloc
+        rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+
+        # === 1단계: 이전 상승 추세 확인 ===
+
+        # 베이스 전 가격 (70일 전)
+        pre_base_price = idc[-70].close if len(d) >= 70 else idc[-50].close
+
+        # 베이스 시작점 (35일 전)
+        base_start_price = idc[-35].close
+
+        # 베이스 전 상승률
+        if pre_base_price > 0:
+            pre_base_gain = (base_start_price - pre_base_price) / pre_base_price * 100
+        else:
+            pre_base_gain = 0
+
+        # === 2단계: Flat Base 확인 (최근 15~35일) ===
+
+        # 베이스 구간 고점/저점
+        base_high = idc[-35:-1].high.max()
+        base_low = idc[-35:-1].low.min()
+
+        # 베이스 변동폭
+        if base_high > 0:
+            base_range_pct = (base_high - base_low) / base_high * 100
+        else:
+            base_range_pct = 100
+
+        # 현재가 위치
+        current_position = (idc[-1].close - base_low) / (base_high - base_low) if (base_high - base_low) > 0 else 0
+
+        # === 3단계: 거래량 패턴 ===
+
+        # 베이스 전 거래량 (70~35일 전)
+        vol_pre_base = idc[-70:-35].volume.mean() if len(d) >= 70 else idc[-50:-25].volume.mean()
+
+        # 베이스 중 거래량 (35~8일 전)
+        vol_during_base = idc[-35:-8].volume.mean()
+
+        # 최근 거래량 (최근 8일)
+        vol_recent = idc[-8:].volume.mean()
+
+        # 거래량 감소 후 증가 (더욱 완화)
+        vol_dried = vol_during_base < vol_pre_base * P["vol_dried_mult"]
+        vol_increasing = vol_recent > vol_during_base * P["vol_increasing_mult"]
+
+        # === 4단계: 이동평균선 배열 ===
+
+        # 주요 이평선 정배열 또는 지지 (더욱 완화)
+        ma_setup = idc[-1].close > idc[-1].sma50 * P["ma_setup_mult"]
+
+        # 베이스가 20일선 근처에서 형성 (더욱 완화)
+        base_above_ma20 = base_low > idc[-25].sma20 * P["base_above_ma20_mult"]
+
+        # === 5단계: 돌파 확인 ===
+
+        # 최근 고점 테스트 중 (더욱 완화)
+        near_breakout = idc[-1].close > base_high * P["near_breakout_mult"]
+
+        # 피벗 포인트
+        pivot = base_high
+
+        # === 6단계: 최종 조건 (더욱 완화) ===
+
+        return bool(pre_base_gain >= P["pre_base_gain_min"]
+                    and base_range_pct <= P["base_range_pct_max"]
+                    and vol_dried
+                    and ma_setup
+                    and base_above_ma20
+                    and has_rs
+                    and rsS >= P["rs_min"]
+                    and near_breakout
+                    and idc[-1].sma50 >= idc[-10].sma50 * P["ma50_support_mult"])
+    except Exception:
+        return False
+
+
+@pattern("p61", group="준비단계", name="Pre-Rally Setup",
+         min_bars=120, band20_q_max=0.20, pos_lo=0.10, pos_hi=0.50,
+         dmi_diff_min=3, adx_min=20, ma20_dist_min=-10, ma20_dist_max=10,
+         mfi_lo=40, mfi_hi=90, willr_lo=-80, willr_hi=-20,
+         vol_avg_mult=0.95, support_min=2)
+def _p61(d, P):
+    if len(d) < P["min_bars"]:
+        return False
+    try:
+        idc = d.iloc
+        current_price = idc[-1].close
+
+        # === 핵심 조건 6개 (모두 AND - 필수) ===
+
+        # 1. Band Squeeze: < 0.20 (완화)
+        if not ('band20_q' in d.columns and idc[-1].band20_q < P["band20_q_max"]):
+            return False
+
+        # 2. 가격 위치: 0.10-0.50 (완화)
+        if not all(col in d.columns for col in ['close', 'max20', 'min20']):
+            return False
+        if (idc[-1].max20 - idc[-1].min20) <= 0:
+            return False
+        position = (current_price - idc[-1].min20) / (idc[-1].max20 - idc[-1].min20)
+        if not (P["pos_lo"] <= position <= P["pos_hi"]):
+            return False
+
+        # 3. DMI 우위: DI+ - DI- > 3 (완화)
+        if not all(col in d.columns for col in ['di_P', 'di_M']):
+            return False
+        if not (idc[-1].di_P - idc[-1].di_M > P["dmi_diff_min"]):
+            return False
+
+        # 4. ADX: > 20 (완화)
+        if not ('adx' in d.columns and idc[-1].adx > P["adx_min"]):
+            return False
+
+        # 5. MA20 근처: ±10% (완화)
+        if not ('sma20' in d.columns and idc[-1].sma20 > 0):
+            return False
+        ma20_dist_pct = (current_price - idc[-1].sma20) / idc[-1].sma20 * 100
+        if not (P["ma20_dist_min"] <= ma20_dist_pct <= P["ma20_dist_max"]):
+            return False
+
+        # 6. MFI: 40-90 (완화)
+        if not ('mfi' in d.columns and P["mfi_lo"] <= idc[-1].mfi <= P["mfi_hi"]):
+            return False
+
+        # === 보조 조건 (3개 중 2개 이상 만족) ===
+
+        support_count = 0
+
+        # 7. Williams %R: -80 ~ -20 (선택)
+        if 'willr' in d.columns and P["willr_lo"] <= idc[-1].willr <= P["willr_hi"]:
+            support_count += 1
+
+        # 8. 이평선 정배열: 20>50>120 (선택)
+        if all(col in d.columns for col in ['sma20', 'sma50', 'sma120']):
+            if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120:
+                support_count += 1
+
+        # 9. 거래량 증가: 5일 > 20일 (선택, 완화)
+        if all(col in d.columns for col in ['vol_sum5', 'vol_sum20']):
+            vol_avg5 = idc[-1].vol_sum5 / 5
+            vol_avg20 = idc[-1].vol_sum20 / 20
+            if vol_avg5 > vol_avg20 * P["vol_avg_mult"]:  # 거의 동등 이상이면 OK
+                support_count += 1
+
+        # 보조 조건 2개 이상 만족 시 선정
+        if support_count >= P["support_min"]:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+@pattern("p71", group="변동성", name="mtr7 급확대 + 정배열",
+         n8=8, mtr7_mult=1.5)
+def _p71(d, P):
+    if len(d) < P["n8"]:
+        return False
+    try:
+        r = d.iloc[-1]
+        return bool(r.mtr7 > d.iloc[-P["n8"]].atr14 * P["mtr7_mult"]
+                    and r.close < r.max5
+                    and ma_aligned(r))
+    except Exception:
+        return False
+
+
+@pattern("p81", group="이격", name="밴드·CSI 동반 확대",
+         n2=2)
+def _p81(d, P):
+    if len(d) < P["n2"]:
+        return False
+    try:
+        r = d.iloc[-1]
+        prev = d.iloc[-P["n2"]]
+        return bool(r.band20_q > prev.band20_q and r.csi > prev.csi)
+    except Exception:
+        return False
+
+
+@pattern("p91", group="RS", name="rs50 상위 + rs20 중위",
+         rs50_min=95, rs20_hi=95, rs20_lo=50, rs_min=90)
+def _p91(d, P):
+    try:
+        rs20S, rs50S, rsS, has_rs = _extract_rs(d, P)
+        if not has_rs:
+            return False
+        return bool(rs50S > P["rs50_min"]
+                    and rs20S < P["rs20_hi"]
+                    and rs20S > P["rs20_lo"]
+                    and rsS > P["rs_min"])
+    except Exception:
+        return False
+
+
+@pattern("p92", group="RS", name="밴드스퀴즈 + 신고가",
+         band_squeeze_q2=0.2, atr_q_max=0.2, n11=11, n21=21, n51=51)
+def _p92(d, P):
+    if len(d) < P["n51"]:
+        return False
+    try:
+        r = d.iloc[-1]
+        cond_break = (r.max10 > d.iloc[-P["n11"]].max50 or r.max10 > d.iloc[-P["n11"]].max125
+                      or r.max20 > d.iloc[-P["n21"]].max50 or r.max20 > d.iloc[-P["n21"]].max125
+                      or r.max50 > d.iloc[-P["n51"]].max50 or r.max50 > d.iloc[-P["n51"]].max125)
+        return bool(r.band20_q < P["band_squeeze_q2"]
+                    and r.atr_q < P["atr_q_max"]
+                    and cond_break)
+    except Exception:
+        return False
+
+
+@pattern("p93", group="RS", name="밴드 확장 초입",
+         band20_q_max=0.8, n6=6)
+def _p93(d, P):
+    if len(d) < P["n6"]:
+        return False
+    try:
+        r = d.iloc[-1]
+        return bool(r.band20_q < P["band20_q_max"] and r.band20_q > d.iloc[-P["n6"]].band20_q)
+    except Exception:
+        return False
+
+
+def screen_all(indicators_data, rs_df=None, **ctx):
+    """종목 스크리닝 (screening_loop.py 내장). SCREEN_FN 미설정 시 일봉 기본."""
+    cfg = _resolve_screen_cfg(ctx)
+    volume_data = ctx.get("volume_data") or {}
+    ticker_list = ctx.get("ticker_list")
+    audit_list = ctx.get("audit_ticker", audit_ticker)
+    if rs_df is None:
+        rs_df = ctx.get("rs_df")
+    if rs_df is None:
+        rs_df = pd.DataFrame(columns=["rs10_score", "rs20_score", "rs50_score", "rs_score"])
+    ctx["rs_df"] = rs_df
     debug_counts = {"total_indicators": len(indicators_data), "passed_basic_filter": 0, "passed_atr_filter": 0, "selected_by_pattern": 0}
     selected_stocks = []
-    selected_stock11 = ['p11']
-    selected_stock12 = ['p12']
-    selected_stock13 = ['p13']
-    selected_stock14 = ['p14']
-    selected_stock15 = ['p15']
-    selected_stock16 = ['p16']
-    selected_stock17 = ['p17']
-    selected_stock21 = ['p21']
-    selected_stock22 = ['p22']
-    selected_stock23 = ['p23']
-    selected_stock24 = ['p24']
-    selected_stock25 = ['p25']
-    selected_stock26 = ['p26']
-    selected_stock27 = ['p27']
-    selected_stock28 = ['p28']
-    selected_stock29a = ['p29']
-    selected_stock29b = ['p29']
-    selected_stock31 = ['p31']
-    selected_stock32 = ['p32']
-    selected_stock33 = ['p33']
-    selected_stock34 = ['p34']
-    selected_stock35 = ['p35']
-    selected_stock36 = ['p36']
-    selected_stock41 = ['p41']
-    selected_stock42 = ['p42']
-    selected_stock43 = ['p43']
-    selected_stock51 = ['p51']
-    selected_stock52 = ['p52']
-    selected_stock53 = ['p53']
-    selected_stock54 = ['p54']
-    selected_stock55 = ['p55']
-    selected_stock61 = ['p61']
-    selected_stock71 = ['p71']
-    selected_stock81 = ['p81']
-    selected_stock91 = ['p91']
-    selected_stock92 = ['p92']
-    selected_stock93 = ['p93']
+    _buckets = defaultdict(list)
 
+    try:
+        _mc = pd.to_numeric(ticker_list['시가총액'], errors='coerce')
+        print(f"[filter] DISPLAY_MCAP_MIN={DISPLAY_MCAP_MIN:,}")
+        print(f"[filter] 시가총액 n={_mc.notna().sum()} min={_mc.min():,.0f} "
+              f"med={_mc.median():,.0f} max={_mc.max():,.0f}")
+        print(f"[filter] 기준 통과 종목수={(_mc >= DISPLAY_MCAP_MIN).sum()}")
+        print(f"[filter] min_bars={cfg['min_bars']} audit_list={len(audit_list)}건")
+    except Exception as e:
+        print(f"[filter] 진단 실패: {e}")
+
+    _basic_sub = {"bars": 0, "open": 0, "mcap": 0, "audit": 0}
 
     for k, i in tqdm(indicators_data.items(), desc="스크리닝"):
         idc = i.iloc
@@ -1014,1446 +2233,93 @@ def run_screening(indicators_data, volume_data, rs_df, ticker_list, audit_ticker
             except Exception:
                 pass
 
-        if len(i) >= 120 and i.iloc[-1].open > 0 and ticker_list.loc[_tk]['시가총액'] >= DISPLAY_MCAP_MIN\
-            and _tk not in audit_ticker:
+        _c_bars = len(i) >= cfg["min_bars"]
+        _c_open = i.iloc[-1].open > 0
+        try:
+            _c_mcap = ticker_list.loc[_tk]['시가총액'] >= DISPLAY_MCAP_MIN
+        except Exception:
+            _c_mcap = False
+        _c_audit = _tk not in audit_list
+        _basic_sub["bars"] += int(_c_bars)
+        _basic_sub["open"] += int(_c_open)
+        _basic_sub["mcap"] += int(_c_mcap)
+        _basic_sub["audit"] += int(_c_audit)
+
+        if _c_bars and _c_open and _c_mcap and _c_audit:
                 debug_counts['passed_basic_filter'] += 1
                 ticker = i.iloc[0].ticker
                 close = i.iloc[-1].close
 
-                if (idc[-1].atr14/close) < 0.1 and idc[-1].mtr7/close < 0.2 and idc[-1].box7/close < 0.3:
+                if (idc[-1].atr14/close) < cfg["atr14_close_max"] and idc[-1].mtr7/close < cfg["mtr7_close_max"] and idc[-1].box7/close < cfg["box7_close_max"]:
                     debug_counts['passed_atr_filter'] += 1
 
-                    #########################################################################################################################
-                    ###########          이동평균선   #######################################################################################3
-
-                    ### 이평선 정배열
-                    ### 50일, 120일, 200일 이평선 상승 중
-                    ### 20일 박스 내 0.75 - 0.9 사이
-                    ### 125일 박스 내 0.75 이상
-
-                    # 0으로 나누기 방지 추가
-                    if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                            and idc[-1].sma50 > idc[-6].sma50 and idc[-1].sma120 > idc[-13].sma120 and idc[-1].sma200 > idc[-21].sma200\
-                                and (idc[-1].max20 - idc[-1].min20) > 0 and (close - idc[-1].min20)/(idc[-1].max20 - idc[-1].min20) < 0.9\
-                                    and (idc[-1].max20 - idc[-1].min20) > 0 and (close - idc[-1].min20)/(idc[-1].max20 - idc[-1].min20) > 0.75\
-                                        and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.75:
-
-                                        selected_stock11.append(i)
-
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p11')
-                                        listed.insert(0,i.index[-1])
-
-                                        selected_stocks.append(listed)
-
-
-                    if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                        and idc[-1].sma50 > idc[-6].sma50 and idc[-1].sma120 > idc[-13].sma120 and idc[-1].sma200 > idc[-21].sma200\
-                            and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.75\
-                                and (idc[-1].csi10 < 0 or idc[-1].csi20 < 0 or idc[-1].csi30 < 0):
-
-                            
-                                    selected_stock12.append(i)
-                        
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p12')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)
-
-                        ### 이평선 정배열
-                        ### 50일 이평선 상승 중
-                        ### 20일 박스 내 0.75 - 0.9 사이
-                        ### 125일 박스 내 0.75 이상
-                
-                    if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                        and idc[-1].sma50 > idc[-6].sma50 and idc[-1].sma120 > idc[-13].sma120 and idc[-1].sma200 > idc[-21].sma200\
-                            and (idc[-1].max20 - idc[-1].min20) > 0 and (close - idc[-1].min20)/(idc[-1].max20 - idc[-1].min20) < 0.9\
-                                and (idc[-1].max20 - idc[-1].min20) > 0 and (close - idc[-1].min20)/(idc[-1].max20 - idc[-1].min20) > 0.75\
-                                    and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.75\
-                                        and (idc[-21].vol_sum20 > idc[-41].vol_sum20*2 or idc[-21].vol_sum50 > idc[-71].vol_sum50*2)\
-                                            and idc[-1].vol_sum20 < idc[-21].vol_sum20:
-                        
-                                                selected_stock13.append(i)
-                                    
-                                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                                listed.insert(0,'p13')
-                                                listed.insert(0,i.index[-1])
-                                    
-                                                selected_stocks.append(listed)
-
-                    if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                        and idc[-1].sma50 > idc[-6].sma50 and idc[-1].sma120 > idc[-6].sma120 and idc[-1].sma200 > idc[-6].sma200\
-                            and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.75\
-                                and (idc[-1].csi10 < 0 or idc[-1].csi20 < 0 or idc[-1].csi30 < 0)\
-                                    and (idc[-21].vol_sum20 > idc[-41].vol_sum20*2 or idc[-21].vol_sum50 > idc[-71].vol_sum50*2)\
-                                        and idc[-1].vol_sum20 < idc[-21].vol_sum20:
-                                        
-                                                selected_stock14.append(i)
-                                    
-                                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                                listed.insert(0,'p14')
-                                                listed.insert(0,i.index[-1])
-                                    
-                                                selected_stocks.append(listed)
-
-
-                    if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                        and idc[-1].sma_score > 0.75\
-                            and idc[-1].close < idc[-1].sma20 + idc[-1].atr14:
-                                        
-                                                selected_stock15.append(i)
-                                    
-                                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                                listed.insert(0,'p15')
-                                                listed.insert(0,i.index[-1])
-                                    
-                                                selected_stocks.append(listed)
-
-
-                    if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                        and (idc[-1].close < idc[-1].sma20 + idc[-1].atr14*0.5 or idc[-1].open < idc[-1].sma20 + idc[-1].atr14*0.5)\
-                            and (idc[-1].close > idc[-1].sma20 - idc[-1].atr14*0.5 or idc[-1].open > idc[-1].sma20 - idc[-1].atr14*0.5)\
-                                and idc[-1].sma50 > idc[-6].sma50 and idc[-1].sma120 > idc[-13].sma120 and idc[-1].sma200 > idc[-21].sma200\
-                                    and (idc[-1].min20 - idc[-1].min50)/(idc[-1].max50 - idc[-1].min50) > 0.5:
-                                        # and (idc[-1].min50 - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.5:
-                                # and 
-                                        
-                                                selected_stock16.append(i)
-                                    
-                                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                                listed.insert(0,'p16')
-                                                listed.insert(0,i.index[-1])
-                                    
-                                                selected_stocks.append(listed)
-
-
-                           #########################################################################################################################
-                        ###########          거래량 급증 상승 → 축소 횡보 → 재상승 기대 (p16)   ############################################
-                
-                        ### P16: Volume Surge → Consolidation → Breakout Ready
-                        # 1. 1단계: 거래량 급증을 동반한 상승 (20-40일 전)
-                        # 2. 2단계: 거래량 축소 및 횡보/소폭 조정 (최근 10-20일)
-                        # 3. 3단계: 재돌파 준비 (현재 위치)
-                        # 4. 이동평균선 지지
-                        # 5. RS Rating 70 이상
-                
-                    if len(i) >= 100:
-                            try:
-                                # === 1단계: 거래량 급증 상승 구간 확인 (30~50일 전) ===
-                
-                                # 상승 시작점 (50일 전)
-                                surge_start_price = idc[-50].close if len(i) >= 50 else idc[-40].close
-                
-                                # 상승 고점 (25~35일 전 구간)
-                                surge_high_price = idc[-35:-25].high.max() if len(i) >= 35 else idc[-30:-20].high.max()
-                
-                                # 상승률 계산
-                                if surge_start_price > 0:
-                                    surge_gain = (surge_high_price - surge_start_price) / surge_start_price * 100
-                                else:
-                                    surge_gain = 0
-                
-                                # 상승 구간 평균 거래량 (50~30일 전)
-                                vol_surge_period = idc[-50:-30].volume.mean() if len(i) >= 50 else idc[-40:-25].volume.mean()
-                
-                                # 상승 전 평균 거래량 (80~50일 전) - 비교 기준
-                                vol_before_surge = idc[-80:-50].volume.mean() if len(i) >= 80 else idc[-60:-40].volume.mean()
-                
-                                # 거래량 급증 비율
-                                if vol_before_surge > 0:
-                                    vol_surge_ratio = vol_surge_period / vol_before_surge
-                                else:
-                                    vol_surge_ratio = 0
-                
-                                # === 2단계: 횡보/조정 구간 확인 (최근 10~25일) ===
-                
-                                # 횡보 구간 고점/저점
-                                consol_high = idc[-25:-1].high.max()
-                                consol_low = idc[-25:-1].low.min()
-                
-                                # 횡보 구간 변동폭
-                                if consol_high > 0:
-                                    consol_range = (consol_high - consol_low) / consol_high * 100
-                                else:
-                                    consol_range = 100
-                
-                                # 횡보 구간 평균 거래량 (최근 25일)
-                                vol_consol = idc[-25:-1].volume.mean()
-                
-                                # 거래량 축소 확인
-                                if vol_surge_period > 0:
-                                    vol_contraction = vol_consol / vol_surge_period
-                                else:
-                                    vol_contraction = 1
-                
-                                # === 3단계: 현재 위치 확인 ===
-                
-                                current_price = idc[-1].close
-                
-                                # 고점 대비 현재가 위치
-                                if surge_high_price > 0:
-                                    price_from_high = (surge_high_price - current_price) / surge_high_price * 100
-                                else:
-                                    price_from_high = 100
-                
-                                # 횡보 구간 내 위치
-                                if (consol_high - consol_low) > 0:
-                                    price_position_in_consol = (current_price - consol_low) / (consol_high - consol_low)
-                                else:
-                                    price_position_in_consol = 0
-                
-                                # === 4단계: 이동평균선 확인 ===
-                
-                                # 20일선 위
-                                above_ma20 = current_price > idc[-1].sma20
-                
-                                # 50일선 상승 중 또는 평탄
-                                ma50_support = idc[-1].sma50 >= idc[-10].sma50 * 0.98
-                
-                                # 이동평균선 정배열 여부
-                                ma_aligned = idc[-1].sma20 > idc[-1].sma50
-                
-                                # === 5단계: 최근 거래량 증가 징후 ===
-                
-                                # 최근 5일 평균 거래량
-                                vol_recent_5d = idc[-5:].volume.mean()
-                
-                                # 횡보 구간 거래량 대비
-                                if vol_consol > 0:
-                                    vol_recent_pickup = vol_recent_5d / vol_consol
-                                else:
-                                    vol_recent_pickup = 0
-                
-                                # === 6단계: 최종 조건 ===
-                
-                                # 조건 체크
-                                if surge_gain >= 15\
-                                    and vol_surge_ratio >= 1.3\
-                                        and consol_range <= 20\
-                                            and vol_contraction <= 0.70\
-                                                and price_from_high <= 15\
-                                                    and price_position_in_consol >= 0.4\
-                                                        and above_ma20\
-                                                            and ma50_support\
-                                                                and _tk in rs_df.index\
-                                                                and rs_df.loc[_tk].rs_score >= 70\
-                                                                    and current_price > consol_high * 0.90:
-                    
-                                    selected_stock17.append(i)
-                    
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p17')
-                                    listed.insert(0,i.index[-1])
-                    
-                                    selected_stocks.append(listed)
-
-                            except Exception as e:
-                                pass
-
-                        #########################################################################################################################
-                        ###########          신고가 돌파   #######################################################################################
-
-
-                        # 1. 50일 최고가 경신
-                        # 2. 음봉 만듬
-        
-                    if idc[-1].max5 > idc[-6].max50\
-                        and idc[-1].close > idc[-1].max5 - idc[-1].atr14*1\
-                            and idc[-1].close < idc[-1].open:
-
-               
-                                    selected_stock21.append(i)    
-    
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p21')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)
-
-                        ## High and Tight Flag
-                        # 1. 50일 만에 90% 이상 급 상승
-                        # 2. 상승 후 타이트한 조정
-                    max_min_diff_50 = 0
-                    max_min_diff_5 = 0
-                    if idc[-1].max10 > 0 and idc[-1].min50 > 0:
-                        max_min_diff_50 = idc[-1].max50 - idc[-1].min50
-                        max_min_diff_5 = idc[-1].max5 - idc[-1].min5
-                    if max_min_diff_50 > 0 and max_min_diff_5 > 0 and idc[-1].min50 > 0:
-                            if idc[-1].max10 / idc[-1].min50 > 1.9\
-                                and idc[-1].high < idc[-1].max10:
-                                # and (close - idc[-1].min5)/max_min_diff_5 < 0.9\
-                                    # and (close - idc[-1].min5)/max_min_diff_5 > 0.75:
-                        
-                                        selected_stock22.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p22')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)
-
-                    # 1. 52주 신고가
-
-                    # rs_df 체크를 안전하게 처리
-                    has_rs_data = len(rs_df) > 0 and _tk in rs_df.index
-                
-                    ticker_in_stock23 = False
-                    ticker_in_stock24 = False
-                    ticker_in_stock26 = False
-
-                    if has_rs_data:
-                        if idc[-1].max20 > idc[-21].max250\
-                            and idc[-1].close > idc[-1].sma20 and idc[-1].close < idc[-1].sma10\
-                                and (rs20S > 80 and rs50S > 80)\
-                                    and (idc[-1].band20_q < 1 or idc[-1].pb < 1):
-
-                                  selected_stock23.append(i)
-
-                                  listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                  listed.insert(0,'p23')
-                                  listed.insert(0,i.index[-1])
-
-                                  selected_stocks.append(listed)
-
-                        # 1. 52주 신고가
-                        # selected_stock23에 ticker가 이미 있는지 확인 (DataFrame에서 ticker 추출)
-                        ticker_in_stock23 = False
-                    try:
-                        for item in selected_stock23:
-                            if item != 'p23' and hasattr(item, 'iloc'):
-                                if str(item.iloc[-1].ticker) == str(k):
-                                    ticker_in_stock23 = True
-                                    break
-                    except Exception:
-                        pass
-
-                    if has_rs_data or ticker_in_stock23:
-                        if idc[-1].max20 > idc[-21].max250\
-                            and idc[-1].close < idc[-1].sma20 + idc[-1].atr14\
-                                and idc[-1].close > idc[-1].sma20 - idc[-1].atr14\
-                                    and idc[-1].close > idc[-1].sma50\
-                                        and (rs20S > 85 or rs50S > 85):
-                                    # and rsS > 70:
-
-             
-                                  selected_stock24.append(i)    
-  
-                                  listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                  listed.insert(0,'p24')
-                                  listed.insert(0,i.index[-1])
-                      
-                                  selected_stocks.append(listed)
-
-                        # selected_stock24에 ticker가 이미 있는지 확인
-                        ticker_in_stock24 = False
-                    try:
-                        for item in selected_stock24:
-                            if item != 'p24' and hasattr(item, 'iloc'):
-                                if str(item.iloc[-1].ticker) == str(k):
-                                    ticker_in_stock24 = True
-                                    break
-                    except Exception:
-                        pass
-                
-                    if has_rs_data or ticker_in_stock23 or ticker_in_stock24:
-                        if idc[-1].max50 > idc[-51].max250\
-                            and idc[-1].close < idc[-1].sma20 + idc[-1].atr14\
-                                and idc[-1].close > idc[-1].sma20 - idc[-1].atr14\
-                                    and idc[-1].close > idc[-1].sma50\
-                                        and (rs20S > 85 or rs50S > 85):
-                                    # and rsS > 70:
-
-             
-                                  selected_stock25.append(i)    
-  
-                                  listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                  listed.insert(0,'p25')
-                                  listed.insert(0,i.index[-1])
-                      
-                                  selected_stocks.append(listed)
-
-                        # rs_df 체크를 안전하게 처리
-                    if len(rs_df) > 0 and _tk in rs_df.index:
-                        if idc[-1].max10 > idc[-11].max50\
-                            and idc[-1].close < idc[-1].sma20 + idc[-1].atr14\
-                                and idc[-1].close > idc[-1].sma20 - idc[-1].atr14\
-                                    and idc[-1].close > idc[-1].sma50\
-                                        and (rs20S > 85 or rs50S > 85):
-                                    # and rsS > 70:
-
-             
-                                  selected_stock26.append(i)    
-  
-                                  listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                  listed.insert(0,'p26')
-                                  listed.insert(0,i.index[-1])
-                      
-                                  selected_stocks.append(listed)
-
-                        # selected_stock26에 ticker가 이미 있는지 확인
-                        ticker_in_stock26 = False
-                    try:
-                        for item in selected_stock26:
-                            if item != 'p26' and hasattr(item, 'iloc'):
-                                if str(item.iloc[-1].ticker) == str(k):
-                                    ticker_in_stock26 = True
-                                    break
-                    except Exception:
-                        pass
-                
-                    if (len(rs_df) == 0 or _tk not in rs_df.index) and not ticker_in_stock26:
-                        pass
-                    else:
-                        if idc[-1].max10 > idc[-11].max125\
-                            and idc[-1].close < idc[-1].sma20 + idc[-1].atr14\
-                                and idc[-1].close > idc[-1].sma20 - idc[-1].atr14\
-                                    and idc[-1].close > idc[-1].sma50\
-                                        and (rs20S > 85 or rs50S > 85):
-                                    # and rsS > 70:
-
-             
-                                  selected_stock27.append(i)    
-  
-                                  listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                  listed.insert(0,'p27')
-                                  listed.insert(0,i.index[-1])
-                      
-                                  selected_stocks.append(listed)    
-
-
-                    if ((idc[-1].close > idc[-2].max50 and idc[-2].close < idc[-2].max50)\
-                        or (idc[-1].close > idc[-2].max125 and idc[-2].close < idc[-2].max125)\
-                            or (idc[-1].close > idc[-2].max250 and idc[-2].close < idc[-2].max250))\
-                                and (rs20S > 80 or rs50S > 80):
-                                    # and idc[-1].band20_q == 1:
-                                # and rsS > 70:
-
-                              selected_stock28.append(i)    
-  
-                              listed = i.iloc[-1][['ticker', 'name']].to_list()
-                              listed.insert(0,'p28')
-                              listed.insert(0,i.index[-1])
-                  
-                              selected_stocks.append(listed)    
-
-                    if idc[-1].max5 > idc[-6].max125 and idc[-1].close > idc[-6].max125\
-                        and (rs20S > 80 or rs50S > 80)\
-                            and idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200:
-                            # and idc[-1].band20_q < 1:
-                                # and rsS > 70:
-
-                                    if len(selected_stock29a) < 50:      
-                                        selected_stock29a.append(i)    
-                                    else:
-                                        selected_stock29b.append(i)   
-  
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p29')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)    
-
-                      
-                      
-                        #########################################################################################################################
-                        ###########          볼린저 밴드   #######################################################################################
-
-                        ## Bolinger band sqeeze
-                        ## 볼린저밴드 폭이 최근 125일 중 하위 10% 미만
-                 
-                    if idc[-1].band20_q < 0.1\
-                        and idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                            and idc[-1].sma50 > idc[-6].sma50\
-                                and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.5:
-               
-                                        selected_stock31.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p31')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)
-
-
-                        ### 이동평균 정배열 상태에서 볼린저 밴드 하단 근접
-                    if idc[-1].pb < 0.3\
-                        and idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200\
-                            and idc[-1].sma50 > idc[-6].sma50\
-                                and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.75:
-                                # and idc[-1].box7*2 < idc[-1].box50\
-
-               
-                                        selected_stock32.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p32')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)
-                            
-                        ## 볼린저 밴드 돌파 + 50일 신고가 돌파
-                        # 볼린저 밴드 돌파 후 밴드 안쪽으로 회귀
-
-                    if idc[-1].max5 > idc[-1].bol20_up and idc[-1].max5 > idc[-6].max50\
-                        and idc[-1].pb < 1 and idc[-1].pb > 0.8\
-                            and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200:
-
-                                        selected_stock33.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p33')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)
-                            
-
-                        ## 볼린저 밴드 돌파 + 50일 신고가 돌파
-                        ## 밴드 폭 20% 미만
-
-                    if idc[-1].max5 > idc[-6].bol20_up and idc[-1].max5 > idc[-6].max50\
-                        and idc[-1].band20_q < 0.2\
-                            and idc[-1].pb < 1.2 and idc[-1].pb > 0.8:
-                        # and idc[-6].bol20_up < idc[-6].sma20 + idc[-6].atr14*2\
-                            # and idc[-1].pb > 0.8\
-                                # and idc[-1].close < idc[-1].open:
-                                        selected_stock34.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p34')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)
-             
-
-                        ## 볼린저 밴드 근접
-
-                    if idc[-1].pb_max < 1\
-                        and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.75:
-                
-                
-                        # idc[-1].close < idc[-1].bol20_up and idc[-2].close < idc[-2].bol20_up and idc[-3].close < idc[-3].bol20_up\
-                        #     and idc[-1].close > idc[-1].bol20_up - idc[-1].atr14\
-                        #         and idc[-2].close < idc[-2].bol20_up - idc[-2].atr14\
-                        #             and idc[-3].close < idc[-3].bol20_up - idc[-3].atr14\
-                        #                 and (idc[-1].max125 - idc[-1].min125) > 0 and (close - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.5:
-                                        selected_stock35.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p35')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)                                    
-
-
-                        ## 볼린저 밴드 스퀴즈
-                        ## 밴드 폭 20% 미만
-
-                    if idc[-2].band20_q < 0.2 and idc[-1].band20_q > idc[-2].band20_q\
-                        and _tk in rs_df.index\
-                            and rs_df.loc[_tk].rs_score > 80:
-                        # and idc[-6].bol20_up < idc[-6].sma20 + idc[-6].atr14*2\
-                            # and idc[-1].pb > 0.8\
-                                # and idc[-1].close < idc[-1].open:
-                                        selected_stock36.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p36')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)
-
-
-
-                        #########################################################################################################################
-                        ###########          매물대 돌파   #######################################################################################
-
-                        ## 매물대 돌파
-                        ## 30% 이상 매물이 몰려있는 매물대를 돌파함
-
-                    if _tk in volume_data.keys():
-                        vd = volume_data[_tk]
-                        if idc[-1].close > vd['volume_p'].idxmax()\
-                                and idc[-6].close < vd['volume_p'].idxmax()\
-                                    and vd['volume_p'].max() > 40:
-                                                selected_stock41.append(i)
-                                    
-                                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                                listed.insert(0,'p41')
-                                                listed.insert(0,i.index[-1])
-                                    
-                                                selected_stocks.append(listed)
-
-                        ## 매물대 돌파
-                        if idc[-1].close > vd['volume_p'].idxmax()\
-                                and idc[-6].close < vd['volume_p'].idxmax()\
-                                    and vd.loc[vd['volume_p'].idxmax()].volume_p_cum > 80:
-                                                selected_stock42.append(i)
-                                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                                listed.insert(0,'p42')
-                                                listed.insert(0,i.index[-1])
-                                                selected_stocks.append(listed)
-
-                    if (idc[-1].max20 - idc[-1].min20) < (idc[-1].max50 - idc[-1].min50)\
-                            and (idc[-1].max50 - idc[-1].min50) < (idc[-1].max125 - idc[-1].min125)\
-                                and (idc[-1].min20 - idc[-1].min125)/(idc[-1].max125 - idc[-1].min125) > 0.75\
-                                    and (idc[-1].close - idc[-1].min20)/(idc[-1].max20 - idc[-1].min20) < 0.9\
-                                        and idc[-1].sma50 > idc[-1].sma120 and idc[-1].sma120 > idc[-1].sma200:
-                         
-
-         
-                                  selected_stock43.append(i)    
-  
-                                  listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                  listed.insert(0,'p43')
-                                  listed.insert(0,i.index[-1])
-                      
-                                  selected_stocks.append(listed)        
-
-                        ### Cup with handle
-                    if idc[-1].sma50 > idc[-1].sma150 and idc[-1].sma150 > idc[-1].sma200\
-                        and idc[-1].sma200 > idc[-21].sma200\
-                            and idc[-1].min5 > idc[-1].max125 * 0.75\
-                                and idc[-1].min5 > idc[-1].min125 * 1.25\
-                                    and idc[-1].close > idc[-2].max20 * 0.9\
-                                        and idc[-1].max5 < idc[-6].max50 * 1.1\
-                                            and _tk in rs_df.index\
-                                            and rs_df.loc[_tk].rs_score > 90:
-                                    selected_stock51.append(i)
-                        
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p51')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)    
-
-
-                        #########################################################################################################################
-                        ###########          Cup with Handle (마크 미너비니)   #################################################################
-                
-                        ### P52: 마크 미너비니의 Cup with Handle 전략 (완화+ 버전)
-                        # Trend Template + SEPA 원칙 기반 (더욱 완화하여 초기 패턴 포착)
-                        # 1. 컵 형성: 최소 30일 이상
-                        # 2. 컵 깊이: 5-70% (더욱 완화)
-                        # 3. 핸들: 컵 높이의 상위 40% 구간
-                        # 4. 핸들 깊이: 5-25% (더욱 완화)
-                        # 5. 거래량: 바닥과 핸들에서 감소 경향
-                        # 6. Trend Template 조건 5개 이상 (더욱 완화)
-                        # 7. RS Rating 65 이상 (더욱 완화)
-                
-                    if len(i) >= 120:
-                        # try:
-                            # === 1단계: 컵(Cup) 패턴 찾기 ===
-                
-                            # 컵 왼쪽 고점 (100~150일 전 구간에서 최고점)
-                            cup_left_window_start = min(150, len(i)-1)
-                            cup_left_window_end = min(70, len(i)-1)
-                            cup_left_high = idc[-cup_left_window_start:-cup_left_window_end].high.max()
-                
-                            # 컵 바닥 (왼쪽 고점 이후 ~ 최근 15일 전)
-                            cup_bottom = idc[-70:-15].low.min()
-                
-                            # 컵 오른쪽 (최근 15일 내 고점)
-                            cup_right_high = idc[-15:].high.max()
-                
-                            # 컵 깊이 계산
-                            if cup_left_high > 0:
-                                cup_depth_pct = (cup_left_high - cup_bottom) / cup_left_high * 100
-                    
-                                # === 2단계: 핸들(Handle) 패턴 찾기 ===
-                    
-                                # 핸들 구간 (최근 5~15일)
-                                handle_high = idc[-15:-1].high.max()
-                                handle_low = idc[-15:-1].low.min()
-                    
-                                # 핸들 깊이
-                                handle_depth_pct = (handle_high - handle_low) / cup_left_high * 100
-                    
-                                # 핸들 위치 (컵 바닥으로부터의 상대적 위치)
-                                cup_height = cup_left_high - cup_bottom
-                                if cup_height > 0:
-                                    handle_position_pct = (handle_low - cup_bottom) / cup_height * 100
-                                else:
-                                    handle_position_pct = 0
-                    
-                                # === 3단계: 거래량 패턴 분석 ===
-                    
-                                # 컵 왼쪽 거래량 (고점 부근)
-                                vol_left = idc[-100:-70].volume.mean() if len(i) >= 100 else idc[-70:-50].volume.mean()
-                    
-                                # 컵 바닥 거래량 (저점 부근)
-                                vol_bottom = idc[-50:-20].volume.mean()
-                    
-                                # 핸들 거래량 (최근)
-                                vol_handle = idc[-15:-1].volume.mean()
-                    
-                                # 최근 거래량 급증 여부
-                                vol_recent = idc[-1].volume
-                    
-                                # 거래량 감소 비율
-                                vol_drying_1 = (vol_left - vol_bottom) / vol_left if vol_left > 0 else 0
-                                vol_drying_2 = (vol_bottom - vol_handle) / vol_bottom if vol_bottom > 0 else 0
-                                vol_surge = vol_recent / vol_handle if vol_handle > 0 else 0
-                    
-                                # === 4단계: Trend Template 검증 (8개 조건) ===
-                    
-                                tt_conditions = 0
-                    
-                                # TT1: 현재가 > 150일, 200일 이평
-                                if idc[-1].close > idc[-1].sma150 and idc[-1].close > idc[-1].sma200:
-                                    tt_conditions += 1
-                    
-                                # TT2: 150일 이평 > 200일 이평
-                                if idc[-1].sma150 > idc[-1].sma200:
-                                    tt_conditions += 1
-                    
-                                # TT3: 200일 이평선 상승 중
-                                if idc[-1].sma200 > idc[-21].sma200:
-                                    tt_conditions += 1
-                    
-                                # TT4: 50일 이평 > 150일, 200일 이평
-                                if idc[-1].sma50 > idc[-1].sma150 and idc[-1].sma50 > idc[-1].sma200:
-                                    tt_conditions += 1
-                    
-                                # TT5: 현재가 > 50일 이평
-                                if idc[-1].close > idc[-1].sma50:
-                                    tt_conditions += 1
-                    
-                                # TT6: 52주 저점보다 20% 이상 상승 (더욱 완화)
-                                week52_low = idc[-200:].low.min() if len(i) >= 200 else idc[-120:].low.min()
-                                if idc[-1].close > week52_low * 1.20:
-                                    tt_conditions += 1
-                    
-                                # TT7: 52주 고점의 65% 이상 (더욱 완화)
-                                week52_high = idc[-200:].high.max() if len(i) >= 200 else idc[-120:].high.max()
-                                if week52_high > 0 and idc[-1].close >= week52_high * 0.65:
-                                    tt_conditions += 1
-                    
-                                # TT8: RS Rating 65 이상 (더욱 완화)
-                                if _tk in rs_df.index and rs_df.loc[_tk].rs_score >= 65:
-                                    tt_conditions += 1
-                    
-                                # === 5단계: 피벗 포인트 (매수 시점) 계산 ===
-                    
-                                pivot_point = handle_high
-                                buy_point = pivot_point * 1.001  # 0.1% 돌파
-                                current_vs_pivot = idc[-1].close / pivot_point
-                    
-                                # === 6단계: 최종 조건 검증 (더욱 완화) ===
-                    
-                                # 미너비니 Cup with Handle 조건 (더욱 완화)
-                                if 5 <= cup_depth_pct <= 70\
-                                    and 5 <= handle_depth_pct <= 25\
-                                        and handle_position_pct >= 40\
-                                            and tt_conditions >= 5\
-                                                and _tk in rs_df.index\
-                                                and rs_df.loc[_tk].rs_score >= 65\
-                                                    and vol_drying_1 >= 0.05\
-                                                        and vol_drying_2 >= 0.02\
-                                                            and 0.80 <= current_vs_pivot <= 1.10\
-                                                                and idc[-1].close > idc[-1].sma50:
-                        
-                                    selected_stock52.append(i)
-                        
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p52')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)
-                        
-                        # except Exception as e:
-                            # pass
-
-
-                        #########################################################################################################################
-                        ###########          High Tight Flag (HTF) - 미너비니가 가장 선호하는 패턴   #########################################
-                
-                        ### P53: High Tight Flag (HTF) - 완화 버전
-                        # 1. 6-8주(30-40일) 이내 60% 이상 급등 (완화)
-                        # 2. 3-5주간 타이트한 조정 (8-30%) (완화)
-                        # 3. 조정 중 거래량 감소
-                        # 4. 이동평균선 정배열 유지
-                        # 5. RS Rating 75 이상 (완화)
-                        # 6. 고점 부근에서 횡보 후 재돌파
-                
-                    if len(i) >= 80:
-                        # try:
-                            # === 1단계: 급등 확인 (최근 25~50일) ===
-                
-                            # 급등 전 가격 (25~50일 전)
-                            surge_start_price = idc[-50:-40].close.min() if len(i) >= 50 else idc[-40:-30].close.min()
-                
-                            # 급등 후 고점 (최근 10~25일)
-                            surge_high = idc[-25:-8].high.max()
-                
-                            # 급등률 계산
-                            if surge_start_price > 0:
-                                surge_pct = (surge_high - surge_start_price) / surge_start_price * 100
-                    
-                                # === 2단계: 타이트한 조정 확인 (최근 8~20일) ===
-                    
-                                flag_high = idc[-20:-1].high.max()
-                                flag_low = idc[-20:-1].low.min()
-                    
-                                # 조정 깊이
-                                if surge_high > 0:
-                                    flag_depth_pct = (flag_high - flag_low) / surge_high * 100
-                        
-                                    # 현재가 위치 (고점 대비)
-                                    price_from_high = (surge_high - idc[-1].close) / surge_high * 100
-                        
-                                    # === 3단계: 거래량 패턴 ===
-                        
-                                    # 급등 구간 거래량
-                                    vol_surge = idc[-40:-15].volume.mean()
-                        
-                                    # 조정 구간 거래량
-                                    vol_flag = idc[-15:-1].volume.mean()
-                        
-                                    # 거래량 감소율
-                                    vol_decrease = (vol_surge - vol_flag) / vol_surge if vol_surge > 0 else 0
-                        
-                                    # === 4단계: 이동평균선 체크 ===
-                        
-                                    ma_aligned = idc[-1].sma20 > idc[-1].sma50
-                        
-                                    # === 5단계: 최종 조건 (완화) ===
-                        
-                                    if surge_pct >= 60\
-                                        and 8 <= flag_depth_pct <= 30\
-                                            and price_from_high <= 20\
-                                                and vol_decrease >= 0.20\
-                                                    and ma_aligned\
-                                                        and idc[-1].close > idc[-1].sma20\
-                                                            and _tk in rs_df.index\
-                                                            and rs_df.loc[_tk].rs_score >= 75\
-                                                                and idc[-1].close > surge_high * 0.85:
-                            
-                                        selected_stock53.append(i)
-                            
-                                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                        listed.insert(0,'p53')
-                                        listed.insert(0,i.index[-1])
-                            
-                                        selected_stocks.append(listed)
-                            
-                        # except Exception as e:
-                            # pass
-
-
-                        #########################################################################################################################
-                        ###########          VCP (Volatility Contraction Pattern)   ##########################################################
-                
-                        ### P54: VCP - 변동성 축소 패턴
-                        # 1. 3단계 이상의 수축 (Contraction)
-                        # 2. 각 수축마다 변동폭 감소 (T1 > T2 > T3)
-                        # 3. 각 수축마다 거래량 감소
-                        # 4. 이동평균선 상승 지지
-                        # 5. RS Rating 75 이상
-                        # 6. 마지막 수축이 가장 타이트
-                
-                    if len(i) >= 120:
-                        # try:
-                            # === 1단계: 세 번의 수축 구간 정의 ===
-                
-                            # T1: 첫 번째 수축 (50~35일 전)
-                            t1_high = idc[-50:-35].high.max()
-                            t1_low = idc[-50:-35].low.min()
-                            t1_range = (t1_high - t1_low) / t1_high * 100 if t1_high > 0 else 0
-                            t1_vol = idc[-50:-35].volume.mean()
-                
-                            # T2: 두 번째 수축 (35~18일 전)
-                            t2_high = idc[-35:-18].high.max()
-                            t2_low = idc[-35:-18].low.min()
-                            t2_range = (t2_high - t2_low) / t2_high * 100 if t2_high > 0 else 0
-                            t2_vol = idc[-35:-18].volume.mean()
-                
-                            # T3: 세 번째 수축 (최근 18일)
-                            t3_high = idc[-18:-1].high.max()
-                            t3_low = idc[-18:-1].low.min()
-                            t3_range = (t3_high - t3_low) / t3_high * 100 if t3_high > 0 else 0
-                            t3_vol = idc[-18:-1].volume.mean()
-                
-                            # === 2단계: 변동성 축소 확인 (완화) ===
-                
-                            # 각 구간의 변동성이 감소 경향인지 (완벽하지 않아도 OK)
-                            volatility_contracting = (t1_range > t2_range * 0.9 and t2_range > t3_range * 0.9)
-                
-                            # 거래량도 감소 경향인지
-                            volume_contracting = (t1_vol > t2_vol * 0.9 and t2_vol > t3_vol * 0.9)
-                
-                            # 마지막 수축이 충분히 타이트한지 (완화)
-                            is_tight = t3_range < 12
-                
-                            # === 3단계: 베이스 높이 확인 ===
-                
-                            # 전체 베이스 깊이
-                            base_high = idc[-50:].high.max()
-                            base_low = idc[-50:].low.min()
-                            base_depth = (base_high - base_low) / base_high * 100 if base_high > 0 else 0
-                
-                            # === 4단계: 이동평균선 지지 ===
-                
-                            # 50일선 상승 중 또는 평탄
-                            ma50_rising = idc[-1].sma50 >= idc[-10].sma50 * 0.98
-                
-                            # 현재가가 주요 이평선 위
-                            above_ma = idc[-1].close > idc[-1].sma20
-                
-                            # === 5단계: 최종 조건 (완화) ===
-                
-                            if volatility_contracting\
-                                and volume_contracting\
-                                    and is_tight\
-                                        and base_depth <= 50\
-                                            and ma50_rising\
-                                                and above_ma\
-                                                    and _tk in rs_df.index\
-                                                    and rs_df.loc[_tk].rs_score >= 70\
-                                                        and idc[-1].close > base_high * 0.80:
-                    
-                                selected_stock54.append(i)
-                    
-                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                listed.insert(0,'p54')
-                                listed.insert(0,i.index[-1])
-                    
-                                selected_stocks.append(listed)
-                    
-                        # except Exception as e:
-                            # pass
-
-
-                        #########################################################################################################################
-                        ###########          Flat Base Breakout   ################################################################################
-                
-                        ### P55: Flat Base (평평한 베이스) 돌파 - 완화++ 버전
-                        # 1. 최소 3주(15일) 이상 횡보 (더욱 완화)
-                        # 2. 변동폭 25% 이내 (더욱 완화)
-                        # 3. 이전에 상승 추세 존재 (10% 이상)
-                        # 4. 횡보 중 거래량 감소 (조건 완화)
-                        # 5. RS Rating 70 이상 (더욱 완화)
-                        # 6. 주요 이평선 근처에서 형성
-                        # 7. 돌파 근접
-                
-                    if len(i) >= 100:
-                        # try:
-                            # === 1단계: 이전 상승 추세 확인 ===
-                
-                            # 베이스 전 가격 (70일 전)
-                            pre_base_price = idc[-70].close if len(i) >= 70 else idc[-50].close
-                
-                            # 베이스 시작점 (35일 전)
-                            base_start_price = idc[-35].close
-                
-                            # 베이스 전 상승률
-                            if pre_base_price > 0:
-                                pre_base_gain = (base_start_price - pre_base_price) / pre_base_price * 100
-                            else:
-                                pre_base_gain = 0
-                
-                            # === 2단계: Flat Base 확인 (최근 15~35일) ===
-                
-                            # 베이스 구간 고점/저점
-                            base_high = idc[-35:-1].high.max()
-                            base_low = idc[-35:-1].low.min()
-                
-                            # 베이스 변동폭
-                            if base_high > 0:
-                                base_range_pct = (base_high - base_low) / base_high * 100
-                            else:
-                                base_range_pct = 100
-                
-                            # 현재가 위치
-                            current_position = (idc[-1].close - base_low) / (base_high - base_low) if (base_high - base_low) > 0 else 0
-                
-                            # === 3단계: 거래량 패턴 ===
-                
-                            # 베이스 전 거래량 (70~35일 전)
-                            vol_pre_base = idc[-70:-35].volume.mean() if len(i) >= 70 else idc[-50:-25].volume.mean()
-                
-                            # 베이스 중 거래량 (35~8일 전)
-                            vol_during_base = idc[-35:-8].volume.mean()
-                
-                            # 최근 거래량 (최근 8일)
-                            vol_recent = idc[-8:].volume.mean()
-                
-                            # 거래량 감소 후 증가 (더욱 완화)
-                            vol_dried = vol_during_base < vol_pre_base * 0.85  # 15% 감소면 OK
-                            vol_increasing = vol_recent > vol_during_base * 1.05  # 5% 증가면 OK
-                
-                            # === 4단계: 이동평균선 배열 ===
-                
-                            # 주요 이평선 정배열 또는 지지 (더욱 완화)
-                            ma_setup = idc[-1].close > idc[-1].sma50 * 0.95  # 50일선 근처면 OK
-                
-                            # 베이스가 20일선 근처에서 형성 (더욱 완화)
-                            base_above_ma20 = base_low > idc[-25].sma20 * 0.90  # 10% 아래까지 허용
-                
-                            # === 5단계: 돌파 확인 ===
-                
-                            # 최근 고점 테스트 중 (더욱 완화)
-                            near_breakout = idc[-1].close > base_high * 0.85
-                
-                            # 피벗 포인트
-                            pivot = base_high
-                
-                            # === 6단계: 최종 조건 (더욱 완화) ===
-                
-                            if pre_base_gain >= 10\
-                                and base_range_pct <= 25\
-                                    and vol_dried\
-                                        and ma_setup\
-                                            and base_above_ma20\
-                                                and _tk in rs_df.index\
-                                                and rs_df.loc[_tk].rs_score >= 70\
-                                                    and near_breakout\
-                                                        and idc[-1].sma50 >= idc[-10].sma50 * 0.95:
-                    
-                                selected_stock55.append(i)
-                    
-                                listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                listed.insert(0,'p55')
-                                listed.insert(0,i.index[-1])
-                    
-                                selected_stocks.append(listed)
-                    
-                        # except Exception as e:
-                            # pass
-
-                        #########################################################################################################################
-                        ###########          Pre-Rally Setup (P61 - 최종 실용 버전)   #########################################################
-                
-                        ### P61: 상승 직전 준비 단계 - 20개 내외 안정적 선정
-                        # 
-                        # 단계적 조합 테스트 결과:
-                        # - 조합 4 (ADX 포함): 9개
-                        # - 조합 5 (MA20 포함): 7개  ← 여기 근처 목표
-                        # - 조합 6 (MFI 포함): 6개
-                        # 
-                        # 선정 전략:
-                        # - 핵심 6개 조건 (AND)
-                        # - 보조 조건은 완화 또는 OR
-                
-                    if len(i) >= 120:
-                            # try:
-                                current_price = idc[-1].close
-                    
-                                # === 핵심 조건 6개 (모두 AND - 필수) ===
-                    
-                                # 1. Band Squeeze: < 0.20 (완화)
-                                if not ('band20_q' in i.columns and idc[-1].band20_q < 0.20):
-                                    continue
-                    
-                                # 2. 가격 위치: 0.10-0.50 (완화)
-                                if not all(col in i.columns for col in ['close', 'max20', 'min20']):
-                                    continue
-                                if (idc[-1].max20 - idc[-1].min20) <= 0:
-                                    continue
-                                position = (current_price - idc[-1].min20) / (idc[-1].max20 - idc[-1].min20)
-                                if not (0.10 <= position <= 0.50):
-                                    continue
-                    
-                                # 3. DMI 우위: DI+ - DI- > 3 (완화)
-                                if not all(col in i.columns for col in ['di_P', 'di_M']):
-                                    continue
-                                if not (idc[-1].di_P - idc[-1].di_M > 3):
-                                    continue
-                    
-                                # 4. ADX: > 20 (완화)
-                                if not ('adx' in i.columns and idc[-1].adx > 20):
-                                    continue
-                    
-                                # 5. MA20 근처: ±10% (완화)
-                                if not ('sma20' in i.columns and idc[-1].sma20 > 0):
-                                    continue
-                                ma20_dist_pct = (current_price - idc[-1].sma20) / idc[-1].sma20 * 100
-                                if not (-10 <= ma20_dist_pct <= 10):
-                                    continue
-                    
-                                # 6. MFI: 40-90 (완화)
-                                if not ('mfi' in i.columns and 40 <= idc[-1].mfi <= 90):
-                                    continue
-                    
-                                # === 보조 조건 (3개 중 2개 이상 만족) ===
-                    
-                                support_count = 0
-                    
-                                # 7. Williams %R: -80 ~ -20 (선택)
-                                if 'willr' in i.columns and -80 <= idc[-1].willr <= -20:
-                                    support_count += 1
-                    
-                                # 8. 이평선 정배열: 20>50>120 (선택)
-                                if all(col in i.columns for col in ['sma20', 'sma50', 'sma120']):
-                                    if idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120:
-                                        support_count += 1
-                    
-                                # 9. 거래량 증가: 5일 > 20일 (선택, 완화)
-                                if all(col in i.columns for col in ['vol_sum5', 'vol_sum20']):
-                                    vol_avg5 = idc[-1].vol_sum5 / 5
-                                    vol_avg20 = idc[-1].vol_sum20 / 20
-                                    if vol_avg5 > vol_avg20 * 0.95:  # 거의 동등 이상이면 OK
-                                        support_count += 1
-                    
-                                # 보조 조건 2개 이상 만족 시 선정
-                                if support_count >= 2:
-                                    selected_stock61.append(i)
-                        
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p61')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)
-                    
-                            # except Exception as e:
-                                # pass
-
-
-                        ### volitility
-                    if idc[-1].mtr7 > idc[-8].atr14*1.5\
-                        and idc[-1].close < idc[-1].max5\
-                            and idc[-1].sma20 > idc[-1].sma50 and idc[-1].sma50 > idc[-1].sma120\
-                                and idc[-1].sma120 > idc[-1].sma200:
-                        
-                        selected_stock71.append(i)
-                
-                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                        listed.insert(0,'p71')
-                        listed.insert(0,i.index[-1])
-                
-                        selected_stocks.append(listed)    
-
-                        ### disparity
-                    if idc[-1].band20_q > idc[-2].band20_q\
-                        and idc[-1].csi > idc[-2].csi:
-                        
-                        selected_stock81.append(i)
-                
-                        listed = i.iloc[-1][['ticker', 'name']].to_list()
-                        listed.insert(0,'p81')
-                        listed.insert(0,i.index[-1])
-                
-                        selected_stocks.append(listed)    
-
- 
-
-                        ### RS
-                    if _tk in rs_df.index\
-                        and rs_df.loc[_tk].rs50_score > 95\
-                            and rs_df.loc[_tk].rs20_score < 95 and rs_df.loc[_tk].rs20_score > 50\
-                                and rs_df.loc[_tk].rs_score > 90:
-                        
-                                    selected_stock91.append(i)
-                        
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p91')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)    
-
-                    if idc[-1].band20_q < 0.2 and idc[-1].atr_q < 0.2\
-                        and (idc[-1].max10 > idc[-11].max50 or idc[-1].max10 > idc[-11].max125\
-                             or idc[-1].max20 > idc[-21].max50 or idc[-1].max20 > idc[-21].max125\
-                                 or idc[-1].max50 > idc[-51].max50 or idc[-1].max50 > idc[-51].max125):                              
-                
-                                    selected_stock92.append(i)
-                        
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p92')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)    
-
-                    if idc[-1].band20_q < 0.8 and idc[-1].band20_q > idc[-6].band20_q:
-                                # and idc[-1].csi_fast > idc[-1].csi_slow:
-                
-                                    selected_stock93.append(i)
-                        
-                                    listed = i.iloc[-1][['ticker', 'name']].to_list()
-                                    listed.insert(0,'p93')
-                                    listed.insert(0,i.index[-1])
-                        
-                                    selected_stocks.append(listed)
-
-    result = {"p11": [x for x in selected_stock11 if hasattr(x,"iloc")], "p12": [x for x in selected_stock12 if hasattr(x,"iloc")], "p13": [x for x in selected_stock13 if hasattr(x,"iloc")], "p14": [x for x in selected_stock14 if hasattr(x,"iloc")], "p15": [x for x in selected_stock15 if hasattr(x,"iloc")], "p16": [x for x in selected_stock16 if hasattr(x,"iloc")], "p17": [x for x in selected_stock17 if hasattr(x,"iloc")], "p21": [x for x in selected_stock21 if hasattr(x,"iloc")], "p22": [x for x in selected_stock22 if hasattr(x,"iloc")], "p23": [x for x in selected_stock23 if hasattr(x,"iloc")], "p24": [x for x in selected_stock24 if hasattr(x,"iloc")], "p25": [x for x in selected_stock25 if hasattr(x,"iloc")], "p26": [x for x in selected_stock26 if hasattr(x,"iloc")], "p27": [x for x in selected_stock27 if hasattr(x,"iloc")], "p28": [x for x in selected_stock28 if hasattr(x,"iloc")], "p29a": [x for x in selected_stock29a if hasattr(x,"iloc")], "p29b": [x for x in selected_stock29b if hasattr(x,"iloc")], "p31": [x for x in selected_stock31 if hasattr(x,"iloc")], "p32": [x for x in selected_stock32 if hasattr(x,"iloc")], "p33": [x for x in selected_stock33 if hasattr(x,"iloc")], "p34": [x for x in selected_stock34 if hasattr(x,"iloc")], "p35": [x for x in selected_stock35 if hasattr(x,"iloc")], "p36": [x for x in selected_stock36 if hasattr(x,"iloc")], "p41": [x for x in selected_stock41 if hasattr(x,"iloc")], "p42": [x for x in selected_stock42 if hasattr(x,"iloc")], "p43": [x for x in selected_stock43 if hasattr(x,"iloc")], "p51": [x for x in selected_stock51 if hasattr(x,"iloc")], "p52": [x for x in selected_stock52 if hasattr(x,"iloc")], "p53": [x for x in selected_stock53 if hasattr(x,"iloc")], "p54": [x for x in selected_stock54 if hasattr(x,"iloc")], "p55": [x for x in selected_stock55 if hasattr(x,"iloc")], "p61": [x for x in selected_stock61 if hasattr(x,"iloc")], "p71": [x for x in selected_stock71 if hasattr(x,"iloc")], "p81": [x for x in selected_stock81 if hasattr(x,"iloc")], "p91": [x for x in selected_stock91 if hasattr(x,"iloc")], "p92": [x for x in selected_stock92 if hasattr(x,"iloc")], "p93": [x for x in selected_stock93 if hasattr(x,"iloc")]}
+                    _p29_matched = False
+                    for _code in (
+                        "p11", "p12", "p13", "p14", "p15", "p16", "p17",
+                        "p21", "p22", "p23", "p24", "p25", "p26", "p27", "p28", "p29a", "p29b",
+                        "p31", "p32", "p33", "p34", "p35", "p36",
+                        "p41", "p42", "p43",
+                        "p51", "p52", "p53",
+                        "p54", "p55",
+                        "p61", "p71", "p81", "p91", "p92", "p93",
+                    ):
+                        if _code not in PATTERN_REGISTRY:
+                            continue
+                        if _code == "p29a" and len(_buckets["p29a"]) >= 49:
+                            continue
+                        if _code == "p29b" and (len(_buckets["p29a"]) < 49 or _p29_matched):
+                            continue
+                        try:
+                            _P = _pat_params(_code, ctx)
+                            _P.setdefault("rs_df", rs_df)      # screen_all 이 확정한 로컬 rs_df 우선
+                            _P.setdefault("volume_data", volume_data)
+                            _ok = PATTERN_REGISTRY[_code]["fn"](i, _P)
+                        except Exception:
+                            _pat_exc(_code)
+                            _ok = False
+                        if _ok:
+                            if _code in ("p29a", "p29b"):
+                                _p29_matched = True
+                            _buckets[_code].append(i)
+                            listed = i.iloc[-1][['ticker', 'name']].to_list()
+                            listed.insert(0, 'p29' if _code in ('p29a', 'p29b') else _code)
+                            listed.insert(0, i.index[-1])
+                            selected_stocks.append(listed)
+
+    print(f"[filter] 서브조건 통과 {_basic_sub}")
+
+    result = {"p11": [x for x in _buckets["p11"] if hasattr(x,"iloc")], "p12": [x for x in _buckets["p12"] if hasattr(x,"iloc")], "p13": [x for x in _buckets["p13"] if hasattr(x,"iloc")], "p14": [x for x in _buckets["p14"] if hasattr(x,"iloc")], "p15": [x for x in _buckets["p15"] if hasattr(x,"iloc")], "p16": [x for x in _buckets["p16"] if hasattr(x,"iloc")], "p17": [x for x in _buckets["p17"] if hasattr(x,"iloc")], "p21": [x for x in _buckets["p21"] if hasattr(x,"iloc")], "p22": [x for x in _buckets["p22"] if hasattr(x,"iloc")], "p23": [x for x in _buckets["p23"] if hasattr(x,"iloc")], "p24": [x for x in _buckets["p24"] if hasattr(x,"iloc")], "p25": [x for x in _buckets["p25"] if hasattr(x,"iloc")], "p26": [x for x in _buckets["p26"] if hasattr(x,"iloc")], "p27": [x for x in _buckets["p27"] if hasattr(x,"iloc")], "p28": [x for x in _buckets["p28"] if hasattr(x,"iloc")], "p29a": [x for x in _buckets["p29a"] if hasattr(x,"iloc")], "p29b": [x for x in _buckets["p29b"] if hasattr(x,"iloc")], "p31": [x for x in _buckets["p31"] if hasattr(x,"iloc")], "p32": [x for x in _buckets["p32"] if hasattr(x,"iloc")], "p33": [x for x in _buckets["p33"] if hasattr(x,"iloc")], "p34": [x for x in _buckets["p34"] if hasattr(x,"iloc")], "p35": [x for x in _buckets["p35"] if hasattr(x,"iloc")], "p36": [x for x in _buckets["p36"] if hasattr(x,"iloc")], "p41": [x for x in _buckets["p41"] if hasattr(x,"iloc")], "p42": [x for x in _buckets["p42"] if hasattr(x,"iloc")], "p43": [x for x in _buckets["p43"] if hasattr(x,"iloc")], "p51": [x for x in _buckets["p51"] if hasattr(x,"iloc")], "p52": [x for x in _buckets["p52"] if hasattr(x,"iloc")], "p53": [x for x in _buckets["p53"] if hasattr(x,"iloc")], "p54": [x for x in _buckets["p54"] if hasattr(x,"iloc")], "p55": [x for x in _buckets["p55"] if hasattr(x,"iloc")], "p61": [x for x in _buckets["p61"] if hasattr(x,"iloc")], "p71": [x for x in _buckets["p71"] if hasattr(x,"iloc")], "p81": [x for x in _buckets["p81"] if hasattr(x,"iloc")], "p91": [x for x in _buckets["p91"] if hasattr(x,"iloc")], "p92": [x for x in _buckets["p92"] if hasattr(x,"iloc")], "p93": [x for x in _buckets["p93"] if hasattr(x,"iloc")]}
+
+    debug_counts["selected_by_pattern"] = len(selected_stocks)
+
+    if len(selected_stocks) > 0:
+        selected_df = pd.DataFrame(
+            selected_stocks, columns=["date", "type", "ticker", "company"]
+        )
+    else:
+        selected_df = pd.DataFrame(columns=["date", "type", "ticker", "company"])
+
+    selected_stock_list = ["p35"] + result.get("p35", [])
+
+    _cnt = {k: len(v) for k, v in result.items()}
+    _hit = {k: v for k, v in _cnt.items() if v}
+    print("=" * 80)
+    print(f"📊 패턴별 선정 건수 (합계 {sum(_cnt.values())} / 발동 {len(_hit)}개 패턴)")
+    for _k in sorted(_cnt):
+        print(f"   · {_k}: {_cnt[_k]}건")
+    print("=" * 80)
 
     return {
+        "selected_stock_list": selected_stock_list,
+        "selected_df": selected_df,
+        "selected_stocks": selected_stocks,
         "result": result,
         "debug_counts": debug_counts,
-        "selected_stocks": selected_stocks,
     }
 
 
-# 성능 모니터링 시작
-print("=" * 80)
-print("🚀 최적화된 KRX 주식 선별 시스템 시작")
-print("=" * 80)
 
-start_time = time.time()
-
-### OHLCV 데이터 로딩 (병렬 처리)
-print("\n" + "=" * 80)
-print("📊 OHLCV 데이터 로딩")
-print("=" * 80)
-
-data_load_start = time.time()
-ohlcv_data = load_ohlcv_parallel(ticker_list, engine, max_workers=MAX_WORKERS_DATA_LOAD)
-ohlcv_data = filter_ohlcv_zero_latest(ohlcv_data)
-data_load_time = time.time() - data_load_start
-print(f"⏱️ OHLCV 데이터 로딩 완료: {data_load_time:.2f}초")
-print(f"📊 성공률: {len(ohlcv_data)}/{len(ticker_list)} ({len(ohlcv_data)/len(ticker_list)*100:.1f}%)")
-
-### 지표 계산 (병렬 처리)
-print("\n" + "=" * 80)
-print("📈 지표 계산 시작")
-print("=" * 80)
-
-indicators_start_time = time.time()
-indicators_data = calculate_indicators_parallel(ohlcv_data, max_workers=MAX_WORKERS_INDICATORS)
-indicators_time = time.time() - indicators_start_time
-print(f"⏱️ 지표 계산 완료: {indicators_time:.2f}초")
-
-### 매물대 계산 (병렬 처리)
-print("\n" + "=" * 80)
-print("📊 매물대 지표 생성")
-print("=" * 80)
-
-volume_start_time = time.time()
-volume_data = calculate_volume_band_parallel(ohlcv_data, max_workers=MAX_WORKERS_VOLUME)
-volume_time = time.time() - volume_start_time
-print(f"⏱️ 매물대 계산 완료: {volume_time:.2f}초")
-
-### RS 데이터 DB에서 가져오기
-print("\n" + "=" * 80)
-print("📊 RS 데이터 로드 시작")
-print("=" * 80)
-
-rs_start_time = time.time()
-
-# DB에서 최신 날짜의 RS 데이터 가져오기
-query_max_date = """
-    SELECT MAX(date) as max_date
-    FROM krx_relative_strength;
-"""
-max_rs_date = pd.read_sql_query(query_max_date, con=engine)
-
-if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
-    latest_date = max_rs_date.iloc[0]['max_date']
-    print(f"최신 RS 데이터 날짜: {latest_date}")
-    
-    # 최신 날짜의 RS 데이터 가져오기
-    query_rs = """
-        SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, rs_120d, rs_200d
-        FROM krx_relative_strength
-        WHERE date = %s;
-    """
-    rs_data = pd.read_sql_query(query_rs, con=engine, params=(latest_date,))
-    
-    if len(rs_data) == 0:
-        print("⚠️ 경고: RS 데이터가 없습니다. 최신 날짜로 다시 시도합니다.")
-        # 최신 날짜로 다시 조회
-        query_rs_all = """
-            SELECT ticker, market_type, rs_10d, rs_20d, rs_50d, rs_120d, rs_200d, date
-            FROM krx_relative_strength
-            ORDER BY date DESC
-            LIMIT 10000;
-        """
-        rs_data_all = pd.read_sql_query(query_rs_all, con=engine)
-        if len(rs_data_all) > 0:
-            latest_date = rs_data_all.iloc[0]['date']
-            print(f"실제 최신 날짜: {latest_date}")
-            rs_data = rs_data_all[rs_data_all['date'] == latest_date].copy()
-            rs_data = rs_data[['ticker', 'market_type', 'rs_10d', 'rs_20d', 'rs_50d', 'rs_120d', 'rs_200d']]
-    
-    if len(rs_data) > 0:
-        print(f"RS 데이터 로드 완료: {len(rs_data)}개 종목")
-        
-        # 코스피/코스닥별로 분리
-        rs_kospi_df = rs_data[rs_data['market_type'] == 'KOSPI'].copy()
-        rs_kosdaq_df = rs_data[rs_data['market_type'] == 'KOSDAQ'].copy()
-        
-        # ticker를 인덱스로 설정
-        if len(rs_kospi_df) > 0:
-            rs_kospi_df = rs_kospi_df.set_index('ticker')
-            rs_kospi_df['rs10_score'] = rs_kospi_df['rs_10d']
-            rs_kospi_df['rs20_score'] = rs_kospi_df['rs_20d']
-            rs_kospi_df['rs50_score'] = rs_kospi_df['rs_50d']
-            # rs_score = 가중평균(rs_20/50/120/200) — 정본 indicators_core.rs_avg
-            rs_kospi_df['rs_score'] = rs_avg(
-                frame=rs_kospi_df, cols=('rs_20d', 'rs_50d', 'rs_120d', 'rs_200d')
-            ).round(2)
-            rs_kospi_df = rs_kospi_df[['rs10_score', 'rs20_score', 'rs50_score', 'rs_score']]
-            print(f"코스피 RS 데이터: {len(rs_kospi_df)}개 종목")
-        else:
-            rs_kospi_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-            print("⚠️ 코스피 RS 데이터가 없습니다.")
-        
-        if len(rs_kosdaq_df) > 0:
-            rs_kosdaq_df = rs_kosdaq_df.set_index('ticker')
-            rs_kosdaq_df['rs10_score'] = rs_kosdaq_df['rs_10d']
-            rs_kosdaq_df['rs20_score'] = rs_kosdaq_df['rs_20d']
-            rs_kosdaq_df['rs50_score'] = rs_kosdaq_df['rs_50d']
-            rs_kosdaq_df['rs_score'] = rs_avg(
-                frame=rs_kosdaq_df, cols=('rs_20d', 'rs_50d', 'rs_120d', 'rs_200d')
-            ).round(2)
-            rs_kosdaq_df = rs_kosdaq_df[['rs10_score', 'rs20_score', 'rs50_score', 'rs_score']]
-            print(f"코스닥 RS 데이터: {len(rs_kosdaq_df)}개 종목")
-        else:
-            rs_kosdaq_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-            print("⚠️ 코스닥 RS 데이터가 없습니다.")
-        
-        # 두 데이터프레임 합치기
-        if len(rs_kospi_df) > 0 and len(rs_kosdaq_df) > 0:
-            rs_df = pd.concat([rs_kospi_df, rs_kosdaq_df])
-        elif len(rs_kospi_df) > 0:
-            rs_df = rs_kospi_df
-        elif len(rs_kosdaq_df) > 0:
-            rs_df = rs_kosdaq_df
-        else:
-            rs_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-            print("⚠️ 경고: RS 데이터프레임이 비어있습니다.")
-        
-    else:
-        print("⚠️ 경고: RS 데이터를 가져올 수 없습니다. 빈 데이터프레임을 생성합니다.")
-        rs_kospi_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-        rs_kosdaq_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-        rs_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-else:
-    print("⚠️ 경고: RS 데이터가 없습니다. 빈 데이터프레임을 생성합니다.")
-    rs_kospi_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-    rs_kosdaq_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-    rs_df = pd.DataFrame(columns=['rs10_score', 'rs20_score', 'rs50_score', 'rs_score'])
-
-rs_time = time.time() - rs_start_time
-print(f"⏱️ RS 데이터 로드 완료: {rs_time:.2f}초")
-
-
-
-
-
-print("\n" + "=" * 80)
-print("🔍 종목 스크리닝 시작")
-print("=" * 80)
-
-screening_start_time = time.time()
-screening_result = run_screening(indicators_data, volume_data, rs_df, ticker_list, audit_ticker)
-
-result = screening_result['result']
-debug_counts = screening_result['debug_counts']
-selected_stocks = screening_result['selected_stocks']
-
-selected_stock11 = ['p11'] + result.get('p11', [])
-selected_stock12 = ['p12'] + result.get('p12', [])
-selected_stock13 = ['p13'] + result.get('p13', [])
-selected_stock14 = ['p14'] + result.get('p14', [])
-selected_stock15 = ['p15'] + result.get('p15', [])
-selected_stock16 = ['p16'] + result.get('p16', [])
-selected_stock17 = ['p17'] + result.get('p17', [])
-selected_stock18 = ['p18'] + result.get('p18', [])
-selected_stock21 = ['p21'] + result.get('p21', [])
-selected_stock22 = ['p22'] + result.get('p22', [])
-selected_stock23 = ['p23'] + result.get('p23', [])
-selected_stock24 = ['p24'] + result.get('p24', [])
-selected_stock25 = ['p25'] + result.get('p25', [])
-selected_stock26 = ['p26'] + result.get('p26', [])
-selected_stock27 = ['p27'] + result.get('p27', [])
-selected_stock28 = ['p28'] + result.get('p28', [])
-selected_stock29 = ['p29'] + result.get('p29', [])
-selected_stock29a = ['p29'] + result.get('p29a', [])
-selected_stock29b = ['p29'] + result.get('p29b', [])
-selected_stock31 = ['p31'] + result.get('p31', [])
-selected_stock32 = ['p32'] + result.get('p32', [])
-selected_stock33 = ['p33'] + result.get('p33', [])
-selected_stock34 = ['p34'] + result.get('p34', [])
-selected_stock35 = ['p35'] + result.get('p35', [])
-selected_stock36 = ['p36'] + result.get('p36', [])
-selected_stock41 = ['p41'] + result.get('p41', [])
-selected_stock42 = ['p42'] + result.get('p42', [])
-selected_stock43 = ['p43'] + result.get('p43', [])
-selected_stock51 = ['p51'] + result.get('p51', [])
-selected_stock52 = ['p52'] + result.get('p52', [])
-selected_stock53 = ['p53'] + result.get('p53', [])
-selected_stock54 = ['p54'] + result.get('p54', [])
-selected_stock55 = ['p55'] + result.get('p55', [])
-selected_stock61 = ['p61'] + result.get('p61', [])
-selected_stock71 = ['p71'] + result.get('p71', [])
-selected_stock81 = ['p81'] + result.get('p81', [])
-selected_stock91 = ['p91'] + result.get('p91', [])
-selected_stock92 = ['p92'] + result.get('p92', [])
-selected_stock93 = ['p93'] + result.get('p93', [])
-
-screening_time = time.time() - screening_start_time
-print(f"⏱️ 스크리닝 완료: {screening_time:.2f}초")
-
-# 디버깅 정보 출력
-print("\n" + "=" * 80)
-print("📊 스크리닝 디버깅 정보")
-print("=" * 80)
-print(f"📈 총 지표 데이터: {debug_counts['total_indicators']}개")
-print(f"✅ 기본 필터 통과: {debug_counts['passed_basic_filter']}개")
-print(f"✅ ATR 필터 통과: {debug_counts['passed_atr_filter']}개")
-print(f"✅ 패턴 매칭 선택: {len(selected_stocks)}개")
-
-if debug_counts['passed_basic_filter'] == 0:
-    print("\n⚠️ 기본 필터를 통과한 종목이 없습니다.")
-    print("   체크 사항:")
-    print(f"   - 지표 데이터: {len(indicators_data)}개")
-    print(f"   - 매물대 데이터: {len(volume_data)}개")
-    
-if debug_counts['passed_basic_filter'] > 0 and debug_counts['passed_atr_filter'] == 0:
-    print("\n⚠️ ATR 필터를 통과한 종목이 없습니다.")
-    print(f"   기본 필터 통과 종목 중 (ATR14/close)*1.5 < 0.1 조건을 만족하는 종목이 없습니다.")
-    
-if debug_counts['passed_atr_filter'] > 0 and len(selected_stocks) == 0:
-    print("\n⚠️ 패턴 매칭 조건을 만족하는 종목이 없습니다.")
-    print("   각 패턴의 조건이 너무 까다로울 수 있습니다.")
-print("=" * 80)
-
-
-# DataFrame 생성 (빈 리스트일 경우 처리)
-if len(selected_stocks) > 0:
-    selected_df = pd.DataFrame(selected_stocks, columns=['date', 'type', 'ticker', 'company'])
-else:
-    selected_df = pd.DataFrame(columns=['date', 'type', 'ticker', 'company'])
-    print("⚠️ 선별된 종목이 없습니다.")
-
-
-# 데이터베이스에 저장
-if len(selected_df) > 0:
-    print("\n" + "=" * 80)
-    print("💾 데이터베이스에 저장 중...")
-    print("=" * 80)
-
-    con = pymysql.connect(user=require_env('DB_USER'),
-    passwd=require_env('DB_PASSWORD'),
-    host='127.0.0.1',
-    db='kor_stock_db',
-    charset='utf8')
-
-    mycursor = con.cursor()
-
-    query = """
-        insert into krx_selected_stock (date, type, ticker, company)
-        values (%s, %s, %s, %s) as new
-        on duplicate key update
-        date=new.date, type=new.type, ticker=new.ticker, company=new.company;
-    """
-
-    args = selected_df.values.tolist()
-    mycursor.executemany(query, args)
-    con.commit()            
-
-    con.close()
-
-    print(f"✅ {len(selected_df)}개 종목 데이터베이스 저장 완료")
-else:
-    print("\n" + "=" * 80)
-    print("⚠️ 저장할 종목이 없습니다. 데이터베이스 저장을 건너뜁니다.")
-    print("=" * 80)
-
-
-
-
+# (파이프라인 실행부는 run_main()으로 이동)
 
 
 def gen_chart(df, typeP, sector_df, rs_df, period, money, risk, save_jpeg=False, trade_data=None):
@@ -2543,12 +2409,15 @@ def gen_chart(df, typeP, sector_df, rs_df, period, money, risk, save_jpeg=False,
         # print(f"[DEBUG] sector_df 날짜 범위: {sector_df.index.min()} ~ {sector_df.index.max()}")
     
     # RS 점수 가져오기 (에러 처리 추가)
-    try:
-        rs20 = float(rs_df.loc[ticker].rs20_score)
-        rs50 = float(rs_df.loc[ticker].rs50_score)
-        rs = float(rs_df.loc[ticker].rs_score)
-    except (KeyError, AttributeError):
-        rs20 = rs50 = rs = 0.0
+    if not USE_RS:
+        rs20 = rs50 = rs = "-"
+    else:
+        try:
+            rs20 = float(rs_df.loc[ticker].rs20_score)
+            rs50 = float(rs_df.loc[ticker].rs50_score)
+            rs = float(rs_df.loc[ticker].rs_score)
+        except (KeyError, AttributeError):
+            rs20 = rs50 = rs = 0.0
     
     try:
         if 'market_cap' in df.columns and pd.notna(df.iloc[0]['market_cap']):
@@ -2572,8 +2441,8 @@ def gen_chart(df, typeP, sector_df, rs_df, period, money, risk, save_jpeg=False,
     if sector_name:
         cpN += ' | ' + str(sector_name)
 
-    fileN = ticker + '.html'
-    fileN_jpeg = ticker + '.jpeg' if save_jpeg else None
+    fileN = ticker + OUTPUT_SUFFIX + '.html'
+    fileN_jpeg = ticker + OUTPUT_SUFFIX + '.jpeg' if save_jpeg else None
     
     # 테마 정보 조회
     theme_title_segment = ''
@@ -2843,14 +2712,14 @@ def gen_chart(df, typeP, sector_df, rs_df, period, money, risk, save_jpeg=False,
     mom_periods = [10, 20, 50, 120]
     mom_df = pd.DataFrame()
     for c in sector_df.columns:
-        mom_df[c+'_mom'] = talib.ROC(sector_df[c], timeperiod=10)
+        mom_df[c+'_mom'] = talib.ROC(sector_df[c],WIN_2)
     mom_df_10 = mom_df.tail(1).copy()
     
     mom_by_period = {}  # period -> DataFrame (columns = sector, one row)
     for period in mom_periods:
         m = pd.DataFrame()
         for c in sector_df.columns:
-            m[c+'_mom'] = talib.ROC(sector_df[c], timeperiod=period)
+            m[c+'_mom'] = talib.ROC(sector_df[c],period)
         mom_by_period[period] = m.tail(1)
     
     # 기존 로직: 10일 모멘텀으로 상위 섹터 선택 (현재는 종목+코스피/코스닥 2개만 있음)
@@ -3686,26 +3555,11 @@ def gen_chart(df, typeP, sector_df, rs_df, period, money, risk, save_jpeg=False,
         gridwidth=0.5
     )
     
-    # holidays를 datetime 형식으로 변환 (안전하게 처리)
-    holidays_datetime = []
-    for h in holidays:
-        try:
-            # 문자열 형식 확인 및 변환
-            if isinstance(h, str) and len(h) == 10 and h.count('-') == 2:
-                # 올바른 형식 (YYYY-MM-DD)
-                holidays_datetime.append(pd.to_datetime(h, format='%Y-%m-%d').strftime('%Y-%m-%d'))
-            else:
-                # 다른 형식이거나 이미 datetime인 경우
-                holidays_datetime.append(pd.to_datetime(h).strftime('%Y-%m-%d'))
-        except Exception as e:
-            print(f"[WARN] 휴일 변환 실패: {h}, 오류: {e}")
-            continue
-    
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]), #hide weekends
-            dict(values=holidays_datetime)  # hide holidays
-            ])
+    _auto_holidays = _nontrading_weekdays(engine, df.index.min(), df.index.max())
+    fig.update_xaxes(rangebreaks=[
+        dict(bounds=["sat", "mon"]),
+        dict(values=_auto_holidays),
+    ])
     
     # Col 2 x축: 마지막 행만 날짜 레이블 표시
     for row in range(3, _box_row):
@@ -3816,11 +3670,11 @@ def _energy_ratio_tradingkis_style(engine, tickers):
         return out
     ut = sorted({str(t).zfill(6) for t in tickers})
     try:
-        ref = pd.read_sql_query("SELECT MAX(date) AS d FROM krx_ohlcv", con=engine)
+        ref = pd.read_sql_query(f"SELECT MAX(date) AS d FROM `{OHLCV_TABLE}`", con=engine)
         d0 = pd.Timestamp(ref.iloc[0]["d"]).strftime("%Y-%m-%d")
-        q_mkt_tv = """
+        q_mkt_tv = f"""
             SELECT ts.sector_cd, SUM(o.close * o.volume) AS total_tv
-            FROM krx_ohlcv o
+            FROM `{OHLCV_TABLE}` o
             INNER JOIN krx_ticker t ON t.종목코드 = o.ticker
                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
             INNER JOIN krx_ticker_sector ts ON ts.ticker = o.ticker
@@ -3869,7 +3723,7 @@ def _energy_ratio_tradingkis_style(engine, tickers):
             _pc = ",".join(["%s"] * len(chunk))
             q_tv = f"""
                 SELECT o.ticker, SUM(o.close * o.volume) AS tv
-                FROM krx_ohlcv o
+                FROM `{OHLCV_TABLE}` o
                 WHERE DATE(o.date) = %s AND o.ticker IN ({_pc})
                 GROUP BY o.ticker
             """
@@ -3879,7 +3733,7 @@ def _energy_ratio_tradingkis_style(engine, tickers):
         chg_map = {}
         try:
             drows = pd.read_sql_query(
-                "SELECT DISTINCT date FROM krx_ohlcv ORDER BY date DESC LIMIT 2",
+                f"SELECT DISTINCT date FROM `{OHLCV_TABLE}` ORDER BY date DESC LIMIT 2",
                 con=engine,
             )
             dl = pd.to_datetime(drows["date"], errors="coerce").dropna().sort_values(ascending=False).tolist()
@@ -3889,7 +3743,7 @@ def _energy_ratio_tradingkis_style(engine, tickers):
                     chunk = ut[i0 : i0 + _chunk]
                     _pc = ",".join(["%s"] * len(chunk))
                     q_ch = f"""
-                        SELECT ticker, date, close FROM krx_ohlcv
+                        SELECT ticker, date, close FROM `{OHLCV_TABLE}`
                         WHERE date IN (%s, %s) AND ticker IN ({_pc})
                     """
                     cdf = pd.read_sql_query(q_ch, con=engine, params=tuple([d0s, d1s] + chunk))
@@ -3964,7 +3818,7 @@ def _screening_summary_mcap_tv_shares(engine, tickers):
     if engine is None or not ut:
         return empty
     try:
-        ref = pd.read_sql_query("SELECT MAX(date) AS d FROM krx_ohlcv", con=engine)
+        ref = pd.read_sql_query(f"SELECT MAX(date) AS d FROM `{OHLCV_TABLE}`", con=engine)
         d0 = pd.Timestamp(ref.iloc[0]["d"]).strftime("%Y-%m-%d")
         total_mcap = float(
             pd.read_sql_query(
@@ -3980,9 +3834,9 @@ def _screening_summary_mcap_tv_shares(engine, tickers):
         )
         total_tv = float(
             pd.read_sql_query(
-                """
+                f"""
                 SELECT COALESCE(SUM(o.close * o.volume), 0) AS total_tv
-                FROM krx_ohlcv o
+                FROM `{OHLCV_TABLE}` o
                 INNER JOIN krx_ticker t ON t.종목코드 = o.ticker
                     AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
                 WHERE t.종목구분 = '보통주'
@@ -4014,7 +3868,7 @@ def _screening_summary_mcap_tv_shares(engine, tickers):
             tdf = pd.read_sql_query(
                 f"""
                 SELECT o.ticker, SUM(o.close * o.volume) AS tv
-                FROM krx_ohlcv o
+                FROM `{OHLCV_TABLE}` o
                 WHERE DATE(o.date) = %s AND o.ticker IN ({_pc})
                 GROUP BY o.ticker
                 """,
@@ -4039,7 +3893,8 @@ def _screening_summary_mcap_tv_shares(engine, tickers):
             else:
                 tv_share[tk] = np.nan
         return full_mcap, mcap_share, tv_share
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ _screening_summary_mcap_tv_shares 실패: {e}")
         return empty
 
 
@@ -4057,10 +3912,10 @@ def _flag_nd_close_high(df, n):
 
 def _flag_120d_close_high(df):
     """최근 120거래일(당일 포함) 중 종가가 구간 최고 종가이면 O."""
-    return _flag_nd_close_high(df, 120)
+    return _flag_nd_close_high(df, WIN_26)
 
 
-def _talent_pct(df, window=120, thr=0.10):
+def _talent_pct(df, window=WIN_26, thr=0.10):
     """
     최근 window거래일 중 전일종가 대비 등락률 ≥ thr 인 날 비중(%).
     indicators_core.talent_up_share × 100.
@@ -4087,7 +3942,7 @@ def export_screening_summary_html(
     default_dir = os.path.join("C:\\Users\\hachi\\OneDrive\\01. Trading\\picking\\KRX", folder_name)
     os.makedirs(default_dir, exist_ok=True)
     if output_path is None:
-        output_path = os.path.join(default_dir, "screening_summary.html")
+        output_path = os.path.join(default_dir, f"screening_summary{OUTPUT_SUFFIX}.html")
 
     if selected_df is None or len(selected_df) == 0:
         body = "<p>선별된 스크리닝 행이 없습니다.</p>"
@@ -4184,10 +4039,10 @@ def export_screening_summary_html(
             s20 = "O" if np.isfinite(close) and np.isfinite(sma20) and close > sma20 else "X"
             bdisp = f"{pb * 100:.2f}" if np.isfinite(pb) else ""
             erdisp = f"{er:.2f}" if np.isfinite(er) else ""
-            tal = _talent_pct(idf, window=120, thr=0.10)
+            tal = _talent_pct(idf, window=WIN_26, thr=0.10)
             taldisp = f"{tal:.2f}" if np.isfinite(tal) else ""
-            hi50 = _flag_nd_close_high(idf, 50)
-            hi120 = _flag_nd_close_high(idf, 120)
+            hi50 = _flag_nd_close_high(idf, WIN_13)
+            hi120 = _flag_nd_close_high(idf, WIN_26)
             hi250 = _flag_nd_close_high(idf, 250)
             idf2, _ = _ensure_investor_osc_on_df(idf, tk)
             bsq_v = (
@@ -4594,9 +4449,486 @@ def create_charts_for_selected_stocks(selected_stock_list, rs_df, money, risk, e
     print(f"📊 생성된 차트 수: {len(selected_stock_list)-1}개")
     print("=" * 80)
 
+def run_main(do_summary=True, do_charts=False):
+    """티커 로드 → 지표 → 스크리닝 → (선택) 요약/차트. import 만으로는 실행되지 않음.
 
-# 1) 스크리닝 결과 요약 HTML (상단 실행 후 이 줄만 다시 실행하려면: export_screening_summary_html(selected_df, indicators_data, engine))
-# export_screening_summary_html(selected_df, indicators_data, engine)
+    Parameters
+    ----------
+    do_summary : bool
+        export_screening_summary_html 실행 여부 (기본 True).
+    do_charts : bool
+        create_charts_for_selected_stocks 실행 여부 (기본 False — 기존과 동일).
 
-# 2) 선별 종목 차트 생성
-create_charts_for_selected_stocks(selected_stock35, rs_df, money, risk, engine)
+    Returns
+    -------
+    dict
+        engine, ticker_list, ohlcv_data, indicators_data, volume_data,
+        selected_df, selected_stock_list(=selected_stock35), rs_df, money, risk 등.
+        동일 내용이 모듈 전역 CONTEXT 에도 보관된다.
+    """
+    global engine, conn_str, ticker_list
+    global ohlcv_data, indicators_data, volume_data
+    global rs_df, rs_kospi_df, rs_kosdaq_df
+    global selected_df, selected_stocks, result, debug_counts
+    global selected_stock11, selected_stock12, selected_stock13, selected_stock14, selected_stock15
+    global selected_stock16, selected_stock17, selected_stock18
+    global selected_stock21, selected_stock22, selected_stock23, selected_stock24, selected_stock25
+    global selected_stock26, selected_stock27, selected_stock28, selected_stock29
+    global selected_stock29a, selected_stock29b
+    global selected_stock31, selected_stock32, selected_stock33, selected_stock34, selected_stock35, selected_stock36
+    global selected_stock41, selected_stock42, selected_stock43
+    global selected_stock51, selected_stock52, selected_stock53, selected_stock54, selected_stock55
+    global selected_stock61, selected_stock71, selected_stock81
+    global selected_stock91, selected_stock92, selected_stock93
+    global CONTEXT
+
+    ### 서버 접속
+    engine = create_engine(db_url())
+    conn_str = db_url().replace('mysql+pymysql://', 'mysql://', 1)
+
+    ### 티커를 가져옴
+    query = """
+    select * from krx_ticker
+    where 기준일 = (select max(기준일) from krx_ticker) and 종목구분 = '보통주';
+    """
+
+    ticker_list = pd.read_sql(query, con=engine)
+    # 시가총액 컬럼이 있으면 가져오고, 없으면 None으로 설정
+    if '시가총액' in ticker_list.columns:
+        ticker_list = ticker_list[['종목코드', '종목명', '업종명', '시가총액']]
+    else:
+        ticker_list['시가총액'] = None
+        ticker_list = ticker_list[['종목코드', '종목명', '업종명', '시가총액']]
+    ticker_list = drop_excluded(ticker_list, "종목코드")
+    ticker_list = ticker_list.set_index('종목코드')
+
+
+    # 성능 모니터링 시작
+    print("=" * 80)
+    print("🚀 최적화된 KRX 주식 선별 시스템 시작")
+    print("=" * 80)
+
+    start_time = time.time()
+
+    ### OHLCV 데이터 로딩 (병렬 처리)
+    print("\n" + "=" * 80)
+    print("📊 OHLCV 데이터 로딩")
+    print("=" * 80)
+
+    data_load_start = time.time()
+    ohlcv_data = load_ohlcv_parallel(ticker_list, engine, max_workers=MAX_WORKERS_DATA_LOAD)
+    ohlcv_data = filter_ohlcv_zero_latest(ohlcv_data)
+    data_load_time = time.time() - data_load_start
+    print(f"⏱️ OHLCV 데이터 로딩 완료: {data_load_time:.2f}초")
+    print(f"📊 성공률: {len(ohlcv_data)}/{len(ticker_list)} ({len(ohlcv_data)/len(ticker_list)*100:.1f}%)")
+
+    ### 투자자/외국인 벌크 로드 (지표 ThreadPool 진입 전, 이후 캐시 읽기 전용)
+    global _INVESTOR_CACHE, _FOREIGN_CACHE
+    _INVESTOR_CACHE = None
+    _FOREIGN_CACHE = None
+    bulk_tickers = list(ohlcv_data.keys())
+    bulk_start = time.time()
+    _INVESTOR_CACHE = _bulk_load_investor_trading(engine, bulk_tickers)
+    _FOREIGN_CACHE = _bulk_load_foreign_holding(engine, bulk_tickers)
+    bulk_rows = sum(len(v) for v in _INVESTOR_CACHE.values()) + sum(
+        len(v) for v in _FOREIGN_CACHE.values()
+    )
+    bulk_time = time.time() - bulk_start
+    print(
+        f"투자자/외국인 벌크 로드: 티커 {len(bulk_tickers)}종, 행 {bulk_rows} ({bulk_time:.1f}s)"
+    )
+
+    ### 지표 계산 (병렬 처리)
+    print("\n" + "=" * 80)
+    print("📈 지표 계산 시작")
+    print("=" * 80)
+
+    indicators_start_time = time.time()
+    indicators_data = calculate_indicators_parallel(ohlcv_data, max_workers=MAX_WORKERS_INDICATORS)
+    indicators_time = time.time() - indicators_start_time
+    print(f"⏱️ 지표 계산 완료: {indicators_time:.2f}초")
+
+    ### 매물대 계산 (병렬 처리)
+    print("\n" + "=" * 80)
+    print("📊 매물대 지표 생성")
+    print("=" * 80)
+
+    volume_start_time = time.time()
+    volume_data = calculate_volume_band_parallel(ohlcv_data, max_workers=MAX_WORKERS_VOLUME)
+    volume_time = time.time() - volume_start_time
+    print(f"⏱️ 매물대 계산 완료: {volume_time:.2f}초")
+
+    ### RS 데이터 DB에서 가져오기
+    rs_start_time = time.time()
+    _rs_empty = pd.DataFrame(columns=["rs10_score", "rs20_score", "rs50_score", "rs_score"])
+    if not USE_RS:
+        print("\n" + "=" * 80)
+        print("📊 RS 스킵 (USE_RS=False)")
+        print("=" * 80)
+        rs_kospi_df = _rs_empty.copy()
+        rs_kosdaq_df = _rs_empty.copy()
+        rs_df = _rs_empty.copy()
+        rs_time = time.time() - rs_start_time
+        print(f"⏱️ RS 스킵 완료: {rs_time:.2f}초")
+    else:
+        print("\n" + "=" * 80)
+        print("📊 RS 데이터 로드 시작")
+        print("=" * 80)
+        _rs_col_sql = ", ".join(f"rs_{p}d" for p in RS_PERIODS)
+        _rs_avg_cols = tuple(f"rs_{p}d" for p in RS_PERIODS if p != 10)
+
+        # DB에서 최신 날짜의 RS 데이터 가져오기
+        query_max_date = """
+            SELECT MAX(date) as max_date
+            FROM krx_relative_strength;
+        """
+        max_rs_date = pd.read_sql_query(query_max_date, con=engine)
+
+        if len(max_rs_date) > 0 and max_rs_date.iloc[0]['max_date'] is not None:
+            latest_date = max_rs_date.iloc[0]['max_date']
+            print(f"최신 RS 데이터 날짜: {latest_date}")
+
+            # 최신 날짜의 RS 데이터 가져오기
+            query_rs = f"""
+                SELECT ticker, market_type, {_rs_col_sql}
+                FROM krx_relative_strength
+                WHERE date = %s;
+            """
+            rs_data = pd.read_sql_query(query_rs, con=engine, params=(latest_date,))
+
+            if len(rs_data) == 0:
+                print("⚠️ 경고: RS 데이터가 없습니다. 최신 날짜로 다시 시도합니다.")
+                # 최신 날짜로 다시 조회
+                query_rs_all = f"""
+                    SELECT ticker, market_type, {_rs_col_sql}, date
+                    FROM krx_relative_strength
+                    ORDER BY date DESC
+                    LIMIT 10000;
+                """
+                rs_data_all = pd.read_sql_query(query_rs_all, con=engine)
+                if len(rs_data_all) > 0:
+                    latest_date = rs_data_all.iloc[0]['date']
+                    print(f"실제 최신 날짜: {latest_date}")
+                    rs_data = rs_data_all[rs_data_all['date'] == latest_date].copy()
+                    rs_data = rs_data[['ticker', 'market_type'] + [f"rs_{p}d" for p in RS_PERIODS]]
+
+            if len(rs_data) > 0:
+                print(f"RS 데이터 로드 완료: {len(rs_data)}개 종목")
+
+                # 코스피/코스닥별로 분리
+                rs_kospi_df = rs_data[rs_data['market_type'] == 'KOSPI'].copy()
+                rs_kosdaq_df = rs_data[rs_data['market_type'] == 'KOSDAQ'].copy()
+
+                # ticker를 인덱스로 설정
+                if len(rs_kospi_df) > 0:
+                    rs_kospi_df = rs_kospi_df.set_index('ticker')
+                    rs_kospi_df['rs10_score'] = rs_kospi_df['rs_10d'] if 'rs_10d' in rs_kospi_df.columns else np.nan
+                    rs_kospi_df['rs20_score'] = rs_kospi_df['rs_20d'] if 'rs_20d' in rs_kospi_df.columns else np.nan
+                    rs_kospi_df['rs50_score'] = rs_kospi_df['rs_50d'] if 'rs_50d' in rs_kospi_df.columns else np.nan
+                    # rs_score = 가중평균(rs_20/50/120/200) — 정본 indicators_core.rs_avg
+                    rs_kospi_df['rs_score'] = rs_avg(
+                        frame=rs_kospi_df, cols=_rs_avg_cols
+                    ).round(2)
+                    rs_kospi_df = rs_kospi_df[['rs10_score', 'rs20_score', 'rs50_score', 'rs_score']]
+                    print(f"코스피 RS 데이터: {len(rs_kospi_df)}개 종목")
+                else:
+                    rs_kospi_df = _rs_empty.copy()
+                    print("⚠️ 코스피 RS 데이터가 없습니다.")
+
+                if len(rs_kosdaq_df) > 0:
+                    rs_kosdaq_df = rs_kosdaq_df.set_index('ticker')
+                    rs_kosdaq_df['rs10_score'] = rs_kosdaq_df['rs_10d'] if 'rs_10d' in rs_kosdaq_df.columns else np.nan
+                    rs_kosdaq_df['rs20_score'] = rs_kosdaq_df['rs_20d'] if 'rs_20d' in rs_kosdaq_df.columns else np.nan
+                    rs_kosdaq_df['rs50_score'] = rs_kosdaq_df['rs_50d'] if 'rs_50d' in rs_kosdaq_df.columns else np.nan
+                    rs_kosdaq_df['rs_score'] = rs_avg(
+                        frame=rs_kosdaq_df, cols=_rs_avg_cols
+                    ).round(2)
+                    rs_kosdaq_df = rs_kosdaq_df[['rs10_score', 'rs20_score', 'rs50_score', 'rs_score']]
+                    print(f"코스닥 RS 데이터: {len(rs_kosdaq_df)}개 종목")
+                else:
+                    rs_kosdaq_df = _rs_empty.copy()
+                    print("⚠️ 코스닥 RS 데이터가 없습니다.")
+
+                # 두 데이터프레임 합치기
+                if len(rs_kospi_df) > 0 and len(rs_kosdaq_df) > 0:
+                    rs_df = pd.concat([rs_kospi_df, rs_kosdaq_df])
+                elif len(rs_kospi_df) > 0:
+                    rs_df = rs_kospi_df
+                elif len(rs_kosdaq_df) > 0:
+                    rs_df = rs_kosdaq_df
+                else:
+                    rs_df = _rs_empty.copy()
+                    print("⚠️ 경고: RS 데이터프레임이 비어있습니다.")
+
+            else:
+                print("⚠️ 경고: RS 데이터를 가져올 수 없습니다. 빈 데이터프레임을 생성합니다.")
+                rs_kospi_df = _rs_empty.copy()
+                rs_kosdaq_df = _rs_empty.copy()
+                rs_df = _rs_empty.copy()
+        else:
+            print("⚠️ 경고: RS 데이터가 없습니다. 빈 데이터프레임을 생성합니다.")
+            rs_kospi_df = _rs_empty.copy()
+            rs_kosdaq_df = _rs_empty.copy()
+            rs_df = _rs_empty.copy()
+
+        rs_time = time.time() - rs_start_time
+        print(f"⏱️ RS 데이터 로드 완료: {rs_time:.2f}초")
+
+
+
+
+
+    print("\n" + "=" * 80)
+    print("🔍 종목 스크리닝 시작")
+    print("=" * 80)
+
+    screening_start_time = time.time()
+    _screener = SCREEN_FN or screen_all
+    _screener_label = (
+        f"{getattr(_screener, '__name__', repr(_screener))}(주봉 전용)"
+        if SCREEN_FN is not None
+        else "screen_all(일봉 기본)"
+    )
+    print(f"스크리너: {_screener_label}")
+
+    screening_result = _screener(
+        indicators_data,
+        rs_df=rs_df,
+        volume_data=volume_data,
+        ticker_list=ticker_list,
+        audit_ticker=audit_ticker,
+    )
+
+    result = screening_result["result"]
+    debug_counts = screening_result["debug_counts"]
+    selected_stocks = screening_result["selected_stocks"]
+    selected_df = screening_result["selected_df"]
+    selected_stock_list = screening_result["selected_stock_list"]
+
+    selected_stock11 = ['p11'] + result.get('p11', [])
+    selected_stock12 = ['p12'] + result.get('p12', [])
+    selected_stock13 = ['p13'] + result.get('p13', [])
+    selected_stock14 = ['p14'] + result.get('p14', [])
+    selected_stock15 = ['p15'] + result.get('p15', [])
+    selected_stock16 = ['p16'] + result.get('p16', [])
+    selected_stock17 = ['p17'] + result.get('p17', [])
+    selected_stock18 = ['p18'] + result.get('p18', [])
+    selected_stock21 = ['p21'] + result.get('p21', [])
+    selected_stock22 = ['p22'] + result.get('p22', [])
+    selected_stock23 = ['p23'] + result.get('p23', [])
+    selected_stock24 = ['p24'] + result.get('p24', [])
+    selected_stock25 = ['p25'] + result.get('p25', [])
+    selected_stock26 = ['p26'] + result.get('p26', [])
+    selected_stock27 = ['p27'] + result.get('p27', [])
+    selected_stock28 = ['p28'] + result.get('p28', [])
+    selected_stock29 = ['p29'] + result.get('p29', [])
+    selected_stock29a = ['p29'] + result.get('p29a', [])
+    selected_stock29b = ['p29'] + result.get('p29b', [])
+    selected_stock31 = ['p31'] + result.get('p31', [])
+    selected_stock32 = ['p32'] + result.get('p32', [])
+    selected_stock33 = ['p33'] + result.get('p33', [])
+    selected_stock34 = ['p34'] + result.get('p34', [])
+    selected_stock35 = ['p35'] + result.get('p35', [])
+    selected_stock36 = ['p36'] + result.get('p36', [])
+    selected_stock41 = ['p41'] + result.get('p41', [])
+    selected_stock42 = ['p42'] + result.get('p42', [])
+    selected_stock43 = ['p43'] + result.get('p43', [])
+    selected_stock51 = ['p51'] + result.get('p51', [])
+    selected_stock52 = ['p52'] + result.get('p52', [])
+    selected_stock53 = ['p53'] + result.get('p53', [])
+    selected_stock54 = ['p54'] + result.get('p54', [])
+    selected_stock55 = ['p55'] + result.get('p55', [])
+    selected_stock61 = ['p61'] + result.get('p61', [])
+    selected_stock71 = ['p71'] + result.get('p71', [])
+    selected_stock81 = ['p81'] + result.get('p81', [])
+    selected_stock91 = ['p91'] + result.get('p91', [])
+    selected_stock92 = ['p92'] + result.get('p92', [])
+    selected_stock93 = ['p93'] + result.get('p93', [])
+
+    screening_time = time.time() - screening_start_time
+    print(f"⏱️ 스크리닝 완료: {screening_time:.2f}초")
+
+    # 디버깅 정보 출력
+    print("\n" + "=" * 80)
+    print("📊 스크리닝 디버깅 정보")
+    print("=" * 80)
+    print(f"📈 총 지표 데이터: {debug_counts['total_indicators']}개")
+    print(f"✅ 기본 필터 통과: {debug_counts['passed_basic_filter']}개")
+    print(f"✅ ATR 필터 통과: {debug_counts['passed_atr_filter']}개")
+    print(f"✅ 패턴 매칭 선택: {debug_counts.get('selected_by_pattern', len(selected_stocks))}개")
+
+    if debug_counts['passed_basic_filter'] == 0:
+        print("\n⚠️ 기본 필터를 통과한 종목이 없습니다.")
+        print("   체크 사항:")
+        print(f"   - 지표 데이터: {len(indicators_data)}개")
+        print(f"   - 매물대 데이터: {len(volume_data)}개")
+
+    if debug_counts['passed_basic_filter'] > 0 and debug_counts['passed_atr_filter'] == 0:
+        print("\n⚠️ ATR 필터를 통과한 종목이 없습니다.")
+        print(f"   기본 필터 통과 종목 중 (ATR14/close)*1.5 < 0.1 조건을 만족하는 종목이 없습니다.")
+
+    if debug_counts['passed_atr_filter'] > 0 and len(selected_stocks) == 0:
+        print("\n⚠️ 패턴 매칭 조건을 만족하는 종목이 없습니다.")
+        print("   각 패턴의 조건이 너무 까다로울 수 있습니다.")
+    print("=" * 80)
+
+
+    if len(selected_df) == 0:
+        print("⚠️ 선별된 종목이 없습니다.")
+
+
+    # 데이터베이스에 저장
+    if len(selected_df) > 0:
+        print("\n" + "=" * 80)
+        print("💾 데이터베이스에 저장 중...")
+        print("=" * 80)
+
+        con = pymysql.connect(user=require_env('DB_USER'),
+        passwd=require_env('DB_PASSWORD'),
+        host='127.0.0.1',
+        db='kor_stock_db',
+        charset='utf8')
+
+        mycursor = con.cursor()
+
+        query = """
+            insert into krx_selected_stock (date, type, ticker, company)
+            values (%s, %s, %s, %s) as new
+            on duplicate key update
+            date=new.date, type=new.type, ticker=new.ticker, company=new.company;
+        """
+
+        args = selected_df.values.tolist()
+        mycursor.executemany(query, args)
+        con.commit()            
+
+        con.close()
+
+        print(f"✅ {len(selected_df)}개 종목 데이터베이스 저장 완료")
+    else:
+        print("\n" + "=" * 80)
+        print("⚠️ 저장할 종목이 없습니다. 데이터베이스 저장을 건너뜁니다.")
+        print("=" * 80)
+
+    # 1) 스크리닝 결과 요약 HTML
+    if do_summary:
+        export_screening_summary_html(selected_df, indicators_data, engine)
+
+    # 2) 선별 종목 차트 생성 (기본 꺼짐 — 기존과 동일)
+    if do_charts:
+        create_charts_for_selected_stocks(selected_stock_list, rs_df, money, risk, engine)
+
+    ctx = {
+        "engine": engine,
+        "ticker_list": ticker_list,
+        "ohlcv_data": ohlcv_data,
+        "indicators_data": indicators_data,
+        "volume_data": volume_data,
+        "selected_df": selected_df,
+        "selected_stocks": selected_stocks,
+        "selected_stock_list": selected_stock_list,
+        "result": result,
+        "debug_counts": debug_counts,
+        "rs_df": rs_df,
+        "money": money,
+        "risk": risk,
+    }
+    CONTEXT.clear()
+    CONTEXT.update(ctx)
+    return ctx
+
+
+def _require_vars(*names: str) -> bool:
+    g = globals()
+    missing = [n for n in names if n not in g or g[n] is None]
+    if missing:
+        print(f"⚠️ 필수 변수 없음: {missing}\n   → 셀1을 먼저 실행하세요.")
+        return False
+    return True
+
+
+def cell1_pipeline(do_summary=True):
+    """데이터 로드 → 지표 → 스크리닝. 차트는 셀2."""
+    ctx = run_main(do_summary=do_summary, do_charts=False)
+    globals().update({
+        "engine": ctx["engine"],
+        "ticker_list": ctx["ticker_list"],
+        "ohlcv_data": ctx["ohlcv_data"],
+        "indicators_data": ctx["indicators_data"],
+        "volume_data": ctx["volume_data"],
+        "selected_df": ctx["selected_df"],
+        "selected_stocks": ctx["selected_stocks"],
+        "selected_stock_list": ctx["selected_stock_list"],
+        "result": ctx["result"],
+        "debug_counts": ctx["debug_counts"],
+        "rs_df": ctx["rs_df"],
+        "money": ctx["money"],
+        "risk": ctx["risk"],
+    })
+    n = len(ctx["selected_df"]) if ctx.get("selected_df") is not None else 0
+    print(f"✅ 파이프라인 완료 — selected_df {n}행. 차트=셀2 Run Cell.")
+    return ctx
+
+
+def cell2_charts(pattern=None, max_charts=None, dedupe=False):
+    """
+    pattern : "p35" / ["p11","p35"] / None(선정된 전 패턴)
+    max_charts : 패턴별 최대 장수
+    dedupe : True 면 여러 패턴에 중복 등장하는 종목을 1회만
+    """
+    if not _require_vars("result", "rs_df", "money", "risk", "engine"):
+        return None
+    if pattern is None:
+        codes = [c for c in result.keys() if result.get(c)]
+    elif isinstance(pattern, str):
+        codes = [pattern]
+    else:
+        codes = list(pattern)
+
+    seen = set()
+    chart_list = []
+    total = 0
+    for code in codes:
+        items = result.get(code) or []
+        if not items:
+            print(f"  {code}: 0건 — 건너뜀")
+            continue
+        picked = []
+        for it in items:
+            tk = None
+            try:
+                tk = str(it.iloc[-1]["ticker"])
+            except Exception:
+                pass
+            if dedupe and tk and tk in seen:
+                continue
+            if tk:
+                seen.add(tk)
+            picked.append(it)
+            if max_charts and len(picked) >= max_charts:
+                break
+        if not picked:
+            continue
+        chart_list.append(code)
+        chart_list.extend(picked)
+        total += len(picked)
+        print(f"  {code}: {len(picked)}장")
+
+    if total == 0:
+        print("생성할 차트가 없습니다.")
+        return None
+    print(f"차트 대상 합계 {total}장 (패턴 {len([c for c in chart_list if isinstance(c, str)])}종)")
+    create_charts_for_selected_stocks(chart_list, rs_df, money, risk, engine)
+    return chart_list
+
+
+# %% 1) 데이터 로드 → 지표 → 스크리닝 (오래 걸림)
+if __name__ == "__main__":
+    cell1_pipeline()
+    print("F5 완료. 차트는 셀2 Run Cell.")
+    raise SystemExit(0)
+
+
+# %% 2) 차트 생성 — 패턴 선택 (셀1 실행 후 Run Cell)
+if __name__ == "__main__":
+    cell2_charts(pattern="p22")
