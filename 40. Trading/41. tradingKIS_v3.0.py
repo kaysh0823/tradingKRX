@@ -653,16 +653,6 @@ biz_day = date.today().strftime('%Y%m%d')
 
 # biz_day = '20250310'
 
-### 휴일을 입력
-holidays = ['2023-08-15', '2023-09-28', '2023-09-29', '2023-10-02', '2023-10-03', '2023-10-09', "2023-12-25", '2023-12-29',
-            "2024-01-01", '2024-02-09', '2024-02-12', '2024-03-01', '2024-04-10', "2024-05-06", '2024-05-01', '2024-05-15', "2024-06-06",
-            '2024-08-15', '2024-09-16', '2024-09-17', '2024-09-18', '2024-10-01', '2024-10-03', '2024-10-09', '2024-12-25', '2024-12-31',
-            '2025-01-01', '2025-01-27', '2025-01-28', '2025-01-29', '2025-01-30', '2025-03-03', '2025-05-01', '2025-05-05', '2025-05-06',
-            '2025-06-03', '2025-06-06', '2025-08-15', '2025-10-03', '2025-10-06', '2025-10-07', '2025-10-08', '2025-10-09',
-            '2025-12-25', '2025-12-31', '2026-01-01', '2026-02-16', '2026-02-17', '2026-02-18', '2026-03-02', '2026-05-01',
-            '2026-05-05', '2026-05-25', '2026-07-17', '2026-08-17']
-
-
 
 ### 비즈데이를 준으로 90일을 시작이로 정함 == 한투가 90일 기준임
 fr = (datetime.strptime(biz_day, '%Y%m%d') + relativedelta(days=-90)).strftime("%Y%m%d")
@@ -1059,6 +1049,19 @@ position = get_balance()
 
 ## 서버 접속
 engine = create_engine(db_url())
+
+
+def _load_trading_days(engine, start, end):
+    """krx_ohlcv 실제 거래일 집합."""
+    q = "SELECT DISTINCT date FROM krx_ohlcv WHERE date BETWEEN %s AND %s"
+    df = pd.read_sql_query(q, con=engine, params=(str(start), str(end)))
+    return set(pd.DatetimeIndex(pd.to_datetime(df["date"])).normalize())
+
+
+def _nontrading_weekdays(engine, start, end):
+    """구간 내 평일 중 거래일이 아닌 날 = 휴장일 (YYYY-MM-DD 문자열)."""
+    td = _load_trading_days(engine, start, end)
+    return [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start, end) if d not in td]
 
 
 ohlcv_data = {}
@@ -3274,26 +3277,12 @@ def gen_chart(df, sector_df, rs_df, period, trade_data=None):
         gridwidth=0.5
     )
     
-    # holidays를 datetime 형식으로 변환 (안전하게 처리)
-    holidays_datetime = []
-    for h in holidays:
-        try:
-            # 문자열 형식 확인 및 변환
-            if isinstance(h, str) and len(h) == 10 and h.count('-') == 2:
-                # 올바른 형식 (YYYY-MM-DD)
-                holidays_datetime.append(pd.to_datetime(h, format='%Y-%m-%d').strftime('%Y-%m-%d'))
-            else:
-                # 다른 형식이거나 이미 datetime인 경우
-                holidays_datetime.append(pd.to_datetime(h).strftime('%Y-%m-%d'))
-        except Exception as e:
-            print(f"[WARN] 휴일 변환 실패: {h}, 오류: {e}")
-            continue
-    
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]), #hide weekends
-            dict(values=holidays_datetime)  # hide holidays
-            ])
+    _auto_holidays = _nontrading_weekdays(engine, df.index.min(), df.index.max())
+    print(f"[rb] 자동 휴장일 {len(_auto_holidays)}건: {_auto_holidays}")
+    fig.update_xaxes(rangebreaks=[
+        dict(bounds=["sat", "mon"]),
+        dict(values=_auto_holidays),
+    ])
     
     # Col 2 x축: 마지막 행만 날짜 레이블 표시
     for row in range(3, _box_row):
