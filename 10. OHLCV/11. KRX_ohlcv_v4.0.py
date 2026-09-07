@@ -507,9 +507,9 @@ BLD_STOCK_OHLCV = 'dbms/MDC/STAT/standard/MDCSTAT01501'
 OHLCV_INITIAL_TRADING_DAYS = 250
 OHLCV_INITIAL_START = None  # 예: '20240101' — 지정 시 초기 백필 시작일(YYYYMMDD)
 # 지정 시 해당 날짜만 강제 재수집(형식 'YYYYMMDD'). 비우면 평소 동작.
-OHLCV_REFETCH_DATES = ['20260507']         # 예: ['20260508', '20260514']
+OHLCV_REFETCH_DATES = None         # 예: ['20260508', '20260514']
 # ('YYYYMMDD','YYYYMMDD') 지정 시 해당 구간 전 거래일 재수집. None이면 미사용.
-OHLCV_REFETCH_RANGE = ('20220711', '20260901')      # 예: ('20220711', '20260901')
+OHLCV_REFETCH_RANGE = None      # 예: ('20220711', '20260901')
 WEEKLY_REBUILD = False  # True: 주봉 테이블 전량 삭제 후 일봉→W-FRI 재적재
 
 
