@@ -11,3 +11,10 @@ naverPub/
 50. Picking/cache/
 
 # archive/ 는 구버전 추적 유지 — ignore 하지 않음 (archive/README.md)
+
+# KIS API 토큰 캐시 — 절대 커밋 금지
+.kis_token_cache.json
+**/.kis_token_cache.json
+
+# 패턴 평가 산출물 (pkl 2.6GB 포함)
+50. Picking/results/
