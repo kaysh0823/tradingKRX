@@ -1237,11 +1237,26 @@ PATTERN_REGISTRY = {}   # code -> {"fn","group","name","params"}
 DISABLED_PATTERNS = {
     "p13", "p14", "p17", "p27", "p34", "p43", "p61",
     "p25", "p26",   # p24 와 중복(Jaccard 0.72/0.36), 성과 동일 → p24 로 통합
+    "p41",          # 58 매물대(2023-01~2026-09, 78히트): h20Δ−0.016/h60Δ−0.037, 승률0.338(base0.383) → 폐기
+    "p53",          # p53: 58 구간분할(2023~24 / 2025~26) h60Δ = -0.062 / +0.095.
+                    #      한 구간 의존, 표본 150/305, std 0.52~0.59 → 신뢰 불가
 }
 
 # 강등 — 성과가 베이스라인과 동일하고 히트가 과다(전체의 55%).
 #        선정 목록에는 넣지 않고 참고용으로만 계산한다.
 REFERENCE_PATTERNS = {"p71", "p81", "p93"}
+
+# 58 구간분할 검증 등급 (2023-01~2026-09)
+# A: 두 구간 모두 h60Δ ≥ +0.02
+# B: 두 구간 모두 양수지만 약함
+# C: 한 구간에만 의존 (△) — 재검토 대상
+PATTERN_GRADE = {
+    "p52": "A", "p51": "A", "p16": "A", "p29a": "A", "p33": "A", "p12": "A",
+    "p92": "B", "p31": "B", "p28": "B", "p23": "B", "p55": "B",
+    "p54": "B", "p32": "B", "p21": "B", "p11": "B", "p15": "B",
+    "p91": "C", "p36": "C", "p22": "C", "p24": "C", "p25": "C",
+    "p26": "C", "p35": "C",
+}
 
 def pattern(code, group, name, **params):
     def deco(fn):
@@ -2325,7 +2340,11 @@ def screen_all(indicators_data, rs_df=None, **ctx):
         elif _k in REFERENCE_PATTERNS:
             print(f"   · {_k}: {_cnt[_k]}건 [참고]")
         else:
-            print(f"   · {_k}: {_cnt[_k]}건")
+            _g = PATTERN_GRADE.get(_k)
+            if _g:
+                print(f"   · {_k}: {_cnt[_k]}건 [{_g}]")
+            else:
+                print(f"   · {_k}: {_cnt[_k]}건")
     print("=" * 80)
 
     return {
