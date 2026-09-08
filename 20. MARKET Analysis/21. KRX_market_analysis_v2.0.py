@@ -2868,12 +2868,14 @@ def write_rs_high_list_html(
     return out_path, set(df["ticker"].astype(str).tolist())
 
 
-def _weekly_close_high_breakout_ox(g: pd.DataFrame) -> tuple[str, str, str]:
+def _weekly_close_high_breakout_ox(g: pd.DataFrame, side: str = "high") -> tuple[str, str, str]:
     """
-    일봉 OHLCV로부터 주봉(주간 종가 = 해당 주 마지막 거래일 종가, `W-FRI` 리샘플) 기준 신고가 여부.
+    일봉 OHLCV로부터 주봉(주간 종가 = 해당 주 마지막 거래일 종가, `W-FRI` 리샘플) 기준
+    신고가(side='high') / 신저가(side='low') 여부.
 
-    각 N주: **최신 주봉 종가**가 **직전 N개 주봉 종가**의 최고값을 **초과(>)** 하면 ``O``, 아니면 ``X``.
-    주봉 봉 수가 부족하면 ``''`` (일간 120일·250일 신고가 판정과 동일하게 엄격 비교).
+    각 N주: **최신 주봉 종가**가 **직전 N개 주봉 종가**의 최고(최저)를
+    초과(미달)하면 ``O``, 아니면 ``X``.
+    주봉 봉 수가 부족하면 ``''`` (일간 판정과 동일하게 엄격 비교).
     """
     if g is None or g.empty or "date" not in g.columns or "close" not in g.columns:
         return ("", "", "")
@@ -2890,17 +2892,47 @@ def _weekly_close_high_breakout_ox(g: pd.DataFrame) -> tuple[str, str, str]:
     if w.empty:
         return ("", "", "")
     cw = w["close"].to_numpy(dtype=float)
+    is_low = (side or "high").lower() == "low"
 
     def ox(nweeks: int) -> str:
         if cw.size < nweeks + 1:
             return ""
         br = float(cw[-1])
-        ref = np.nanmax(cw[-(nweeks + 1) : -1])
+        prev = cw[-(nweeks + 1) : -1]
+        if is_low:
+            ref = np.nanmin(prev)
+            if not np.isfinite(ref) or not np.isfinite(br):
+                return ""
+            return "O" if br < ref else "X"
+        ref = np.nanmax(prev)
         if not np.isfinite(ref) or not np.isfinite(br):
             return ""
         return "O" if br > ref else "X"
 
     return (ox(10), ox(20), ox(50))
+
+
+_BREAKOUT_BTN_LABELS = {
+    1: "1페이지: 당일 신고가",
+    2: "2페이지: 당일 신저가",
+}
+_BREAKOUT_PAGE_DESCS = {
+    1: "당일(D-0) 종가가 전일(D-1) 기준 200·120·50거래일 최고 종가를 상향 돌파한 종목입니다. 상위 티어에 해당하면 하위 구간에는 표시되지 않습니다.",
+    2: "당일(D-0) 종가가 전일(D-1) 기준 200·120·50거래일 최저 종가를 하향 돌파한 종목입니다. 상위 티어(200일)에 해당하면 하위 구간에는 표시되지 않습니다.",
+}
+
+_BREAKOUT_PAGE_CSS = """
+<style>
+  section { margin: 0 0 28px 0; }
+  .tables-2col { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+  .tables-2col .col { flex: 1 1 520px; min-width: 460px; }
+  h2 { font-size: 1.1rem; margin: 0 0 10px 0; }
+  h3 { font-size: 0.95rem; margin: 16px 0 8px 0; color: #222; font-weight: 600; }
+  .theme-summary { font-size: 12px; color: #333; margin: 0 0 12px 0; line-height: 1.55; max-width: 100%; }
+  .theme-summary .tc { color: #666; font-weight: 600; }
+  .bo-note { color: #444; font-size: 13px; margin: 0 0 18px; line-height: 1.55; }
+</style>
+"""
 
 
 def write_120d_breakout_list_html(
@@ -2910,10 +2942,10 @@ def write_120d_breakout_list_html(
     quiet: bool = False,
 ) -> tuple[str | None, set[str]]:
     """
-    최근 5거래일 동안 '6거래일 전 시점의 120일 최고 종가'를 상향 돌파(신고가)한 종목 리스트 HTML 생성.
+    당일 신고가/신저가 달성(200·120·50일) 리스트 HTML (2페이지 토글).
 
     - 코스피/코스닥 구분: `krx_ticker_sector.sector_cd` (1001/2001)
-    - 컬럼: 순번, 종목코드, 종목명, 테마, 이전 신고가 경과일수, 이전 신저가 경과일수, 최저가대비 상승률
+    - 반환 티커 집합은 신고가 기준(호출부 호환). DB 저장도 신고가만.
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
     out_dir = os.path.join(base, date.today().strftime("%Y-%m-%d"))
@@ -2954,7 +2986,7 @@ def write_120d_breakout_list_html(
         print("실패: 신고가 리스트 유니버스가 비었습니다.")
         return None, set()
 
-    # OHLCV 로드 (chunked IN)
+    # OHLCV 로드 (chunked IN) — 신고가/신저가 공용, 1회만
     parts: list[pd.DataFrame] = []
     chunk_size = 450
     for i in range(0, len(universe), chunk_size):
@@ -2986,7 +3018,6 @@ def write_120d_breakout_list_html(
     for c in ("high", "low", "close", "volume"):
         ohlcv[c] = pd.to_numeric(ohlcv[c], errors="coerce")
 
-    # 최신일 기준 현재가/거래대금 순위는 '시장 판단' 산출물을 우선 사용
     output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
     _rank_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
     rank_path = os.path.join(_rank_dir, "market_judgment_tv_rank.csv")
@@ -3000,7 +3031,6 @@ def write_120d_breakout_list_html(
         cur_map = {str(r["ticker"]): float(pd.to_numeric(r["current_price"], errors="coerce")) for _, r in rk.iterrows()}
         tv_map = {str(r["ticker"]): float(pd.to_numeric(r["trade_value"], errors="coerce")) for _, r in rk.iterrows()}
     except Exception:
-        # fallback: 이 함수 내에서 최신일 거래대금/현재가 계산(동일 정의)
         last_rows = ohlcv.sort_values(["ticker", "date"]).groupby("ticker", as_index=False).tail(1).copy()
         last_rows["ticker"] = last_rows["ticker"].astype(str)
         last_rows["last_close"] = pd.to_numeric(last_rows["close"], errors="coerce")
@@ -3008,7 +3038,6 @@ def write_120d_breakout_list_html(
         cur_map = {str(r["ticker"]): float(r["last_close"]) if pd.notna(r["last_close"]) else np.nan for _, r in last_rows.iterrows()}
         tv_map = {str(r["ticker"]): float(r["last_tv"]) if pd.notna(r["last_tv"]) else np.nan for _, r in last_rows.iterrows()}
 
-    # 종목명
     name_map: dict[str, str] = {}
     mcap_map: dict[str, float] = {}
     try:
@@ -3027,7 +3056,6 @@ def write_120d_breakout_list_html(
         name_map = {}
         mcap_map = {}
 
-    # 테마
     theme_map: dict[str, str] = {}
     try:
         th_df = pd.read_sql_query(
@@ -3046,8 +3074,9 @@ def write_120d_breakout_list_html(
 
     kospi_set = set(kospi_list)
     kosdaq_set = set(kosdaq_list)
+    rs_rank_map = _load_latest_rs_rank_map(engine)
 
-    def _calc_one(g: pd.DataFrame, window: int) -> dict | None:
+    def _calc_one(g: pd.DataFrame, window: int, side: str = "high") -> dict | None:
         g = g.sort_values("date").reset_index(drop=True)
         need = int(window) + 2
         if len(g) < need:
@@ -3057,49 +3086,91 @@ def write_120d_breakout_list_html(
         vol = g["volume"].to_numpy(dtype=float) if "volume" in g.columns else np.full(len(g), np.nan, dtype=float)
         dates = pd.to_datetime(g["date"]).to_numpy()
 
-        # 당일(D-0) 종가 > 전일(D-1) 기준 window일 최고 종가
         ref_end = len(g) - 2
         if ref_end < window - 1:
             return None
         ref_win_start = ref_end - (window - 1)
-        ref_high = np.nanmax(close[ref_win_start : ref_end + 1])
-        if not np.isfinite(ref_high):
-            return None
-
         ref_slice = close[ref_win_start : ref_end + 1]
-        hit = np.where(np.isfinite(ref_slice) & (ref_slice >= ref_high))[0]
-        if len(hit) == 0:
-            return None
-        prev_high_idx = ref_win_start + int(hit[-1])
 
         breakout_idx = len(g) - 1
         br_close = close[breakout_idx]
-        if not (np.isfinite(br_close) and br_close > ref_high):
+        if not np.isfinite(br_close):
             return None
 
-        elapsed_high_td = breakout_idx - prev_high_idx
-        if elapsed_high_td < 0:
-            elapsed_high_td = 0
+        if (side or "high").lower() == "low":
+            # 당일(D-0) 종가 < 전일(D-1) 기준 window일 최저 종가
+            ref_low = np.nanmin(ref_slice)
+            if not np.isfinite(ref_low):
+                return None
+            hit = np.where(np.isfinite(ref_slice) & (ref_slice <= ref_low))[0]
+            if len(hit) == 0:
+                return None
+            prev_low_idx = ref_win_start + int(hit[-1])
+            if not (br_close < ref_low):
+                return None
 
-        low_win_start = max(0, breakout_idx - (window - 1))
-        low_slice = close[low_win_start : breakout_idx + 1]
-        low_n = np.nanmin(low_slice) if low_slice.size else np.nan
-        low_n_idx = None
-        if np.isfinite(low_n):
-            hit_low = np.where(np.isfinite(low_slice) & (low_slice <= low_n))[0]
-            if len(hit_low) > 0:
-                low_n_idx = low_win_start + int(hit_low[-1])
-
-        elapsed_td = 0
-        if low_n_idx is not None:
-            elapsed_td = breakout_idx - int(low_n_idx)
+            elapsed_td = breakout_idx - prev_low_idx
             if elapsed_td < 0:
                 elapsed_td = 0
 
-        if np.isfinite(low_n) and low_n > 0 and np.isfinite(br_close):
-            up_pct = (br_close / low_n - 1.0) * 100.0
+            hi_win_start = max(0, breakout_idx - (window - 1))
+            hi_slice = close[hi_win_start : breakout_idx + 1]
+            hi_n = np.nanmax(hi_slice) if hi_slice.size else np.nan
+            hi_n_idx = None
+            if np.isfinite(hi_n):
+                hit_hi = np.where(np.isfinite(hi_slice) & (hi_slice >= hi_n))[0]
+                if len(hit_hi) > 0:
+                    hi_n_idx = hi_win_start + int(hit_hi[-1])
+
+            elapsed_high_td = 0
+            if hi_n_idx is not None:
+                elapsed_high_td = breakout_idx - int(hi_n_idx)
+                if elapsed_high_td < 0:
+                    elapsed_high_td = 0
+
+            if np.isfinite(hi_n) and hi_n > 0 and np.isfinite(br_close):
+                up_pct = (br_close / hi_n - 1.0) * 100.0
+            else:
+                up_pct = np.nan
+            extreme_ox = "O"
         else:
-            up_pct = np.nan
+            # 당일(D-0) 종가 > 전일(D-1) 기준 window일 최고 종가 (기존 신고가 로직 유지)
+            ref_high = np.nanmax(ref_slice)
+            if not np.isfinite(ref_high):
+                return None
+
+            hit = np.where(np.isfinite(ref_slice) & (ref_slice >= ref_high))[0]
+            if len(hit) == 0:
+                return None
+            prev_high_idx = ref_win_start + int(hit[-1])
+
+            if not (br_close > ref_high):
+                return None
+
+            elapsed_high_td = breakout_idx - prev_high_idx
+            if elapsed_high_td < 0:
+                elapsed_high_td = 0
+
+            low_win_start = max(0, breakout_idx - (window - 1))
+            low_slice = close[low_win_start : breakout_idx + 1]
+            low_n = np.nanmin(low_slice) if low_slice.size else np.nan
+            low_n_idx = None
+            if np.isfinite(low_n):
+                hit_low = np.where(np.isfinite(low_slice) & (low_slice <= low_n))[0]
+                if len(hit_low) > 0:
+                    low_n_idx = low_win_start + int(hit_low[-1])
+
+            elapsed_td = 0
+            if low_n_idx is not None:
+                elapsed_td = breakout_idx - int(low_n_idx)
+                if elapsed_td < 0:
+                    elapsed_td = 0
+
+            if np.isfinite(low_n) and low_n > 0 and np.isfinite(br_close):
+                up_pct = (br_close / low_n - 1.0) * 100.0
+            else:
+                up_pct = np.nan
+            extreme_ox = "O"
 
         tv = np.nan
         if breakout_idx < len(vol) and np.isfinite(br_close) and np.isfinite(vol[breakout_idx]):
@@ -3113,9 +3184,6 @@ def write_120d_breakout_list_html(
         if breakout_idx >= 5 and np.isfinite(br_close) and np.isfinite(close[breakout_idx - 5]) and close[breakout_idx - 5] != 0:
             ret5 = (float(br_close) / float(close[breakout_idx - 5]) - 1.0) * 100.0
 
-        # 같은 window 기준 신고가 달성 여부(참고용, 리스트 포함 조건과 동일하게 O)
-        high_ox = "O"
-
         return {
             "ticker": str(g.loc[0, "ticker"]),
             "breakout_window": int(window),
@@ -3126,355 +3194,357 @@ def write_120d_breakout_list_html(
             "trade_value": float(tv) if np.isfinite(tv) else np.nan,
             "chg_1d_pct": float(chg1) if np.isfinite(chg1) else np.nan,
             "ret_5d_pct": float(ret5) if np.isfinite(ret5) else np.nan,
-            "is_250d_high": high_ox,
+            "is_250d_high": extreme_ox,
         }
 
-    rows = []
-    # 배타적 티어: 200 ⊃ 120 ⊃ 50 — 상위 티어에 해당하면 하위에 중복 표기하지 않음
-    for t, g in ohlcv.groupby("ticker", sort=False):
-        hit = None
-        for _w in (200, 120, 50):
-            r = _calc_one(g, _w)
-            if r is not None:
-                hit = r
-                break
-        if hit is not None:
-            rows.append(hit)
+    def _build_breakout_df(side: str) -> pd.DataFrame:
+        rows = []
+        # 배타적 티어: 200 ⊃ 120 ⊃ 50 — 상위 티어에 해당하면 하위에 중복 표기하지 않음
+        for t, g in ohlcv.groupby("ticker", sort=False):
+            hit = None
+            for _w in (200, 120, 50):
+                r = _calc_one(g, _w, side=side)
+                if r is not None:
+                    hit = r
+                    break
+            if hit is not None:
+                rows.append(hit)
+        if not rows:
+            return pd.DataFrame()
 
-    if not rows:
-        html_doc = f"""<!doctype html>
-<html lang="ko">
-<head><meta charset="utf-8"/><title>당일 신고가 달성 리스트 (200·120·50일)</title></head>
-<body>
-  <p>기준일(OHLCV 최신): <strong>{ref_d.strftime('%Y-%m-%d')}</strong></p>
-  <p>당일(D-0) 종가가 전일(D-1) 기준 200·120·50거래일 최고 종가를 상향 돌파한 종목이 없습니다.</p>
-</body>
-</html>"""
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html_doc)
-        if not quiet:
-            print(f"완료: 신고가 리스트 HTML 저장(0건): {out_path}")
-        try:
-            _save_krx_analysis_table(
-                engine, "krx_analysis_breakout_120d", pd.DataFrame(), bo_ref_trade_date
-            )
-        except Exception as e:
-            if not quiet:
-                print(f"경고: 신고가 리스트 DB 저장 실패 ({type(e).__name__}: {e})")
-        return out_path, set()
-
-    out_df = pd.DataFrame(rows)
-    # RS 순위(시장별 RS4구간 평균 내림차순, 1=최상위)
-    rs_rank_map = _load_latest_rs_rank_map(engine)
-    out_df["rs_rank"] = out_df["ticker"].astype(str).map(rs_rank_map)
-    out_df["name"] = out_df["ticker"].map(name_map).fillna("")
-    out_df["theme_str"] = out_df["ticker"].map(theme_map).fillna("")
-    out_df["market"] = np.where(out_df["ticker"].isin(kospi_set), "KOSPI", "KOSDAQ")
-    out_df["mcap"] = pd.to_numeric(out_df["ticker"].map(mcap_map), errors="coerce")
-    out_df["current_price"] = pd.to_numeric(out_df["ticker"].map(cur_map), errors="coerce")
-    out_df["last_trade_value"] = pd.to_numeric(out_df["ticker"].map(tv_map), errors="coerce")
-    out_df["tv_rank"] = pd.to_numeric(out_df["ticker"].map(rank_map), errors="coerce")
-    if out_df["tv_rank"].isna().all():
-        # rank 파일이 없거나 비정상인 경우: 이 함수에서 동일 정의로 순위 산출
-        out_df["tv_rank"] = np.nan
-        for _m in ("KOSPI", "KOSDAQ"):
-            _mask = out_df["market"] == _m
-            if not _mask.any():
-                continue
-            _r = out_df.loc[_mask, "last_trade_value"].rank(ascending=False, method="min")
-            out_df.loc[_mask, "tv_rank"] = _r
-
-    # 표시 직전: 시총 ≥ DISPLAY_MCAP_MIN
-    out_df = _filter_display_mcap(out_df)
-
-    # 표 정렬: 시장별 거래대금 순위(1등이 최상단)
-    out_df = out_df.sort_values(["market", "tv_rank"], ascending=[True, True], na_position="last").reset_index(drop=True)
-
-    # 주봉(금요일 주간) 종가 기준 10·20·50주 신고가 여부 — 본 리스트 종목만 산출
-    _wk_need = set(out_df["ticker"].astype(str).tolist())
-    _wk_flags: dict[str, tuple[str, str, str]] = {}
-    for _tk, _g in ohlcv.groupby("ticker", sort=False):
-        _tks = str(_tk)
-        if _tks not in _wk_need:
-            continue
-        _wk_flags[_tks] = _weekly_close_high_breakout_ox(_g)
-    _wk_rows = [_wk_flags.get(str(t), ("", "", "")) for t in out_df["ticker"].astype(str)]
-    out_df["is_10w_high"] = [r[0] for r in _wk_rows]
-    out_df["is_20w_high"] = [r[1] for r in _wk_rows]
-    out_df["is_50w_high"] = [r[2] for r in _wk_rows]
-
-    def _fmt_pct(x):
-        try:
-            if x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
-                return ""
-            return f"{float(x):.1f}"
-        except Exception:
-            return ""
-
-    def _fmt_money(x):
-        try:
-            if x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
-                return ""
-            v = float(x)
-            if not np.isfinite(v):
-                return ""
-            # 10억원(=1e9원) 단위 표기
-            return f"{v/1_000_000_000.0:,.1f}"
-        except Exception:
-            return ""
-
-    _MCAP_1조 = 1_000_000_000_000.0
-    _MCAP_5000억 = 500_000_000_000.0
-
-    def _mcap_row_bg(mcap) -> str:
-        """시총(원): 1조 이상 / 5천억~1조 미만 / 5천억 미만."""
-        if mcap is None:
-            return "#ffffff"
-        try:
-            if isinstance(mcap, float) and pd.isna(mcap):
-                return "#ffffff"
-            v = float(mcap)
-        except (TypeError, ValueError):
-            return "#ffffff"
-        if not np.isfinite(v) or v <= 0:
-            return "#ffffff"
-        if v >= _MCAP_1조:
-            return "#c8e6c9"
-        if v >= _MCAP_5000억:
-            return "#bbdefb"
-        return "#ffe0b2"
-
-    def _table(sub: pd.DataFrame) -> str:
-        if sub.empty:
-            return "<p>해당 없음</p>"
-        lines = [
-            "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:12px;width:100%;'>",
-            "<thead><tr>",
-            "<th>순번</th><th>종목코드</th><th>종목명</th><th>테마</th><th>RS순위</th><th>시가총액(10억원)</th><th>거래대금 순위</th><th>현재가</th><th>당일 상승률(%)</th><th>최근 5거래일 상승률(%)</th><th>이전 신고가 경과일수</th><th>이전 신저가 경과일수</th><th>최저가대비 상승률(%)</th><th>신고가 달성일</th>",
-            "</tr></thead><tbody>",
-        ]
-        for i, (_, r) in enumerate(sub.iterrows(), start=1):
-            th = (r.get("theme_str") or "").strip()
-            if len(th) > 96:
-                th = th[:95] + "…"
-            bg = _mcap_row_bg(r.get("mcap"))
-            _tk = str(r.get("ticker", ""))
-            _is_hi = _tk in set([str(x) for x in (highlight_tickers or set())])
-            tv_rank = r.get("tv_rank")
-            tv_rank_txt = "" if tv_rank is None or (isinstance(tv_rank, float) and (np.isnan(tv_rank) or not np.isfinite(tv_rank))) else f"{int(tv_rank):,}"
-            cur = r.get("current_price")
-            cur_txt = "" if cur is None or (isinstance(cur, float) and (np.isnan(cur) or not np.isfinite(cur))) else f"{float(cur):,.0f}"
-            rsr = r.get("rs_rank")
-            rsr_txt = "" if rsr is None or (isinstance(rsr, float) and (np.isnan(rsr) or not np.isfinite(rsr))) else f"{int(float(rsr)):,}"
-            _chg = r.get("chg_1d_pct")
-            _tk_inner = html.escape(_tk)
-            if _is_hi:
-                _tk_inner = f"<strong>{_tk_inner}</strong>"
-            _tk_cell = _krx_colored_html(_tk_inner, _chg)
-            _nm_inner = html.escape(str(r.get("name", "")))
-            if _is_hi:
-                _nm_inner = f"<strong>{_nm_inner}</strong>"
-            _nm_cell = _krx_colored_html(_nm_inner, _chg)
-            lines.append(
-                f"<tr style=\"background-color:{bg};\">"
-                f"<td style='text-align:center'{_html_sort_num_attr(i)}>{i}</td>"
-                f"<td style='text-align:center'>{_tk_cell}</td>"
-                f"<td>{_nm_cell}</td>"
-                f"<td>{html.escape(th)}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(rsr)}>{rsr_txt}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(r.get('mcap'))}>{_fmt_money(r.get('mcap'))}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(tv_rank)}>{tv_rank_txt}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(cur)}>{cur_txt}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(r.get('chg_1d_pct'))}>{_fmt_pct(r.get('chg_1d_pct'))}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(r.get('ret_5d_pct'))}>{_fmt_pct(r.get('ret_5d_pct'))}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(r.get('elapsed_high_td'))}>{int(r.get('elapsed_high_td', 0))}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(r.get('elapsed_td'))}>{int(r.get('elapsed_td', 0))}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(r.get('up_from_low_pct'))}>{_fmt_pct(r.get('up_from_low_pct'))}</td>"
-                f"<td style='text-align:center'>{html.escape(str(r.get('breakout_date','')))}</td>"
-                "</tr>"
-            )
-        lines.append("</tbody></table>")
-        return "".join(lines)
-
-    def _ox_sort_attr(ox: str) -> str:
-        s = (ox or "").strip().upper()
-        if s == "O":
-            return ' data-sort-value="2"'
-        if s == "X":
-            return ' data-sort-value="1"'
-        return ' data-sort-value="0"'
-
-    def _table_weekly(sub: pd.DataFrame) -> str:
-        """위 메인 표와 동일 종목·순서로 주봉 10·20·50주 신고가 O/X만 표시."""
-        if sub.empty:
-            return "<p>해당 없음</p>"
-        lines = [
-            "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:12px;width:100%;'>",
-            "<thead><tr>",
-            "<th>순번</th><th>종목코드</th><th>종목명</th><th>10주 신고가</th><th>20주 신고가</th><th>50주 신고가</th>",
-            "</tr></thead><tbody>",
-        ]
-        for i, (_, r) in enumerate(sub.iterrows(), start=1):
-            bg = _mcap_row_bg(r.get("mcap"))
-            _tk = str(r.get("ticker", ""))
-            _is_hi = _tk in set([str(x) for x in (highlight_tickers or set())])
-            _chg = r.get("chg_1d_pct")
-            _tk_inner = html.escape(_tk)
-            if _is_hi:
-                _tk_inner = f"<strong>{_tk_inner}</strong>"
-            _tk_cell = _krx_colored_html(_tk_inner, _chg)
-            _nm_inner = html.escape(str(r.get("name", "")))
-            if _is_hi:
-                _nm_inner = f"<strong>{_nm_inner}</strong>"
-            _nm_cell = _krx_colored_html(_nm_inner, _chg)
-            o10 = str(r.get("is_10w_high", "") or "")
-            o20 = str(r.get("is_20w_high", "") or "")
-            o50 = str(r.get("is_50w_high", "") or "")
-            lines.append(
-                f"<tr style=\"background-color:{bg};\">"
-                f"<td style='text-align:center'{_html_sort_num_attr(i)}>{i}</td>"
-                f"<td style='text-align:center'>{_tk_cell}</td>"
-                f"<td>{_nm_cell}</td>"
-                f"<td style='text-align:center'{_ox_sort_attr(o10)}>{html.escape(o10)}</td>"
-                f"<td style='text-align:center'{_ox_sort_attr(o20)}>{html.escape(o20)}</td>"
-                f"<td style='text-align:center'{_ox_sort_attr(o50)}>{html.escape(o50)}</td>"
-                "</tr>"
-            )
-        lines.append("</tbody></table>")
-        return "".join(lines)
-
-    def _top_theme_terms_html(sub: pd.DataFrame, market_label: str, top_n: int = 22) -> str:
-        """표 위 요약: 테마 문자열( · 구분)에서 등장 빈도 상위 테마명(불용어 제거 포함)."""
-        if sub is None or sub.empty or "theme_str" not in sub.columns:
-            return (
-                f'<p class="theme-summary"><strong>{html.escape(market_label)} 주요 테마</strong> '
-                f"(본 표 <code>테마</code> 칼럼 기준): 종목 없음</p>"
-            )
-
-        _theme_stopwords_norm = {
-            "등",
-            "기업가치",
-            "제고계획",
-            "발표",
-            "밸류업",
-            "코리아",
-            "지수",
-            "주요종목",
-            "value-up",
-            "valueup",
-        }
-
-        def _norm_theme_token(x: str) -> str:
-            s0 = (x or "").strip()
-            if not s0:
-                return ""
-            s0 = re.sub(r"[().,]", " ", s0)
-            s0 = re.sub(r"\s+", " ", s0).strip()
-            s0 = re.sub(r"\s*등\s*$", "", s0).strip()
-            return s0
-
-        def _is_stopword_token(x: str) -> bool:
-            nx = _norm_theme_token(x)
-            if not nx:
-                return True
-            k = nx.casefold()
-            if k in _theme_stopwords_norm:
-                return True
-            for sw in _theme_stopwords_norm:
-                if sw and sw in k:
-                    return True
-            return False
-
-        cnt: Counter[str] = Counter()
-        for raw in sub["theme_str"].astype(str):
-            s = raw.strip()
-            if not s:
-                continue
-            seen_row: set[str] = set()
-            for part in re.split(r"\s*·\s*", s):
-                t = _norm_theme_token(part)
-                if len(t) < 1 or _is_stopword_token(t):
+        out_df = pd.DataFrame(rows)
+        out_df["rs_rank"] = out_df["ticker"].astype(str).map(rs_rank_map)
+        out_df["name"] = out_df["ticker"].map(name_map).fillna("")
+        out_df["theme_str"] = out_df["ticker"].map(theme_map).fillna("")
+        out_df["market"] = np.where(out_df["ticker"].isin(kospi_set), "KOSPI", "KOSDAQ")
+        out_df["mcap"] = pd.to_numeric(out_df["ticker"].map(mcap_map), errors="coerce")
+        out_df["current_price"] = pd.to_numeric(out_df["ticker"].map(cur_map), errors="coerce")
+        out_df["last_trade_value"] = pd.to_numeric(out_df["ticker"].map(tv_map), errors="coerce")
+        out_df["tv_rank"] = pd.to_numeric(out_df["ticker"].map(rank_map), errors="coerce")
+        if out_df["tv_rank"].isna().all():
+            out_df["tv_rank"] = np.nan
+            for _m in ("KOSPI", "KOSDAQ"):
+                _mask = out_df["market"] == _m
+                if not _mask.any():
                     continue
-                if t not in seen_row:
-                    seen_row.add(t)
-                    cnt[t] += 1
-                for w in re.split(r"\s+", t):
-                    w = _norm_theme_token(w)
-                    if len(w) < 2 or w == t or _is_stopword_token(w):
-                        continue
-                    if w not in seen_row:
-                        seen_row.add(w)
-                        cnt[w] += 1
+                _r = out_df.loc[_mask, "last_trade_value"].rank(ascending=False, method="min")
+                out_df.loc[_mask, "tv_rank"] = _r
 
-        if not cnt:
+        out_df = _filter_display_mcap(out_df)
+        out_df = out_df.sort_values(["market", "tv_rank"], ascending=[True, True], na_position="last").reset_index(drop=True)
+
+        _wk_need = set(out_df["ticker"].astype(str).tolist())
+        _wk_flags: dict[str, tuple[str, str, str]] = {}
+        for _tk, _g in ohlcv.groupby("ticker", sort=False):
+            _tks = str(_tk)
+            if _tks not in _wk_need:
+                continue
+            _wk_flags[_tks] = _weekly_close_high_breakout_ox(_g, side=side)
+        _wk_rows = [_wk_flags.get(str(t), ("", "", "")) for t in out_df["ticker"].astype(str)]
+        out_df["is_10w_high"] = [r[0] for r in _wk_rows]
+        out_df["is_20w_high"] = [r[1] for r in _wk_rows]
+        out_df["is_50w_high"] = [r[2] for r in _wk_rows]
+        return out_df
+
+    def _breakout_list_page_html(out_df: pd.DataFrame, *, side: str) -> str:
+        """한 페이지(200·120·50 섹션 + 주봉 표) HTML 을 반환."""
+        is_low = (side or "high").lower() == "low"
+        label_extreme = "신저가" if is_low else "신고가"
+        col_vs_extreme = "최고가대비 하락률(%)" if is_low else "최저가대비 상승률(%)"
+        col_achieve = f"{label_extreme} 달성일"
+        wk_h10 = f"10주 {label_extreme}"
+        wk_h20 = f"20주 {label_extreme}"
+        wk_h50 = f"50주 {label_extreme}"
+
+        def _fmt_pct(x):
+            try:
+                if x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
+                    return ""
+                return f"{float(x):.1f}"
+            except Exception:
+                return ""
+
+        def _fmt_money(x):
+            try:
+                if x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
+                    return ""
+                v = float(x)
+                if not np.isfinite(v):
+                    return ""
+                return f"{v/1_000_000_000.0:,.1f}"
+            except Exception:
+                return ""
+
+        _MCAP_1조 = 1_000_000_000_000.0
+        _MCAP_5000억 = 500_000_000_000.0
+
+        def _mcap_row_bg(mcap) -> str:
+            if mcap is None:
+                return "#ffffff"
+            try:
+                if isinstance(mcap, float) and pd.isna(mcap):
+                    return "#ffffff"
+                v = float(mcap)
+            except (TypeError, ValueError):
+                return "#ffffff"
+            if not np.isfinite(v) or v <= 0:
+                return "#ffffff"
+            if v >= _MCAP_1조:
+                return "#c8e6c9"
+            if v >= _MCAP_5000억:
+                return "#bbdefb"
+            return "#ffe0b2"
+
+        def _color_ref(chg):
+            """신저가 페이지는 하락이 정상이므로 색상 기준 부호를 뒤집는다."""
+            if not is_low:
+                return chg
+            try:
+                if chg is None or (isinstance(chg, float) and (np.isnan(chg) or not np.isfinite(chg))):
+                    return chg
+                return -float(chg)
+            except (TypeError, ValueError):
+                return chg
+
+        def _table(sub: pd.DataFrame) -> str:
+            if sub.empty:
+                return "<p>해당 없음</p>"
+            lines = [
+                "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:12px;width:100%;'>",
+                "<thead><tr>",
+                "<th>순번</th><th>종목코드</th><th>종목명</th><th>테마</th><th>RS순위</th>"
+                "<th>시가총액(10억원)</th><th>거래대금 순위</th><th>현재가</th>"
+                "<th>당일 상승률(%)</th><th>최근 5거래일 상승률(%)</th>"
+                "<th>이전 신고가 경과일수</th><th>이전 신저가 경과일수</th>"
+                f"<th>{col_vs_extreme}</th><th>{col_achieve}</th>",
+                "</tr></thead><tbody>",
+            ]
+            for i, (_, r) in enumerate(sub.iterrows(), start=1):
+                th = (r.get("theme_str") or "").strip()
+                if len(th) > 96:
+                    th = th[:95] + "…"
+                bg = _mcap_row_bg(r.get("mcap"))
+                _tk = str(r.get("ticker", ""))
+                _is_hi = _tk in set([str(x) for x in (highlight_tickers or set())])
+                tv_rank = r.get("tv_rank")
+                tv_rank_txt = "" if tv_rank is None or (isinstance(tv_rank, float) and (np.isnan(tv_rank) or not np.isfinite(tv_rank))) else f"{int(tv_rank):,}"
+                cur = r.get("current_price")
+                cur_txt = "" if cur is None or (isinstance(cur, float) and (np.isnan(cur) or not np.isfinite(cur))) else f"{float(cur):,.0f}"
+                rsr = r.get("rs_rank")
+                rsr_txt = "" if rsr is None or (isinstance(rsr, float) and (np.isnan(rsr) or not np.isfinite(rsr))) else f"{int(float(rsr)):,}"
+                _chg = r.get("chg_1d_pct")
+                _cref = _color_ref(_chg)
+                _tk_inner = html.escape(_tk)
+                if _is_hi:
+                    _tk_inner = f"<strong>{_tk_inner}</strong>"
+                _tk_cell = _krx_colored_html(_tk_inner, _cref)
+                _nm_inner = html.escape(str(r.get("name", "")))
+                if _is_hi:
+                    _nm_inner = f"<strong>{_nm_inner}</strong>"
+                _nm_cell = _krx_colored_html(_nm_inner, _cref)
+                lines.append(
+                    f"<tr style=\"background-color:{bg};\">"
+                    f"<td style='text-align:center'{_html_sort_num_attr(i)}>{i}</td>"
+                    f"<td style='text-align:center'>{_tk_cell}</td>"
+                    f"<td>{_nm_cell}</td>"
+                    f"<td>{html.escape(th)}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(rsr)}>{rsr_txt}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('mcap'))}>{_fmt_money(r.get('mcap'))}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(tv_rank)}>{tv_rank_txt}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(cur)}>{cur_txt}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('chg_1d_pct'))}>{_fmt_pct(r.get('chg_1d_pct'))}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('ret_5d_pct'))}>{_fmt_pct(r.get('ret_5d_pct'))}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('elapsed_high_td'))}>{int(r.get('elapsed_high_td', 0))}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('elapsed_td'))}>{int(r.get('elapsed_td', 0))}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('up_from_low_pct'))}>{_fmt_pct(r.get('up_from_low_pct'))}</td>"
+                    f"<td style='text-align:center'>{html.escape(str(r.get('breakout_date','')))}</td>"
+                    "</tr>"
+                )
+            lines.append("</tbody></table>")
+            return "".join(lines)
+
+        def _ox_sort_attr(ox: str) -> str:
+            s = (ox or "").strip().upper()
+            if s == "O":
+                return ' data-sort-value="2"'
+            if s == "X":
+                return ' data-sort-value="1"'
+            return ' data-sort-value="0"'
+
+        def _table_weekly(sub: pd.DataFrame) -> str:
+            if sub.empty:
+                return "<p>해당 없음</p>"
+            lines = [
+                "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:12px;width:100%;'>",
+                "<thead><tr>",
+                f"<th>순번</th><th>종목코드</th><th>종목명</th><th>{wk_h10}</th><th>{wk_h20}</th><th>{wk_h50}</th>",
+                "</tr></thead><tbody>",
+            ]
+            for i, (_, r) in enumerate(sub.iterrows(), start=1):
+                bg = _mcap_row_bg(r.get("mcap"))
+                _tk = str(r.get("ticker", ""))
+                _is_hi = _tk in set([str(x) for x in (highlight_tickers or set())])
+                _chg = r.get("chg_1d_pct")
+                _cref = _color_ref(_chg)
+                _tk_inner = html.escape(_tk)
+                if _is_hi:
+                    _tk_inner = f"<strong>{_tk_inner}</strong>"
+                _tk_cell = _krx_colored_html(_tk_inner, _cref)
+                _nm_inner = html.escape(str(r.get("name", "")))
+                if _is_hi:
+                    _nm_inner = f"<strong>{_nm_inner}</strong>"
+                _nm_cell = _krx_colored_html(_nm_inner, _cref)
+                o10 = str(r.get("is_10w_high", "") or "")
+                o20 = str(r.get("is_20w_high", "") or "")
+                o50 = str(r.get("is_50w_high", "") or "")
+                lines.append(
+                    f"<tr style=\"background-color:{bg};\">"
+                    f"<td style='text-align:center'{_html_sort_num_attr(i)}>{i}</td>"
+                    f"<td style='text-align:center'>{_tk_cell}</td>"
+                    f"<td>{_nm_cell}</td>"
+                    f"<td style='text-align:center'{_ox_sort_attr(o10)}>{html.escape(o10)}</td>"
+                    f"<td style='text-align:center'{_ox_sort_attr(o20)}>{html.escape(o20)}</td>"
+                    f"<td style='text-align:center'{_ox_sort_attr(o50)}>{html.escape(o50)}</td>"
+                    "</tr>"
+                )
+            lines.append("</tbody></table>")
+            return "".join(lines)
+
+        def _top_theme_terms_html(sub: pd.DataFrame, market_label: str, top_n: int = 22) -> str:
+            if sub is None or sub.empty or "theme_str" not in sub.columns:
+                return (
+                    f'<p class="theme-summary"><strong>{html.escape(market_label)} 주요 테마</strong> '
+                    f"(본 표 <code>테마</code> 칼럼 기준): 종목 없음</p>"
+                )
+
+            _theme_stopwords_norm = {
+                "등", "기업가치", "제고계획", "발표", "밸류업", "코리아", "지수", "주요종목",
+                "value-up", "valueup",
+            }
+
+            def _norm_theme_token(x: str) -> str:
+                s0 = (x or "").strip()
+                if not s0:
+                    return ""
+                s0 = re.sub(r"[().,]", " ", s0)
+                s0 = re.sub(r"\s+", " ", s0).strip()
+                s0 = re.sub(r"\s*등\s*$", "", s0).strip()
+                return s0
+
+            def _is_stopword_token(x: str) -> bool:
+                nx = _norm_theme_token(x)
+                if not nx:
+                    return True
+                k = nx.casefold()
+                if k in _theme_stopwords_norm:
+                    return True
+                for sw in _theme_stopwords_norm:
+                    if sw and sw in k:
+                        return True
+                return False
+
+            cnt: Counter[str] = Counter()
+            for raw in sub["theme_str"].astype(str):
+                s = raw.strip()
+                if not s:
+                    continue
+                seen_row: set[str] = set()
+                for part in re.split(r"\s*·\s*", s):
+                    t = _norm_theme_token(part)
+                    if len(t) < 1 or _is_stopword_token(t):
+                        continue
+                    if t not in seen_row:
+                        seen_row.add(t)
+                        cnt[t] += 1
+                    for w in re.split(r"\s+", t):
+                        w = _norm_theme_token(w)
+                        if len(w) < 2 or w == t or _is_stopword_token(w):
+                            continue
+                        if w not in seen_row:
+                            seen_row.add(w)
+                            cnt[w] += 1
+
+            if not cnt:
+                return (
+                    f'<p class="theme-summary"><strong>{html.escape(market_label)} 주요 테마</strong> '
+                    f"(본 표 <code>테마</code> 칼럼 기준): (비어 있음)</p>"
+                )
+            top = cnt.most_common(top_n)
+            parts_esc = [f"{html.escape(name)} <span class='tc'>({c})</span>" for name, c in top]
+            body = ", ".join(parts_esc)
             return (
                 f'<p class="theme-summary"><strong>{html.escape(market_label)} 주요 테마</strong> '
-                f"(본 표 <code>테마</code> 칼럼 기준): (비어 있음)</p>"
+                f"(아래 표 <code>테마</code> 칼럼에서 자주 나온 이름·단어, 괄호는 해당 시장 리스트 내 등장 종목 수):<br/>{body}</p>"
             )
-        top = cnt.most_common(top_n)
-        parts_esc = [f"{html.escape(name)} <span class='tc'>({c})</span>" for name, c in top]
-        body = ", ".join(parts_esc)
-        return (
-            f'<p class="theme-summary"><strong>{html.escape(market_label)} 주요 테마</strong> '
-            f"(아래 표 <code>테마</code> 칼럼에서 자주 나온 이름·단어, 괄호는 해당 시장 리스트 내 등장 종목 수):<br/>{body}</p>"
-        )
 
-    k = out_df[out_df["market"] == "KOSPI"].copy()
-    q = out_df[out_df["market"] == "KOSDAQ"].copy()
-
-    def _section_for_window(window: int) -> str:
-        sub = out_df[out_df["breakout_window"] == int(window)].copy()
-        kk = sub[sub["market"] == "KOSPI"].copy()
-        qq = sub[sub["market"] == "KOSDAQ"].copy()
-        tb_k = _top_theme_terms_html(kk, f"코스피 {window}일")
-        tb_q = _top_theme_terms_html(qq, f"코스닥 {window}일")
-        return f"""
+        def _section_for_window(window: int) -> str:
+            if out_df is None or out_df.empty or "breakout_window" not in out_df.columns:
+                sub = pd.DataFrame()
+            else:
+                sub = out_df[out_df["breakout_window"] == int(window)].copy()
+            kk = sub[sub["market"] == "KOSPI"].copy() if not sub.empty else sub
+            qq = sub[sub["market"] == "KOSDAQ"].copy() if not sub.empty else sub
+            tb_k = _top_theme_terms_html(kk, f"코스피 {window}일")
+            tb_q = _top_theme_terms_html(qq, f"코스닥 {window}일")
+            if is_low:
+                cond_note = (
+                    f"당일(D-0) 종가가 전일(D-1) 기준 <strong>{window}거래일 최저 종가</strong>를 "
+                    f"하향 돌파한 종목입니다 (상위 티어 신저가에 해당하면 이 구간에 포함되지 않음)."
+                )
+            else:
+                cond_note = (
+                    f"당일(D-0) 종가가 전일(D-1) 기준 <strong>{window}거래일 최고 종가</strong>를 "
+                    f"상향 돌파한 종목입니다 (상위 티어 신고가에 해당하면 이 구간에 포함되지 않음)."
+                )
+            return f"""
   <section>
-    <h2>{window}일 신고가 달성</h2>
+    <h2>{window}일 {label_extreme} 달성</h2>
     <p style="margin:0 0 12px 0;font-size:12px;color:#555;line-height:1.55;">
-      당일(D-0) 종가가 전일(D-1) 기준 <strong>{window}거래일 최고 종가</strong>를 상향 돌파한 종목입니다 (상위 티어 신고가에 해당하면 이 구간에 포함되지 않음).
+      {cond_note}
     </p>
     <div class="tables-2col">
       <div class="col">
         <h3>코스피 (KOSPI) — {len(kk)}종목</h3>
         {tb_k}
         {_table(kk)}
-        <h3>주봉 기준 신고가 여부 (10주 · 20주 · 50주)</h3>
+        <h3>주봉 기준 {label_extreme} 여부 (10주 · 20주 · 50주)</h3>
         {_table_weekly(kk)}
       </div>
       <div class="col">
         <h3>코스닥 (KOSDAQ) — {len(qq)}종목</h3>
         {tb_q}
         {_table(qq)}
-        <h3>주봉 기준 신고가 여부 (10주 · 20주 · 50주)</h3>
+        <h3>주봉 기준 {label_extreme} 여부 (10주 · 20주 · 50주)</h3>
         {_table_weekly(qq)}
       </div>
     </div>
   </section>
 """
 
-    html_doc = f"""<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>당일 신고가 달성 리스트 (200·120·50일)</title>
-  <style>
-    body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px 20px; color: #111; }}
-    h1 {{ font-size: 1.2rem; margin: 0 0 10px 0; }}
-    .note {{ color: #444; font-size: 13px; margin: 10px 0 18px; line-height: 1.55; }}
-    section {{ margin: 0 0 28px 0; }}
-    .tables-2col {{ display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }}
-    .tables-2col .col {{ flex: 1 1 520px; min-width: 460px; }}
-    h2 {{ font-size: 1.1rem; margin: 0 0 10px 0; }}
-    h3 {{ font-size: 0.95rem; margin: 16px 0 8px 0; color: #222; font-weight: 600; }}
-    .theme-summary {{ font-size: 12px; color: #333; margin: 0 0 12px 0; line-height: 1.55; max-width: 100%; }}
-    .theme-summary .tc {{ color: #666; font-weight: 600; }}
-  </style>
-</head>
-<body>
-  <h1>당일 신고가 달성 종목 (200일 · 120일 · 50일)</h1>
-  <div class="note">
+        if is_low:
+            note = f"""
+  <div class="bo-note">
+    기준일(OHLCV 최신): <strong>{ref_d.strftime('%Y-%m-%d')}</strong><br/>
+    조건: <strong>당일(D-0) 종가</strong>가 <strong>전일(D-1) 기준 N일 최저 종가</strong>를 하향 돌파(&lt;)한 종목. 섹션 순서 N = 200 → 120 → 50.<br/>
+    <strong>표시: 시총 3,000억 이상</strong> (계산·판정은 시장 전체 보통주·전역제외).<br/>
+    이전 신고가 경과일수: 당일(D-0) 포함 최근 N거래일 최고 종가(도달일, 가장 최근 도달)로부터 당일(D-0)까지의 <strong>거래일 간격</strong>.<br/>
+    이전 신저가 경과일수: 전일(D-1) 기준 N일 최저 종가(도달일, 가장 최근 도달)로부터 당일(D-0)까지의 <strong>거래일 간격</strong>.<br/>
+    최고가대비 하락률(%): (당일(D-0) 종가 ÷ (당일 포함 최근 N거래일 최고 종가) − 1) × 100.<br/>
+    시가총액: <strong>10억원 단위</strong>로 표기합니다(예: 150.0 = 1,500억원).<br/>
+    거래대금 순위: <code>거래대금.html</code>과 동일하게 <strong>최신일 거래대금(종가×거래량) 기준</strong>으로 코스피/코스닥 시장 내 순위를 매깁니다.<br/>
+    현재가: 최신일 종가 기준.<br/>
+    <strong>주봉 신저가 표</strong>(아래 각 시장 표): 일봉을 금요일 주간(<code>W-FRI</code>)으로 묶어 주간 종가(해당 주 <strong>마지막 거래일 종가</strong>)를 사용합니다.
+    당일이 속한 주의 주봉 종가가 직전 10·20·50개 주봉 종가 각각의 최저값에 <strong>미달(&lt;)</strong>하면 <strong>O</strong>, 아니면 <strong>X</strong>, 주봉 이력이 부족하면 빈칸입니다.<br/>
+    테마: <code>krx_theme_stock</code> 기준. 행 배경(시가총액, 원): <span style="background:#c8e6c9;padding:0 6px">1조 이상</span>,
+    <span style="background:#bbdefb;padding:0 6px">5천억 이상 1조 미만</span>,
+    <span style="background:#ffe0b2;padding:0 6px">5천억 미만</span>.<br/>
+    <strong>표 정렬</strong>: 칼럼 헤더 클릭 시 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
+    파일: {html.escape(os.path.basename(out_path))}
+  </div>
+"""
+        else:
+            note = f"""
+  <div class="bo-note">
     기준일(OHLCV 최신): <strong>{ref_d.strftime('%Y-%m-%d')}</strong><br/>
     조건: <strong>당일(D-0) 종가</strong>가 <strong>전일(D-1) 기준 N일 최고 종가</strong>를 상향 돌파(&gt;)한 종목. 섹션 순서 N = 200 → 120 → 50.<br/>
     <strong>표시: 시총 3,000억 이상</strong> (계산·판정은 시장 전체 보통주·전역제외).<br/>
@@ -3490,32 +3560,55 @@ def write_120d_breakout_list_html(
     <span style="background:#bbdefb;padding:0 6px">5천억 이상 1조 미만</span>,
     <span style="background:#ffe0b2;padding:0 6px">5천억 미만</span>.<br/>
     <strong>표 정렬</strong>: 칼럼 헤더 클릭 시 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
-    파일: {os.path.basename(out_path)}
+    파일: {html.escape(os.path.basename(out_path))}
   </div>
-  {_section_for_window(200)}
-  {_section_for_window(120)}
-  {_section_for_window(50)}
-{KRX_SORTABLE_TABLE_CSS_JS}
-</body>
-</html>"""
+"""
 
+        return (
+            _BREAKOUT_PAGE_CSS
+            + note
+            + _section_for_window(200)
+            + _section_for_window(120)
+            + _section_for_window(50)
+            + KRX_SORTABLE_TABLE_CSS_JS
+        )
+
+    high_df = _build_breakout_df("high")
+    low_df = _build_breakout_df("low")
+
+    # DB 저장은 신고가만
     try:
-        _bo_db = out_df.copy()
-        _bo_db = _bo_db.drop(columns=["is_10w_high", "is_20w_high", "is_50w_high"], errors="ignore")
-        # DB PK는 (ref_trade_date, ticker): 동일 종목 다중 window는 가장 긴 window 1건만 저장
-        if "breakout_window" in _bo_db.columns:
-            _bo_db = _bo_db.sort_values("breakout_window", ascending=False)
-            _bo_db = _bo_db.drop_duplicates(subset=["ticker"], keep="first")
-            _bo_db = _bo_db.drop(columns=["breakout_window"], errors="ignore")
-        if "breakout_date" in _bo_db.columns:
-            _bo_db["breakout_date"] = pd.to_datetime(_bo_db["breakout_date"], errors="coerce").dt.date
-        _save_krx_analysis_table(engine, "krx_analysis_breakout_120d", _bo_db, bo_ref_trade_date)
+        if high_df is None or high_df.empty:
+            _save_krx_analysis_table(
+                engine, "krx_analysis_breakout_120d", pd.DataFrame(), bo_ref_trade_date
+            )
+        else:
+            _bo_db = high_df.copy()
+            _bo_db = _bo_db.drop(columns=["is_10w_high", "is_20w_high", "is_50w_high"], errors="ignore")
+            if "breakout_window" in _bo_db.columns:
+                _bo_db = _bo_db.sort_values("breakout_window", ascending=False)
+                _bo_db = _bo_db.drop_duplicates(subset=["ticker"], keep="first")
+                _bo_db = _bo_db.drop(columns=["breakout_window"], errors="ignore")
+            if "breakout_date" in _bo_db.columns:
+                _bo_db["breakout_date"] = pd.to_datetime(_bo_db["breakout_date"], errors="coerce").dt.date
+            _save_krx_analysis_table(engine, "krx_analysis_breakout_120d", _bo_db, bo_ref_trade_date)
     except Exception as e:
         if not quiet:
             print(f"경고: 신고가 리스트 DB 저장 실패 ({type(e).__name__}: {e})")
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html_doc)
+    page_divs = [
+        _breakout_list_page_html(high_df, side="high"),
+        _breakout_list_page_html(low_df, side="low"),
+    ]
+    doc_title = "당일 신고가/신저가 달성 종목 (200·120·50일)"
+    _write_toggle_pages_html(
+        out_path,
+        page_divs,
+        doc_title=doc_title,
+        head_title=doc_title,
+        btn_labels=_BREAKOUT_BTN_LABELS,
+        page_descs=_BREAKOUT_PAGE_DESCS,
+    )
 
     if not quiet:
         try:
@@ -3525,14 +3618,29 @@ def write_120d_breakout_list_html(
         except Exception:
             pass
 
-        _n50 = int((out_df["breakout_window"] == 50).sum()) if "breakout_window" in out_df.columns else 0
-        _n120 = int((out_df["breakout_window"] == 120).sum()) if "breakout_window" in out_df.columns else 0
-        _n200 = int((out_df["breakout_window"] == 200).sum()) if "breakout_window" in out_df.columns else 0
-        print(
-            f"완료: 당일 신고가(200/120/50일) HTML 저장: {out_path} "
-            f"(총 {len(out_df)}건 · 200일 {_n200} / 120일 {_n120} / 50일 {_n50})"
-        )
-    return out_path, set(out_df["ticker"].astype(str).tolist())
+        if high_df is None or high_df.empty:
+            print(f"완료: 신고가 리스트 HTML 저장(0건): {out_path}")
+        else:
+            _n50 = int((high_df["breakout_window"] == 50).sum()) if "breakout_window" in high_df.columns else 0
+            _n120 = int((high_df["breakout_window"] == 120).sum()) if "breakout_window" in high_df.columns else 0
+            _n200 = int((high_df["breakout_window"] == 200).sum()) if "breakout_window" in high_df.columns else 0
+            print(
+                f"완료: 당일 신고가(200/120/50일) HTML 저장: {out_path} "
+                f"(총 {len(high_df)}건 · 200일 {_n200} / 120일 {_n120} / 50일 {_n50})"
+            )
+        if low_df is None or low_df.empty:
+            print(f"완료: 신저가 리스트(0건, 동일 파일 2페이지)")
+        else:
+            _ln50 = int((low_df["breakout_window"] == 50).sum()) if "breakout_window" in low_df.columns else 0
+            _ln120 = int((low_df["breakout_window"] == 120).sum()) if "breakout_window" in low_df.columns else 0
+            _ln200 = int((low_df["breakout_window"] == 200).sum()) if "breakout_window" in low_df.columns else 0
+            print(
+                f"완료: 당일 신저가(200/120/50일) · "
+                f"총 {len(low_df)}건 · 200일 {_ln200} / 120일 {_ln120} / 50일 {_ln50}"
+            )
+
+    high_tickers = set(high_df["ticker"].astype(str).tolist()) if high_df is not None and not high_df.empty else set()
+    return out_path, high_tickers
 
 
 def _create_engine():
@@ -3723,6 +3831,7 @@ def _market_dash_load_ohlcv_parallel(
     return ohlcv_data
 
 
+# DB 조회 실패 시 폴백. 평소에는 _nontrading_weekdays 가 대체한다.
 MARKET_DASH_HOLIDAYS = [
     "2023-08-15",
     "2023-09-28",
@@ -3780,46 +3889,91 @@ MARKET_DASH_HOLIDAYS = [
     "2026-06-03",    
 ]
 
+_TRADING_DAYS_CACHE: dict = {}
+
+
+def _load_trading_days(engine, start, end) -> set:
+    """krx_ohlcv 의 실제 거래일 집합. (start, end) 키로 캐시."""
+    key = (str(start), str(end))
+    if key in _TRADING_DAYS_CACHE:
+        return _TRADING_DAYS_CACHE[key]
+    try:
+        df = pd.read_sql_query(
+            "SELECT DISTINCT `date` FROM krx_ohlcv WHERE `date` >= %s AND `date` <= %s",
+            con=engine, params=(start, end),
+        )
+        out = set(pd.to_datetime(df["date"]).dt.normalize())
+    except Exception as e:
+        print(f"경고: 거래일 조회 실패 — 휴장일 자동 도출 생략 ({type(e).__name__}: {e})")
+        out = set()
+    _TRADING_DAYS_CACHE[key] = out
+    return out
+
+
+def _nontrading_weekdays(engine, start, end) -> list[str]:
+    """평일 중 거래일이 아닌 날짜(=휴장일) 'YYYY-MM-DD' 리스트."""
+    tdays = _load_trading_days(engine, start, end)
+    if not tdays:
+        return list(MARKET_DASH_HOLIDAYS)   # DB 실패 시 기존 하드코딩 목록으로 폴백
+    out = []
+    for d in pd.date_range(start, end, freq="D"):
+        if d.weekday() < 5 and d.normalize() not in tdays:
+            out.append(d.strftime("%Y-%m-%d"))
+    return out
+
+
 MARKET_DASH_PAGE_DESCS: dict[int, str] = {
-    1: "Advance Decline Line: 전일 대비 상승 종목 수 − 하락 종목 수(Net AD)의 200일 롤링 누적선과, 그 선의 20일 지수이동평균(Signal)입니다. 아래 막대는 같은 날짜의 Net AD 일별 값이고, 맨 아래는 맥클레란 오실레이터(Net AD의 EMA19−EMA39, 0선 기준)입니다. 지수와 함께 시장 참여 종목의 방향성 강도를 봅니다.",
-    2: "CVI: 전일 대비 상승 종목 거래대금 합 − 하락 종목 거래대금 합(net TV)의 200일 롤링 누적선과 Signal(EMA20)입니다. 가운데 막대는 일별 net TV이고, 아래는 삼성전자·SK하이닉스를 제외한 동일 지표입니다.",
+    1: "Net AD 롤링 합: 전일 대비 상승 종목 수 − 하락 종목 수(Net AD)를 200·120·50거래일 구간으로 각각 합산해 패널을 나눠 표시합니다. Signal 은 200일선의 20일 지수이동평균입니다. 누적 ADL 이 아니라 롤링 합이므로 하루치 변화는 '오늘 Net AD − 창에서 빠지는 날의 Net AD' 입니다. 일간 방향이 아니라 수준·0선 돌파·Signal 교차로 읽으세요. 아래 막대는 같은 날짜의 Net AD 일별 값이고, 맨 아래는 맥클레란 오실레이터(Net AD의 EMA19−EMA39, 0선 기준)입니다. 지수와 함께 시장 참여 종목의 방향성 강도를 봅니다.",
+    2: "CVI: 전일 대비 상승 종목 거래대금 합 − 하락 종목 거래대금 합(net TV)를 200·120·50거래일로 각각 합산해 패널을 나눠 표시하며 Signal 은 200일선의 EMA20 입니다. Signal 은 200일=EMA20, 120일=EMA10, 50일=EMA5 입니다. 가운데 막대는 일별 net TV이고, 아래는 삼성전자·SK하이닉스를 제외한 동일 지표입니다.",
     3: "시총가중 변동성(ATR3/종가): 지수(10/20/50 SMA+거래량)와, 보통주 유니버스 시총가중 ATR3÷종가·Vol SMA20입니다.",
     4: "Zweig Breadth Thrust: 상승÷(상승+하락) 종목 비율의 10일 SMA(%)입니다. 최근 10일 안에 40% 미만을 거친 뒤 61.5%를 처음 돌파하면 별(★)로 표시합니다.",
     5: "종가>SMA 비중: 해당 시장 유니버스에서 종가가 SMA5·10·20 위에 있는 종목 비율(%)입니다. 코스피·코스닥 각각 SMA 길이별로 한 패널씩 나누어 표시합니다.",
-    6: "120일 신고가/신저가 종목 수: 종가가 최근 120거래일 최고·최저 종가인 종목 수입니다. 신고가·신저가 확산 정도를 봅니다.",
+    6: "신고가/신저가 종목 수: 종가가 최근 200·120·50거래일 최고·최저 종가인 종목 수를 기간별 패널로 나눠 표시합니다. 신고가·신저가 확산 정도를 봅니다.",
     7: "ADR: 최근 20거래일 상승 종목 수 합 ÷ 같은 기간 하락 종목 수 합에 100을 곱한 값입니다. 일별 값은 들쭉날쭉하므로 ADR의 10일 SMA로 추세를 보조합니다. 약 100 근처는 균형, 120~125 이상은 단기 과열, 70~75 이하는 침체(과매도) 권역으로 자주 해석합니다.",
     8: "모멘텀 속도: 지수 종가 기준 ROC(기간 변화율 %) ÷ 기간으로 나눈 하루 평균 변화율(%/일)입니다. 20·50일 선을 겹쳐 중기 추세 속도를 비교합니다. 0선 위는 상승 모멘텀, 아래는 하락 모멘텀입니다.",
     9: "ATR3/종가 vs 시가총액: 코스피(위)·코스닥(아래) 산점도입니다. x축 [0, 0.3], 0.3 초과 종목은 주석으로만 표시합니다. 분위선·평균은 전 종목 기준이며 RS Top20·거래대금 Top20을 강조합니다.",
 }
 
 _MARKET_DASH_BTN_LABELS: dict[int, str] = {
-    1: "1페이지: Advance Decline Line",
+    1: "1페이지: Net AD 롤링 합",
     2: "2페이지: CVI(거래대금)",
     3: "3페이지: 시총가중 변동성",
     4: "4페이지: Zweig Breadth Thrust",
     5: "5페이지: 종가>SMA5/10/20 비중",
-    6: "6페이지: 120일 신고가/신저가 종목수",
+    6: "6페이지: 신고가/신저가 종목수 (200/120/50일)",
     7: "7페이지: ADR",
     8: "8페이지: 모멘텀 속도",
     9: "9페이지: ATR3/종가 vs 시가총액",
 }
 
 
-def _write_krx_market_dashboard_html(out_path: str, plot_divs: list[str]) -> None:
-    """plot_divs = Plotly full_html=False 조각 리스트 → 페이지 토글 HTML."""
-    n = len(plot_divs)
+def _write_toggle_pages_html(
+    out_path: str,
+    page_divs: list[str],
+    *,
+    doc_title: str = "KRX 시장 대시보드",
+    head_title: str | None = None,
+    btn_labels: dict[int, str] | None = None,
+    page_descs: dict[int, str] | None = None,
+) -> None:
+    """page_divs = Plotly div 또는 임의 HTML 조각 리스트 → 페이지 토글 HTML."""
+    n = len(page_divs)
     if n <= 0:
-        raise ValueError("plot_divs 비어 있음")
+        raise ValueError("page_divs 비어 있음")
 
-    def _page_block(i: int, plot_div: str) -> str:
-        desc = html.escape(MARKET_DASH_PAGE_DESCS.get(i, ""))
-        return f'<div class="page-desc">{desc}</div>\n{plot_div}'
+    labels = btn_labels if btn_labels is not None else _MARKET_DASH_BTN_LABELS
+    descs = page_descs if page_descs is not None else MARKET_DASH_PAGE_DESCS
+    title = head_title if head_title is not None else doc_title
+
+    def _page_block(i: int, page_div: str) -> str:
+        desc = html.escape(descs.get(i, ""))
+        return f'<div class="page-desc">{desc}</div>\n{page_div}'
 
     btns = []
     pages = []
-    for i, div in enumerate(plot_divs, start=1):
+    for i, div in enumerate(page_divs, start=1):
         active = " active" if i == 1 else ""
-        label = html.escape(_MARKET_DASH_BTN_LABELS.get(i, f"{i}페이지"))
+        label = html.escape(labels.get(i, f"{i}페이지"))
         btns.append(
             f'<button id="b{i}" class="btn{active}" onclick="showPage({i})">{label}</button>'
         )
@@ -3832,7 +3986,7 @@ def _write_krx_market_dashboard_html(out_path: str, plot_divs: list[str]) -> Non
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>KRX Market Dashboard</title>
+  <title>{html.escape(title)}</title>
   <style>
     body {{ margin: 0; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #fff; color: #111; }}
     .topbar {{ position: sticky; top: 0; z-index: 10; background: rgba(255,255,255,0.95); border-bottom: 1px solid #e6e6e6; padding: 10px 14px; display:flex; flex-wrap: wrap; gap:10px; align-items:center; }}
@@ -3866,6 +4020,11 @@ def _write_krx_market_dashboard_html(out_path: str, plot_divs: list[str]) -> Non
 </html>"""
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
+
+
+def _write_krx_market_dashboard_html(out_path: str, plot_divs: list[str]) -> None:
+    """plot_divs = Plotly full_html=False 조각 리스트 → 페이지 토글 HTML."""
+    _write_toggle_pages_html(out_path, plot_divs, head_title="KRX Market Dashboard")
 
 _MOMENTUM_SPEED_PERIODS = (20, 50)
 _MOMENTUM_SPEED_COLORS = {20: "#43A047", 50: "#1E88E5"}
@@ -4640,7 +4799,6 @@ def run_market_dashboard(
         _log("=" * 80)
 
         BREADTH_WINDOW = 250  # 최근 N거래일 (AD 200일 롤링 채움·변동성 공통 x축)
-        holidays = MARKET_DASH_HOLIDAYS
 
         # universe: 보통주만 (krx_ticker 최신 기준일) + 전역 제외 유지
         _univ_sql = """
@@ -4800,6 +4958,8 @@ def run_market_dashboard(
                 return pd.DataFrame(
                     columns=[
                         "ad_200",
+                        "ad_120",
+                        "ad_50",
                         "ad_signal",
                         "net_ad_daily",
                         "market_avg_volatility",
@@ -4807,6 +4967,10 @@ def run_market_dashboard(
                         "zweig_ma10_pct",
                         "cvi",
                         "cvi_signal",
+                        "cvi_120",
+                        "cvi_50",
+                        "cvi_120_signal",
+                        "cvi_50_signal",
                         "cvi_daily",
                         "cvi_ex",
                         "cvi_ex_signal",
@@ -4822,15 +4986,21 @@ def run_market_dashboard(
 
             ad_daily = breadth_df["up"] - breadth_df["down"]
             breadth_df["net_ad_daily"] = ad_daily
-            # Advance Decline Line: Net AD 200일 롤링 누적 + Signal(EMA20) — tail 전에 계산해 창을 채움
+            # Net AD 200/120/50일 롤링 합 + Signal(200일선의 EMA20) — tail 전에 계산해 창을 채움
             breadth_df["ad_200"] = ad_daily.rolling(200).sum()
             breadth_df["ad_signal"] = breadth_df["ad_200"].ewm(span=20, adjust=False).mean()
+            breadth_df["ad_120"] = ad_daily.rolling(120).sum()
+            breadth_df["ad_50"] = ad_daily.rolling(50).sum()
 
             uv = np.array([up_tv_sum.get(d, 0.0) for d in idx], dtype=float)
             dv = np.array([down_tv_sum.get(d, 0.0) for d in idx], dtype=float)
             net_tv = uv - dv
             breadth_df["cvi_daily"] = net_tv
             breadth_df["cvi"] = pd.Series(net_tv, index=idx).rolling(200).sum()
+            breadth_df["cvi_120"] = pd.Series(net_tv, index=idx).rolling(120).sum()
+            breadth_df["cvi_50"] = pd.Series(net_tv, index=idx).rolling(50).sum()
+            breadth_df["cvi_120_signal"] = breadth_df["cvi_120"].ewm(span=10, adjust=False).mean()
+            breadth_df["cvi_50_signal"] = breadth_df["cvi_50"].ewm(span=5, adjust=False).mean()
             breadth_df["cvi_signal"] = breadth_df["cvi"].ewm(span=20, adjust=False).mean()
 
             uv_ex = np.array([up_tv_ex.get(d, 0.0) for d in idx], dtype=float)
@@ -4915,6 +5085,8 @@ def run_market_dashboard(
             return breadth_df[
                 [
                     "ad_200",
+                    "ad_120",
+                    "ad_50",
                     "ad_signal",
                     "net_ad_daily",
                     "market_avg_volatility",
@@ -4922,6 +5094,10 @@ def run_market_dashboard(
                     "zweig_ma10_pct",
                     "cvi",
                     "cvi_signal",
+                    "cvi_120",
+                    "cvi_50",
+                    "cvi_120_signal",
+                    "cvi_50_signal",
                     "cvi_daily",
                     "cvi_ex",
                     "cvi_ex_signal",
@@ -4935,6 +5111,14 @@ def run_market_dashboard(
         # 지수 데이터는 breadth 구간(마지막 BREADTH_WINDOW)으로 정렬해서 x축을 동일하게 맞춤
         kospi_index_aligned = kospi_index_df.reindex(kospi_df.index)
         kosdaq_index_aligned = kosdaq_index_df.reindex(kosdaq_df.index)
+
+        _hol_start = kospi_df.index.min() if len(kospi_df.index) else None
+        _hol_end = kospi_df.index.max() if len(kospi_df.index) else None
+        holidays = (
+            _nontrading_weekdays(engine, _hol_start, _hol_end)
+            if _hol_start is not None else list(MARKET_DASH_HOLIDAYS)
+        )
+        print(f"· 자동 휴장일 {len(holidays)}건 ({_hol_start} ~ {_hol_end})")
 
         def zweig_breadth_thrust_flags(zweig_ma10_pct: pd.Series) -> pd.Series:
             """Zweig: 10일 SMA(Adv/(Adv+Dec))%가 10거래일 안에 40% 미만 구간을 거쳐 61.5% 초과(당일 최초 돌파)."""
@@ -4960,7 +5144,14 @@ def run_market_dashboard(
         kospi_bt = zweig_breadth_thrust_flags(kospi_df["zweig_ma10_pct"])
         kosdaq_bt = zweig_breadth_thrust_flags(kosdaq_df["zweig_ma10_pct"])
 
-        def _apply_common_layout(f, title_text: str, layout_height: int = 980, max_xaxis_row: int = 2):
+        def _anchored_tickvals(idx, n=9):
+            """마지막 날짜를 반드시 포함하고 역방향 등간격으로 tick 을 잡는다."""
+            if idx is None or len(idx) == 0:
+                return None
+            step = max(1, len(idx) // max(1, n))
+            return [idx[p] for p in sorted(range(len(idx) - 1, -1, -step))]
+
+        def _apply_common_layout(f, title_text: str, layout_height: int = 980, max_xaxis_row: int = 2, tick_dates=None):
             f.update_layout(
                 title=title_text,
                 plot_bgcolor="white",
@@ -4976,34 +5167,46 @@ def run_market_dashboard(
                 height=layout_height,
                 margin=dict(l=45, r=45, t=70, b=35),
             )
+            _tick_kw = {}
+            if tick_dates is not None and len(tick_dates):
+                _tick_kw = dict(tickmode="array", tickvals=list(tick_dates))
             for rr in range(1, max_xaxis_row + 1):
                 for cc in (1, 2):
                     f.update_xaxes(
-                        row=rr,
-                        col=cc,
+                        row=rr, col=cc,
                         tickformat="%Y-%m-%d",
+                        tickangle=-45,
+                        tickfont=dict(size=9),
                         rangeslider_visible=False,
                         rangebreaks=[dict(bounds=["sat", "mon"]), dict(values=holidays)],
+                        **_tick_kw,
                     )
 
-        # Page 1: 지수 / Advance Decline Line(200 + Signal) / Net AD / 맥클레란
+        # Page 1: 지수 / Net AD 롤링 합(200/120/50 + Signal) / Net AD 일별 / 맥클레란
         fig_page1 = make_subplots(
-            rows=4,
+            rows=6,
             cols=2,
             shared_xaxes=False,
-            vertical_spacing=0.06,
+            vertical_spacing=0.055,
             horizontal_spacing=0.07,
             specs=[
                 [{"secondary_y": True}, {"secondary_y": True}],
                 [{}, {}],
                 [{}, {}],
                 [{}, {}],
+                [{}, {}],
+                [{}, {}],
             ],
+            row_heights=[0.24, 0.17, 0.15, 0.15, 0.14, 0.15],
             subplot_titles=[
                 "코스피 지수 (10/20/50 SMA + 거래량)",
                 "코스닥 지수 (10/20/50 SMA + 거래량)",
-                "코스피 Advance Decline Line (200일) + Signal",
-                "코스닥 Advance Decline Line (200일) + Signal",
+                "코스피 Net AD 200일 롤링 합 + Signal",
+                "코스닥 Net AD 200일 롤링 합 + Signal",
+                "코스피 Net AD 120일 롤링 합",
+                "코스닥 Net AD 120일 롤링 합",
+                "코스피 Net AD 50일 롤링 합",
+                "코스닥 Net AD 50일 롤링 합",
                 "코스피 Net AD (상승−하락, 일별)",
                 "코스닥 Net AD (상승−하락, 일별)",
                 "코스피 맥클레란 오실레이터 (EMA19−EMA39 of Net AD)",
@@ -5031,7 +5234,7 @@ def run_market_dashboard(
                 x=kospi_df.index,
                 y=kospi_df["ad_200"],
                 mode="lines",
-                name="Advance Decline Line",
+                name="Net AD 200일",
                 line=dict(color="#FF6B35", width=2.2),
             ),
             row=2,
@@ -5042,7 +5245,7 @@ def run_market_dashboard(
                 x=kospi_df.index,
                 y=kospi_df["ad_signal"],
                 mode="lines",
-                name="Signal",
+                name="Signal(200일 EMA20)",
                 line=dict(color="#8E44AD", width=2.0, dash="dash"),
             ),
             row=2,
@@ -5053,7 +5256,7 @@ def run_market_dashboard(
                 x=kosdaq_df.index,
                 y=kosdaq_df["ad_200"],
                 mode="lines",
-                name="Advance Decline Line",
+                name="Net AD 200일",
                 line=dict(color="#FF6B35", width=2.2),
                 showlegend=False,
             ),
@@ -5065,13 +5268,67 @@ def run_market_dashboard(
                 x=kosdaq_df.index,
                 y=kosdaq_df["ad_signal"],
                 mode="lines",
-                name="Signal",
+                name="Signal(200일 EMA20)",
                 line=dict(color="#8E44AD", width=2.0, dash="dash"),
                 showlegend=False,
             ),
             row=2,
             col=2,
         )
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kospi_df.index,
+                y=kospi_df["ad_120"],
+                mode="lines",
+                name="Net AD 120일",
+                line=dict(color="#F7B267", width=2.0),
+            ),
+            row=3,
+            col=1,
+        )
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kosdaq_df.index,
+                y=kosdaq_df["ad_120"],
+                mode="lines",
+                name="Net AD 120일",
+                line=dict(color="#F7B267", width=2.0),
+                showlegend=False,
+            ),
+            row=3,
+            col=2,
+        )
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kospi_df.index,
+                y=kospi_df["ad_50"],
+                mode="lines",
+                name="Net AD 50일",
+                line=dict(color="#5AA9E6", width=2.0),
+            ),
+            row=4,
+            col=1,
+        )
+        fig_page1.add_trace(
+            go.Scatter(
+                x=kosdaq_df.index,
+                y=kosdaq_df["ad_50"],
+                mode="lines",
+                name="Net AD 50일",
+                line=dict(color="#5AA9E6", width=2.0),
+                showlegend=False,
+            ),
+            row=4,
+            col=2,
+        )
+        for _r in (2, 3, 4):
+            for _c in (1, 2):
+                fig_page1.add_hline(
+                    y=0,
+                    line=dict(color="rgba(128,128,128,0.4)", width=1, dash="dash"),
+                    row=_r,
+                    col=_c,
+                )
 
         _nad_k = kospi_df["net_ad_daily"].fillna(0.0).to_numpy(dtype=float)
         _nad_q = kosdaq_df["net_ad_daily"].fillna(0.0).to_numpy(dtype=float)
@@ -5079,12 +5336,12 @@ def run_market_dashboard(
         _col_q = [("#e57373" if v >= 0 else "#64b5f6") for v in _nad_q]
         fig_page1.add_trace(
             go.Bar(x=kospi_df.index, y=_nad_k, name="코스피 Net AD(일별)", marker_color=_col_k, showlegend=False),
-            row=3,
+            row=5,
             col=1,
         )
         fig_page1.add_trace(
             go.Bar(x=kosdaq_df.index, y=_nad_q, name="코스닥 Net AD(일별)", marker_color=_col_q, showlegend=False),
-            row=3,
+            row=5,
             col=2,
         )
 
@@ -5092,49 +5349,54 @@ def run_market_dashboard(
         _zero_q = np.zeros(len(kosdaq_df.index), dtype=float)
         fig_page1.add_trace(
             go.Scatter(x=kospi_df.index, y=kospi_df["mcclellan"], mode="lines", name="코스피 맥클레란", line=dict(color="#E67E22", width=2)),
-            row=4,
+            row=6,
             col=1,
         )
         fig_page1.add_trace(
             go.Scatter(x=kospi_df.index, y=_zero_k, mode="lines", name="0", line=dict(color="rgba(0,0,0,0.35)", width=1, dash="dash"), showlegend=False),
-            row=4,
+            row=6,
             col=1,
         )
         fig_page1.add_trace(
             go.Scatter(x=kosdaq_df.index, y=kosdaq_df["mcclellan"], mode="lines", name="코스닥 맥클레란", line=dict(color="#E67E22", width=2)),
-            row=4,
+            row=6,
             col=2,
         )
         fig_page1.add_trace(
             go.Scatter(x=kosdaq_df.index, y=_zero_q, mode="lines", name="0", line=dict(color="rgba(0,0,0,0.35)", width=1, dash="dash"), showlegend=False),
-            row=4,
+            row=6,
             col=2,
         )
 
         _apply_common_layout(
             fig_page1,
-            "Page 1: Advance Decline Line",
-            layout_height=1680,
-            max_xaxis_row=4,
+            "Page 1: Net AD 롤링 합",
+            layout_height=1900,
+            max_xaxis_row=6,
+            tick_dates=_anchored_tickvals(kospi_df.index),
         )
         fig_page1.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page1.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page1.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
         fig_page1.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
-        fig_page1.update_yaxes(title_text="Advance Decline Line", row=2, col=1)
-        fig_page1.update_yaxes(title_text="Advance Decline Line", row=2, col=2)
-        fig_page1.update_yaxes(title_text="상승−하락(종목 수)", row=3, col=1)
-        fig_page1.update_yaxes(title_text="상승−하락(종목 수)", row=3, col=2)
-        fig_page1.update_yaxes(title_text="McClellan", row=4, col=1)
-        fig_page1.update_yaxes(title_text="McClellan", row=4, col=2)
+        fig_page1.update_yaxes(title_text="Net AD 200일 합", row=2, col=1)
+        fig_page1.update_yaxes(title_text="Net AD 200일 합", row=2, col=2)
+        fig_page1.update_yaxes(title_text="Net AD 120일 합", row=3, col=1)
+        fig_page1.update_yaxes(title_text="Net AD 120일 합", row=3, col=2)
+        fig_page1.update_yaxes(title_text="Net AD 50일 합", row=4, col=1)
+        fig_page1.update_yaxes(title_text="Net AD 50일 합", row=4, col=2)
+        fig_page1.update_yaxes(title_text="상승−하락(종목 수)", row=5, col=1)
+        fig_page1.update_yaxes(title_text="상승−하락(종목 수)", row=5, col=2)
+        fig_page1.update_yaxes(title_text="McClellan", row=6, col=1)
+        fig_page1.update_yaxes(title_text="McClellan", row=6, col=2)
 
 
-        # Page 2: CVI (200일 누적 net TV + Signal / 일별 net / 삼성·하이닉스 제외)
+        # Page 2: CVI (200/120/50 롤링 합 + Signal / 일별 net / 삼성·하이닉스 제외)
         fig_page2 = make_subplots(
-            rows=5,
+            rows=7,
             cols=2,
             shared_xaxes=False,
-            vertical_spacing=0.05,
+            vertical_spacing=0.050,
             horizontal_spacing=0.07,
             specs=[
                 [{"secondary_y": True}, {"secondary_y": True}],
@@ -5142,12 +5404,19 @@ def run_market_dashboard(
                 [{}, {}],
                 [{}, {}],
                 [{}, {}],
+                [{}, {}],
+                [{}, {}],
             ],
+            row_heights=[0.20, 0.15, 0.13, 0.13, 0.13, 0.13, 0.13],
             subplot_titles=[
                 "코스피 지수 (10/20/50 SMA + 거래량)",
                 "코스닥 지수 (10/20/50 SMA + 거래량)",
-                "코스피 CVI (200일 누적) + Signal",
-                "코스닥 CVI (200일 누적) + Signal",
+                "코스피 CVI (200일 롤링 합) + Signal",
+                "코스닥 CVI (200일 롤링 합) + Signal",
+                "코스피 CVI (120일 롤링 합) + Signal",
+                "코스닥 CVI (120일 롤링 합) + Signal",
+                "코스피 CVI (50일 롤링 합) + Signal",
+                "코스닥 CVI (50일 롤링 합) + Signal",
                 "코스피 일별 net 거래대금 (상승TV−하락TV)",
                 "코스닥 일별 net 거래대금 (상승TV−하락TV)",
                 "코스피 CVI (삼성·하이닉스 제외, 200일) + Signal",
@@ -5173,38 +5442,59 @@ def run_market_dashboard(
         fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi"], mode="lines", name="CVI", line=dict(color="#16A085", width=2.2), showlegend=False), row=2, col=2)
         fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_signal"], mode="lines", name="Signal", line=dict(color="#8E44AD", width=2.0, dash="dash"), showlegend=False), row=2, col=2)
 
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_120"], mode="lines", name="CVI 120일", line=dict(color="#F7B267", width=2.0)), row=3, col=1)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_120_signal"], mode="lines", name="Signal(120일 EMA10)", line=dict(color="#8E44AD", width=2.0, dash="dash")), row=3, col=1)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_120"], mode="lines", name="CVI 120일", line=dict(color="#F7B267", width=2.0), showlegend=False), row=3, col=2)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_120_signal"], mode="lines", name="Signal(120일 EMA10)", line=dict(color="#8E44AD", width=2.0, dash="dash"), showlegend=False), row=3, col=2)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_50"], mode="lines", name="CVI 50일", line=dict(color="#5AA9E6", width=2.0)), row=4, col=1)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_50_signal"], mode="lines", name="Signal(50일 EMA5)", line=dict(color="#8E44AD", width=2.0, dash="dash")), row=4, col=1)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_50"], mode="lines", name="CVI 50일", line=dict(color="#5AA9E6", width=2.0), showlegend=False), row=4, col=2)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_50_signal"], mode="lines", name="Signal(50일 EMA5)", line=dict(color="#8E44AD", width=2.0, dash="dash"), showlegend=False), row=4, col=2)
+        for _r in (2, 3, 4):
+            for _c in (1, 2):
+                fig_page2.add_hline(
+                    y=0,
+                    line=dict(color="rgba(128,128,128,0.4)", width=1, dash="dash"),
+                    row=_r,
+                    col=_c,
+                )
+
         _cd_k = kospi_df["cvi_daily"].fillna(0.0).to_numpy(dtype=float)
         _cd_q = kosdaq_df["cvi_daily"].fillna(0.0).to_numpy(dtype=float)
         _cc_k = [("#e57373" if v >= 0 else "#64b5f6") for v in _cd_k]
         _cc_q = [("#e57373" if v >= 0 else "#64b5f6") for v in _cd_q]
-        fig_page2.add_trace(go.Bar(x=kospi_df.index, y=_cd_k, name="코스피 일별 net TV", marker_color=_cc_k, showlegend=False), row=3, col=1)
-        fig_page2.add_trace(go.Bar(x=kosdaq_df.index, y=_cd_q, name="코스닥 일별 net TV", marker_color=_cc_q, showlegend=False), row=3, col=2)
+        fig_page2.add_trace(go.Bar(x=kospi_df.index, y=_cd_k, name="코스피 일별 net TV", marker_color=_cc_k, showlegend=False), row=5, col=1)
+        fig_page2.add_trace(go.Bar(x=kosdaq_df.index, y=_cd_q, name="코스닥 일별 net TV", marker_color=_cc_q, showlegend=False), row=5, col=2)
 
-        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_ex"], mode="lines", name="CVI(제외)", line=dict(color="#1ABC9C", width=2.2)), row=4, col=1)
-        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_ex_signal"], mode="lines", name="Signal(제외)", line=dict(color="#9B59B6", width=2.0, dash="dash")), row=4, col=1)
-        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_ex"], mode="lines", name="CVI(제외)", line=dict(color="#1ABC9C", width=2.2), showlegend=False), row=4, col=2)
-        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_ex_signal"], mode="lines", name="Signal(제외)", line=dict(color="#9B59B6", width=2.0, dash="dash"), showlegend=False), row=4, col=2)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_ex"], mode="lines", name="CVI(제외)", line=dict(color="#1ABC9C", width=2.2)), row=6, col=1)
+        fig_page2.add_trace(go.Scatter(x=kospi_df.index, y=kospi_df["cvi_ex_signal"], mode="lines", name="Signal(제외)", line=dict(color="#9B59B6", width=2.0, dash="dash")), row=6, col=1)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_ex"], mode="lines", name="CVI(제외)", line=dict(color="#1ABC9C", width=2.2), showlegend=False), row=6, col=2)
+        fig_page2.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["cvi_ex_signal"], mode="lines", name="Signal(제외)", line=dict(color="#9B59B6", width=2.0, dash="dash"), showlegend=False), row=6, col=2)
 
         _cde_k = kospi_df["cvi_daily_ex"].fillna(0.0).to_numpy(dtype=float)
         _cde_q = kosdaq_df["cvi_daily_ex"].fillna(0.0).to_numpy(dtype=float)
         _cce_k = [("#e57373" if v >= 0 else "#64b5f6") for v in _cde_k]
         _cce_q = [("#e57373" if v >= 0 else "#64b5f6") for v in _cde_q]
-        fig_page2.add_trace(go.Bar(x=kospi_df.index, y=_cde_k, name="코스피 일별 net(제외)", marker_color=_cce_k, showlegend=False), row=5, col=1)
-        fig_page2.add_trace(go.Bar(x=kosdaq_df.index, y=_cde_q, name="코스닥 일별 net(제외)", marker_color=_cce_q, showlegend=False), row=5, col=2)
+        fig_page2.add_trace(go.Bar(x=kospi_df.index, y=_cde_k, name="코스피 일별 net(제외)", marker_color=_cce_k, showlegend=False), row=7, col=1)
+        fig_page2.add_trace(go.Bar(x=kosdaq_df.index, y=_cde_q, name="코스닥 일별 net(제외)", marker_color=_cce_q, showlegend=False), row=7, col=2)
 
-        _apply_common_layout(fig_page2, "Page 2: CVI (200d net trade-value cumulative + Signal)", layout_height=2000, max_xaxis_row=5)
+        _apply_common_layout(fig_page2, "Page 2: CVI (200d net trade-value cumulative + Signal)", layout_height=3000, max_xaxis_row=7, tick_dates=_anchored_tickvals(kospi_df.index))
         fig_page2.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page2.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page2.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
         fig_page2.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
         fig_page2.update_yaxes(title_text="CVI", row=2, col=1)
         fig_page2.update_yaxes(title_text="CVI", row=2, col=2)
-        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=3, col=1)
-        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=3, col=2)
-        fig_page2.update_yaxes(title_text="CVI(제외)", row=4, col=1)
-        fig_page2.update_yaxes(title_text="CVI(제외)", row=4, col=2)
+        fig_page2.update_yaxes(title_text="CVI 120일 합", row=3, col=1)
+        fig_page2.update_yaxes(title_text="CVI 120일 합", row=3, col=2)
+        fig_page2.update_yaxes(title_text="CVI 50일 합", row=4, col=1)
+        fig_page2.update_yaxes(title_text="CVI 50일 합", row=4, col=2)
         fig_page2.update_yaxes(title_text="상승TV−하락TV", row=5, col=1)
         fig_page2.update_yaxes(title_text="상승TV−하락TV", row=5, col=2)
+        fig_page2.update_yaxes(title_text="CVI(제외)", row=6, col=1)
+        fig_page2.update_yaxes(title_text="CVI(제외)", row=6, col=2)
+        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=7, col=1)
+        fig_page2.update_yaxes(title_text="상승TV−하락TV", row=7, col=2)
 
         # Page 3: 시장 변동성 (지수 / ATR3 평균) — ATR 산점도는 9페이지
         fig_vol = make_subplots(
@@ -5241,7 +5531,7 @@ def run_market_dashboard(
         fig_vol.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"], mode="lines", name="코스닥 시총가중 변동성(ATR3/종가)", line=dict(color="#2ECC71", width=2)), row=2, col=2)
         fig_vol.add_trace(go.Scatter(x=kosdaq_df.index, y=kosdaq_df["market_avg_volatility"].rolling(20).mean(), mode="lines", name="코스닥 Vol SMA20", line=dict(color="#2ECC71", width=2.2, dash="dash")), row=2, col=2)
 
-        _apply_common_layout(fig_vol, "Page 3: 시총가중 변동성(ATR3/종가)", layout_height=980, max_xaxis_row=2)
+        _apply_common_layout(fig_vol, "Page 3: 시총가중 변동성(ATR3/종가)", layout_height=980, max_xaxis_row=2, tick_dates=_anchored_tickvals(kospi_df.index))
         fig_vol.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_vol.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_vol.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5314,7 +5604,7 @@ def run_market_dashboard(
                 col=2,
             )
 
-        _apply_common_layout(fig_page4, "Page 4: Zweig Breadth Thrust (Zweig)")
+        _apply_common_layout(fig_page4, "Page 4: Zweig Breadth Thrust (Zweig)", tick_dates=_anchored_tickvals(kospi_df.index))
         fig_page4.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page4.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page4.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5440,7 +5730,7 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page6, "Page 5: Close > SMA breadth (%) — by window", layout_height=1680, max_xaxis_row=4)
+        _apply_common_layout(fig_page6, "Page 5: Close > SMA breadth (%) — by window", layout_height=1800, max_xaxis_row=4, tick_dates=_anchored_tickvals(kospi_df.index))
         fig_page6.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page6.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page6.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5453,8 +5743,8 @@ def run_market_dashboard(
         fig_page6.update_yaxes(title_text="비중(%)", row=4, col=2, range=[0, 100])
 
 
-        # Page 7: 120일 신고가/신저가
-        def compute_120d_high_low_counts(universe_set: set, target_index: pd.DatetimeIndex, window: int = 120) -> pd.DataFrame:
+        # Page 7: 신고가/신저가 (200/120/50)
+        def compute_high_low_counts(universe_set: set, target_index: pd.DatetimeIndex, window: int = 120) -> pd.DataFrame:
             """각 날짜별로 '종가가 최근 window 거래일 최고/최저'인 종목 수를 계산."""
             idx = pd.DatetimeIndex(target_index)
             if len(idx) == 0:
@@ -5501,15 +5791,34 @@ def run_market_dashboard(
             out["low_cnt"] = low_cnt
             return out
 
-        kospi_120hl = compute_120d_high_low_counts(kospi_set, kospi_df.index, window=120)
-        kosdaq_120hl = compute_120d_high_low_counts(kosdaq_set, kosdaq_df.index, window=120)
+        kospi_120hl = compute_high_low_counts(kospi_set, kospi_df.index, window=120)
+        kosdaq_120hl = compute_high_low_counts(kosdaq_set, kosdaq_df.index, window=120)
+        kospi_200hl = compute_high_low_counts(kospi_set, kospi_df.index, window=200)
+        kosdaq_200hl = compute_high_low_counts(kosdaq_set, kosdaq_df.index, window=200)
+        kospi_50hl = compute_high_low_counts(kospi_set, kospi_df.index, window=50)
+        kosdaq_50hl = compute_high_low_counts(kosdaq_set, kosdaq_df.index, window=50)
 
         fig_page8 = make_subplots(
-            rows=2,
+            rows=4,
             cols=2,
-            specs=[[{"secondary_y": True}, {"secondary_y": True}], [{}, {}]],
-            subplot_titles=("코스피 지수", "코스닥 지수", "코스피: 120일 신고가/신저가 종목수", "코스닥: 120일 신고가/신저가 종목수"),
-            vertical_spacing=0.12,
+            specs=[
+                [{"secondary_y": True}, {"secondary_y": True}],
+                [{}, {}],
+                [{}, {}],
+                [{}, {}],
+            ],
+            row_heights=[0.28, 0.24, 0.24, 0.24],
+            subplot_titles=(
+                "코스피 지수",
+                "코스닥 지수",
+                "코스피: 200일 신고가/신저가 종목수",
+                "코스닥: 200일 신고가/신저가 종목수",
+                "코스피: 120일 신고가/신저가 종목수",
+                "코스닥: 120일 신고가/신저가 종목수",
+                "코스피: 50일 신고가/신저가 종목수",
+                "코스닥: 50일 신고가/신저가 종목수",
+            ),
+            vertical_spacing=0.070,
             horizontal_spacing=0.06,
         )
 
@@ -5525,18 +5834,38 @@ def run_market_dashboard(
         fig_page8.add_trace(go.Scatter(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["sma50"], mode="lines", name="SMA50", line=dict(color="#5E35B1", width=1.8, dash="dot")), row=1, col=2)
         fig_page8.add_trace(go.Bar(x=kosdaq_index_aligned.index, y=kosdaq_index_aligned["volume"], name="Volume", marker=dict(color="rgba(128, 128, 128, 0.35)")), row=1, col=2, secondary_y=True)
 
-        fig_page8.add_trace(go.Scatter(x=kospi_120hl.index, y=kospi_120hl["high_cnt"], mode="lines", name="코스피 120일 신고가 수", line=dict(color="#E74C3C", width=2.2)), row=2, col=1)
-        fig_page8.add_trace(go.Scatter(x=kospi_120hl.index, y=kospi_120hl["low_cnt"], mode="lines", name="코스피 120일 신저가 수", line=dict(color="#2980B9", width=2.2)), row=2, col=1)
-        fig_page8.add_trace(go.Scatter(x=kosdaq_120hl.index, y=kosdaq_120hl["high_cnt"], mode="lines", name="코스닥 120일 신고가 수", line=dict(color="#E74C3C", width=2.2)), row=2, col=2)
-        fig_page8.add_trace(go.Scatter(x=kosdaq_120hl.index, y=kosdaq_120hl["low_cnt"], mode="lines", name="코스닥 120일 신저가 수", line=dict(color="#2980B9", width=2.2)), row=2, col=2)
+        fig_page8.add_trace(go.Scatter(x=kospi_200hl.index, y=kospi_200hl["high_cnt"], mode="lines", name="코스피 200일 신고가 수", line=dict(color="#E74C3C", width=2.2)), row=2, col=1)
+        fig_page8.add_trace(go.Scatter(x=kospi_200hl.index, y=kospi_200hl["low_cnt"], mode="lines", name="코스피 200일 신저가 수", line=dict(color="#2980B9", width=2.2)), row=2, col=1)
+        fig_page8.add_trace(go.Scatter(x=kosdaq_200hl.index, y=kosdaq_200hl["high_cnt"], mode="lines", name="코스닥 200일 신고가 수", line=dict(color="#E74C3C", width=2.2)), row=2, col=2)
+        fig_page8.add_trace(go.Scatter(x=kosdaq_200hl.index, y=kosdaq_200hl["low_cnt"], mode="lines", name="코스닥 200일 신저가 수", line=dict(color="#2980B9", width=2.2)), row=2, col=2)
 
-        _apply_common_layout(fig_page8, "Page 7: 120-day New High / New Low counts (Close 기준)")
+        fig_page8.add_trace(go.Scatter(x=kospi_120hl.index, y=kospi_120hl["high_cnt"], mode="lines", name="코스피 120일 신고가 수", line=dict(color="#E74C3C", width=2.2), showlegend=False), row=3, col=1)
+        fig_page8.add_trace(go.Scatter(x=kospi_120hl.index, y=kospi_120hl["low_cnt"], mode="lines", name="코스피 120일 신저가 수", line=dict(color="#2980B9", width=2.2), showlegend=False), row=3, col=1)
+        fig_page8.add_trace(go.Scatter(x=kosdaq_120hl.index, y=kosdaq_120hl["high_cnt"], mode="lines", name="코스닥 120일 신고가 수", line=dict(color="#E74C3C", width=2.2), showlegend=False), row=3, col=2)
+        fig_page8.add_trace(go.Scatter(x=kosdaq_120hl.index, y=kosdaq_120hl["low_cnt"], mode="lines", name="코스닥 120일 신저가 수", line=dict(color="#2980B9", width=2.2), showlegend=False), row=3, col=2)
+
+        fig_page8.add_trace(go.Scatter(x=kospi_50hl.index, y=kospi_50hl["high_cnt"], mode="lines", name="코스피 50일 신고가 수", line=dict(color="#E74C3C", width=2.2), showlegend=False), row=4, col=1)
+        fig_page8.add_trace(go.Scatter(x=kospi_50hl.index, y=kospi_50hl["low_cnt"], mode="lines", name="코스피 50일 신저가 수", line=dict(color="#2980B9", width=2.2), showlegend=False), row=4, col=1)
+        fig_page8.add_trace(go.Scatter(x=kosdaq_50hl.index, y=kosdaq_50hl["high_cnt"], mode="lines", name="코스닥 50일 신고가 수", line=dict(color="#E74C3C", width=2.2), showlegend=False), row=4, col=2)
+        fig_page8.add_trace(go.Scatter(x=kosdaq_50hl.index, y=kosdaq_50hl["low_cnt"], mode="lines", name="코스닥 50일 신저가 수", line=dict(color="#2980B9", width=2.2), showlegend=False), row=4, col=2)
+
+        _apply_common_layout(
+            fig_page8,
+            "Page 7: New High / New Low counts (200/120/50일, Close 기준)",
+            layout_height=1800,
+            max_xaxis_row=4,
+            tick_dates=_anchored_tickvals(kospi_df.index),
+        )
         fig_page8.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page8.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page8.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
         fig_page8.update_yaxes(title_text="거래량", row=1, col=2, secondary_y=True)
         fig_page8.update_yaxes(title_text="종목 수", row=2, col=1)
         fig_page8.update_yaxes(title_text="종목 수", row=2, col=2)
+        fig_page8.update_yaxes(title_text="종목 수", row=3, col=1)
+        fig_page8.update_yaxes(title_text="종목 수", row=3, col=2)
+        fig_page8.update_yaxes(title_text="종목 수", row=4, col=1)
+        fig_page8.update_yaxes(title_text="종목 수", row=4, col=2)
 
         fig_page9 = make_subplots(
             rows=2,
@@ -5611,7 +5940,7 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page9, "Page 8: ADR (20d sum advances / declines × 100)")
+        _apply_common_layout(fig_page9, "Page 8: ADR (20d sum advances / declines × 100)", tick_dates=_anchored_tickvals(kospi_df.index))
         fig_page9.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page9.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page9.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -5689,7 +6018,7 @@ def run_market_dashboard(
             col=2,
         )
 
-        _apply_common_layout(fig_page10, "Page 9: (KOSPI/KOSDAQ Index) x (Momentum Speed)")
+        _apply_common_layout(fig_page10, "Page 9: (KOSPI/KOSDAQ Index) x (Momentum Speed)", tick_dates=_anchored_tickvals(kospi_df.index))
         fig_page10.update_yaxes(title_text="지수", row=1, col=1, secondary_y=False)
         fig_page10.update_yaxes(title_text="거래량", row=1, col=1, secondary_y=True)
         fig_page10.update_yaxes(title_text="지수", row=1, col=2, secondary_y=False)
@@ -7223,6 +7552,82 @@ _INVESTOR_TOP_GROUPS = [
     ("FOREIGN", "외국인", ("9000",)),      # 기존 ("9000","9001") → 9001 제외
 ]
 
+_INVESTOR_BTN_LABELS = {
+    1: "1페이지: 당일 순매수",
+    2: "2페이지: 5일 누적 순매수",
+    3: "3페이지: 당일 순매도",
+    4: "4페이지: 5일 누적 순매도",
+}
+_INVESTOR_PAGE_DESCS = {
+    1: "기준일 당일 투자자구분별 순매수금액(net_val) 상위 20종목입니다. 전역제외·보통주 필터 적용.",
+    2: "최근 5거래일 net_val 합 기준 순매수 상위 20종목입니다. 캘린더 5일이 아니라 거래일 5개입니다.",
+    3: "기준일 당일 순매도금액 상위 20종목입니다(net_val 오름차순, 표시값은 절대값).",
+    4: "최근 5거래일 net_val 합 기준 순매도 상위 20종목입니다.",
+}
+
+_INVESTOR_PAGE_CSS = """
+<style>
+  section { padding: 8px 4px 12px; }
+  section h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  section h3 { font-size: 0.98rem; margin: 18px 0 8px; color: #333; }
+  .inv-rank20-wrap { overflow: auto; max-height: 560px; border-radius: 8px; border: 1px solid #e6e6e6; background: #fff; }
+  table.inv-rank20 { border-collapse: collapse; font-size: 11px; width: 100%; background: #fff; }
+  table.inv-rank20 th, table.inv-rank20 td { border: 1px solid #eee; padding: 5px 6px; vertical-align: top; min-width: 96px; }
+  table.inv-rank20 thead th { position: sticky; top: 0; background: #fafafa; z-index: 1; text-align: center; }
+  table.inv-rank20 td.datecol { position: sticky; left: 0; background: #fff; font-weight: 600; min-width: 96px; text-align: center; }
+  table.inv-rank20 tr.latest td { background: #fff8e1; }
+  table.inv-rank20 tr.latest td.datecol { background: #ffecb3; }
+</style>
+"""
+
+
+def _investor_net_val_agg(engine, ref_d, days: int = 1) -> pd.DataFrame:
+    """krx_investor_trade_krx 에서 최근 `days` 거래일 net_val·net_qty 합.
+    반환: date(기준일), ticker, invst_tp_cd, net_val, net_qty"""
+    empty = pd.DataFrame(columns=["date", "ticker", "invst_tp_cd", "net_val", "net_qty"])
+    try:
+        ddf = pd.read_sql_query(
+            """
+            SELECT DISTINCT `date` AS d FROM krx_investor_trade_krx
+            WHERE `date` <= %s
+            ORDER BY `date` DESC
+            LIMIT %s
+            """,
+            con=engine,
+            params=(ref_d, int(days)),
+        )
+    except Exception:
+        return empty
+    if ddf is None or ddf.empty:
+        return empty
+    dates = sorted(pd.to_datetime(ddf["d"]).dt.date.tolist())
+    d0, d1 = dates[0], dates[-1]
+    try:
+        raw = pd.read_sql_query(
+            """
+            SELECT i.ticker, i.invst_tp_cd,
+                   SUM(i.net_val) AS net_val,
+                   SUM(i.net_qty) AS net_qty
+            FROM krx_investor_trade_krx i
+            WHERE i.`date` >= %s AND i.`date` <= %s
+            GROUP BY i.ticker, i.invst_tp_cd
+            HAVING SUM(i.net_val) IS NOT NULL
+            """,
+            con=engine,
+            params=(d0, d1),
+        )
+    except Exception:
+        return empty
+    if raw is None or raw.empty:
+        return empty
+    out = raw.copy()
+    out["date"] = ref_d
+    out["ticker"] = out["ticker"].astype(str)
+    out["invst_tp_cd"] = out["invst_tp_cd"].astype(str)
+    out["net_val"] = pd.to_numeric(out["net_val"], errors="coerce")
+    out["net_qty"] = pd.to_numeric(out["net_qty"], errors="coerce")
+    return out[["date", "ticker", "invst_tp_cd", "net_val", "net_qty"]]
+
 
 def write_investor_net_buy_top_html(
     engine,
@@ -7230,9 +7635,9 @@ def write_investor_net_buy_top_html(
     quiet: bool = False,
 ) -> str | None:
     """
-    기준일(최신) 투자자구분별 순매수금액(net_val) Top20 → 투자자_순매수상위.html.
+    투자자구분별 순매수/순매도 Top20 → 투자자_순매수상위.html (4페이지 토글).
+    1) 당일 순매수 2) 5일 누적 순매수 3) 당일 순매도 4) 5일 누적 순매도.
     외국인=9000(기타외국인 9001 제외). 전역제외·보통주(이름) 필터.
-    당일표: 당일상승률·5거래일·RS점수. 각 그룹 아래 최근 20거래일 일별 Top20 추이.
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
     out_dir = os.path.join(base, date.today().strftime("%Y-%m-%d"))
@@ -7268,7 +7673,6 @@ def write_investor_net_buy_top_html(
     ref_d = pd.to_datetime(ref_df.iloc[0]["d"]).date()
     _, rs_score_map = _load_latest_rs_rank_and_score_maps(engine)
 
-    # 표시 필터용 최신 시총 (종목코드 → mcap)
     inv_mcap_map: dict[str, float] = {}
     try:
         _tl = pd.read_sql_query(
@@ -7289,6 +7693,75 @@ def write_investor_net_buy_top_html(
     except Exception:
         inv_mcap_map = {}
 
+    name_map: dict[str, str] = {}
+    sector_map: dict[str, str] = {}
+    try:
+        _tl_full = _load_latest_ticker_list(engine)
+        if _tl_full is not None and not _tl_full.empty:
+            _code_col = "종목코드" if "종목코드" in _tl_full.columns else "ticker"
+            _name_col = "종목명" if "종목명" in _tl_full.columns else "name"
+            name_map = {
+                str(r[_code_col]): str(r[_name_col] or "")
+                for _, r in _tl_full.iterrows()
+            }
+    except Exception:
+        name_map = {}
+    if not name_map:
+        try:
+            _nm = pd.read_sql_query(
+                """
+                SELECT 종목코드 AS ticker, 종목명 AS name
+                FROM krx_ticker
+                WHERE 기준일 = (SELECT MAX(기준일) FROM krx_ticker)
+                """,
+                con=engine,
+            )
+            if _nm is not None and not _nm.empty:
+                name_map = {
+                    str(r["ticker"]): str(r["name"] or "")
+                    for _, r in _nm.iterrows()
+                }
+        except Exception:
+            name_map = {}
+
+    # 4페이지 공통: v_ticker_sector_primary.sector_key (실패 시 KRX 업종명 폴백)
+    try:
+        _vs = pd.read_sql_query(
+            "SELECT ticker, sector_key FROM v_ticker_sector_primary",
+            con=engine,
+        )
+        if _vs is not None and not _vs.empty:
+            sector_map = {
+                str(r["ticker"]).zfill(6): (
+                    "" if pd.isna(r["sector_key"]) else str(r["sector_key"] or "")
+                )
+                for _, r in _vs.iterrows()
+            }
+        else:
+            raise RuntimeError("v_ticker_sector_primary 결과가 비어 있습니다")
+    except Exception as e:
+        print("⚠️ v_ticker_sector_primary 조회 실패 — KRX 업종명으로 폴백")
+        print(f"   ({type(e).__name__}: {e})")
+        try:
+            _sec = pd.read_sql_query(
+                """
+                SELECT 종목코드 AS ticker, 업종명 AS sector
+                FROM krx_ticker
+                WHERE 기준일 = (SELECT MAX(기준일) FROM krx_ticker)
+                """,
+                con=engine,
+            )
+            if _sec is not None and not _sec.empty:
+                sector_map = {
+                    str(r["ticker"]).zfill(6): (
+                        "" if pd.isna(r["sector"]) else str(r["sector"] or "")
+                    )
+                    for _, r in _sec.iterrows()
+                }
+        except Exception as e2:
+            print(f"⚠️ KRX 업종명 폴백도 실패: {type(e2).__name__}: {e2}")
+            sector_map = {}
+
     INV_RANK_DAYS = 20
     INV_RANK_N = 20
     RANK_IMPROVE = "#d32f2f"
@@ -7303,7 +7776,7 @@ def write_investor_net_buy_top_html(
                 WHERE date <= %s
                 ORDER BY date DESC
                 LIMIT %s
-                """ ,
+                """,
                 con=engine,
                 params=(end, int(n)),
             )
@@ -7321,7 +7794,7 @@ def write_investor_net_buy_top_html(
                 WHERE `date` <= %s
                 ORDER BY `date` DESC
                 LIMIT %s
-                """ ,
+                """,
                 con=engine,
                 params=(end, int(n)),
             )
@@ -7331,48 +7804,64 @@ def write_investor_net_buy_top_html(
             return []
         return sorted(pd.to_datetime(df["d"]).dt.date.tolist())
 
-    def _load_top(codes: tuple[str, ...], as_of: date | None = None) -> pd.DataFrame:
-        as_of = as_of or ref_d
-        if len(codes) == 1:
-            q = """
-                SELECT i.ticker, t.종목명 AS name, i.net_val, i.net_qty
-                FROM krx_investor_trade_krx i
-                LEFT JOIN krx_ticker t
-                  ON t.종목코드 = i.ticker
-                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-                WHERE i.date = %s AND i.invst_tp_cd = %s
-                  AND i.net_val IS NOT NULL
-            """
-            df = pd.read_sql_query(q, con=engine, params=(as_of, codes[0]))
+    def _top_from_agg(
+        agg: pd.DataFrame,
+        codes: tuple[str, ...],
+        ascending: bool,
+        prev_agg: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        if agg is None or agg.empty:
+            return pd.DataFrame()
+        sub = agg[agg["invst_tp_cd"].isin([str(c) for c in codes])].copy()
+        if sub.empty:
+            return pd.DataFrame()
+        if len(codes) > 1:
+            sub = (
+                sub.groupby("ticker", as_index=False)
+                .agg({"net_val": "sum", "net_qty": "sum"})
+            )
         else:
-            ph = ",".join(["%s"] * len(codes))
-            q = f"""
-                SELECT i.ticker,
-                       MAX(t.종목명) AS name,
-                       SUM(i.net_val) AS net_val,
-                       SUM(i.net_qty) AS net_qty
-                FROM krx_investor_trade_krx i
-                LEFT JOIN krx_ticker t
-                  ON t.종목코드 = i.ticker
-                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-                WHERE i.date = %s AND i.invst_tp_cd IN ({ph})
-                GROUP BY i.ticker
-                HAVING SUM(i.net_val) IS NOT NULL
-            """
-            df = pd.read_sql_query(q, con=engine, params=(as_of, *codes))
-        if df is None or df.empty:
+            sub = sub[["ticker", "net_val", "net_qty"]].copy()
+        sub["name"] = sub["ticker"].map(name_map).fillna("")
+        sub["sector"] = sub["ticker"].astype(str).str.zfill(6).map(sector_map).fillna("")
+        sub = filter_common_stock_df(sub, "ticker", "name")
+        if sub is None or sub.empty:
             return pd.DataFrame()
-        df = filter_common_stock_df(df, "ticker", "name")
-        if df is None or df.empty:
+        sub["net_val"] = pd.to_numeric(sub["net_val"], errors="coerce")
+        sub["net_qty"] = pd.to_numeric(sub["net_qty"], errors="coerce")
+        sub["mcap"] = sub["ticker"].astype(str).str.zfill(6).map(inv_mcap_map)
+        sub = _filter_display_mcap(sub)
+        if sub.empty:
             return pd.DataFrame()
-        df["net_val"] = pd.to_numeric(df["net_val"], errors="coerce")
-        df["net_qty"] = pd.to_numeric(df["net_qty"], errors="coerce")
-        df["mcap"] = df["ticker"].astype(str).str.zfill(6).map(inv_mcap_map)
-        df = _filter_display_mcap(df)
-        if df.empty:
-            return pd.DataFrame()
-        df = df.dropna(subset=["net_val"]).sort_values("net_val", ascending=False).head(20)
-        return df.reset_index(drop=True)
+        sub = sub.dropna(subset=["net_val"]).sort_values("net_val", ascending=ascending).head(20)
+        sub = sub.reset_index(drop=True)
+
+        prev_val_map: dict[str, float] = {}
+        prev_qty_map: dict[str, float] = {}
+        if prev_agg is not None and not prev_agg.empty:
+            psub = prev_agg[prev_agg["invst_tp_cd"].isin([str(c) for c in codes])].copy()
+            if not psub.empty:
+                if len(codes) > 1:
+                    psub = (
+                        psub.groupby("ticker", as_index=False)
+                        .agg({"net_val": "sum", "net_qty": "sum"})
+                    )
+                psub["ticker"] = psub["ticker"].astype(str)
+                psub["net_val"] = pd.to_numeric(psub["net_val"], errors="coerce")
+                psub["net_qty"] = pd.to_numeric(psub["net_qty"], errors="coerce")
+                prev_val_map = {
+                    str(r["ticker"]): float(r["net_val"])
+                    for _, r in psub.iterrows()
+                    if pd.notna(r["net_val"])
+                }
+                prev_qty_map = {
+                    str(r["ticker"]): float(r["net_qty"])
+                    for _, r in psub.iterrows()
+                    if pd.notna(r["net_qty"])
+                }
+        sub["prev_net_val"] = sub["ticker"].astype(str).map(prev_val_map)
+        sub["prev_net_qty"] = sub["ticker"].astype(str).map(prev_qty_map)
+        return sub
 
     def _enrich_returns_rs(df: pd.DataFrame) -> pd.DataFrame:
         """Top20 확정 후 당일상승률·5거래일·RS점수 부착."""
@@ -7397,7 +7886,7 @@ def write_investor_net_buy_top_html(
                 SELECT ticker, date, close
                 FROM krx_ohlcv
                 WHERE date >= %s AND date <= %s AND ticker IN ({ph})
-                """ ,
+                """,
                 con=engine,
                 params=(dates[0], d0, *tickers),
             )
@@ -7439,7 +7928,7 @@ def write_investor_net_buy_top_html(
         out["ret_5d"] = ret5s
         return out
 
-    def _load_rank20_long(codes: tuple[str, ...], plot_dates: list) -> pd.DataFrame:
+    def _load_rank20_long(codes: tuple[str, ...], plot_dates: list, ascending: bool) -> pd.DataFrame:
         """trade_date, top_rank, ticker, name, net_val."""
         if not plot_dates:
             return pd.DataFrame()
@@ -7492,7 +7981,7 @@ def write_investor_net_buy_top_html(
             g = _filter_display_mcap(g)
             if g.empty:
                 continue
-            g = g.sort_values("net_val", ascending=False).head(INV_RANK_N).reset_index(drop=True)
+            g = g.sort_values("net_val", ascending=ascending).head(INV_RANK_N).reset_index(drop=True)
             for i, r in g.iterrows():
                 rows.append(
                     {
@@ -7532,8 +8021,9 @@ def write_investor_net_buy_top_html(
             return ""
         return f"{x:.1f}"
 
-    def _rank20_html(label: str, long_df: pd.DataFrame, plot_dates: list) -> str:
-        h3 = f"<h3>{html.escape(label)} 최근 20거래일 일별 Top20</h3>"
+    def _rank20_html(label: str, long_df: pd.DataFrame, plot_dates: list, side: str) -> str:
+        side_label = "순매도" if side == "sell" else "순매수"
+        h3 = f"<h3>{html.escape(label)} 최근 20거래일 일별 {side_label} Top20</h3>"
         if not plot_dates:
             return h3 + "<p style='color:#666;font-size:13px;'>20일 추이 데이터 없음</p>"
         rank_map: dict[tuple, int] = {}
@@ -7567,6 +8057,8 @@ def write_investor_net_buy_top_html(
                 nv = cell_nv.get((d, rk), np.nan)
                 try:
                     eok = float(nv) / 1e8
+                    if side == "sell":
+                        eok = -eok
                     eok_s = f"{eok:+,.0f}"
                 except (TypeError, ValueError):
                     eok_s = ""
@@ -7592,8 +8084,33 @@ def write_investor_net_buy_top_html(
             + "</tbody></table></div>"
         )
 
-    def _table_html(label: str, df: pd.DataFrame, rank_html: str) -> str:
-        title = f"{label} 순매수금액 Top20 · 기준일 {ref_d}"
+    def _table_html(
+        label: str,
+        df: pd.DataFrame,
+        rank_html: str,
+        *,
+        days: int,
+        side: str,
+        start_d,
+    ) -> str:
+        if days <= 1:
+            if side == "sell":
+                title = f"{label} 당일 순매도금액 Top20 · 기준일 {ref_d}"
+            else:
+                title = f"{label} 당일 순매수금액 Top20 · 기준일 {ref_d}"
+        else:
+            if side == "sell":
+                title = f"{label} 5일 누적 순매도금액 Top20 · {start_d}~{ref_d}"
+            else:
+                title = f"{label} 5일 누적 순매수금액 Top20 · {start_d}~{ref_d}"
+        if side == "sell":
+            col_val, col_qty = "순매도금액(억)", "순매도량"
+            col_prev_val, col_prev_qty = "전일 순매도금액(억)", "전일 순매도량"
+        else:
+            col_val, col_qty = "순매수금액(억)", "순매수량"
+            col_prev_val, col_prev_qty = "전일 순매수금액(억)", "전일 순매수량"
+        show_prev = days <= 1
+
         if df is None or df.empty:
             daily = (
                 f"<h2>{html.escape(title)}</h2>"
@@ -7603,98 +8120,129 @@ def write_investor_net_buy_top_html(
             rows = []
             for i, r in df.iterrows():
                 nv = r.get("net_val")
-                col = _krx_chg_font_color(nv)
+                nq = r.get("net_qty")
+                disp_nv = nv
+                disp_nq = nq
+                try:
+                    if side == "sell" and nv is not None and pd.notna(nv):
+                        disp_nv = -float(nv)
+                    if side == "sell" and nq is not None and pd.notna(nq):
+                        disp_nq = -float(nq)
+                except (TypeError, ValueError):
+                    pass
+                # 순매수: 양수 빨강 / 순매도: 원본 net_val(음수) → 파랑
+                col = _krx_chg_font_color(nv if side == "sell" else disp_nv)
                 rs_v = r.get("rs_score")
+                prev_cells = ""
+                if show_prev:
+                    pnv = r.get("prev_net_val")
+                    pnq = r.get("prev_net_qty")
+                    disp_pnv = pnv
+                    disp_pnq = pnq
+                    try:
+                        if side == "sell" and pnv is not None and pd.notna(pnv):
+                            disp_pnv = -float(pnv)
+                        if side == "sell" and pnq is not None and pd.notna(pnq):
+                            disp_pnq = -float(pnq)
+                    except (TypeError, ValueError):
+                        pass
+                    pcol = _krx_chg_font_color(pnv if side == "sell" else disp_pnv)
+                    pnv_txt = _fmt_eok(disp_pnv) if pnv is not None and pd.notna(pnv) else ""
+                    pnq_txt = _fmt_qty(disp_pnq) if pnq is not None and pd.notna(pnq) else ""
+                    prev_cells = (
+                        f"<td style='text-align:right;color:{pcol}'{_html_sort_num_attr(disp_pnv if pnv_txt else None)}>{html.escape(pnv_txt)}</td>"
+                        f"<td style='text-align:right'{_html_sort_num_attr(disp_pnq if pnq_txt else None)}>{html.escape(pnq_txt)}</td>"
+                    )
                 rows.append(
                     "<tr>"
                     f"<td style='text-align:center'{_html_sort_num_attr(i + 1)}>{i + 1}</td>"
                     f"<td style='text-align:center'>{html.escape(str(r.get('ticker') or ''))}</td>"
                     f"<td style='text-align:left'>{html.escape(str(r.get('name') or ''))}</td>"
-                    f"<td style='text-align:right;color:{col}'{_html_sort_num_attr(nv)}>{_fmt_eok(nv)}</td>"
-                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('net_qty'))}>{_fmt_qty(r.get('net_qty'))}</td>"
+                    f"<td style='text-align:left'>{html.escape(str(r.get('sector') or ''))}</td>"
+                    f"<td style='text-align:right;color:{col}'{_html_sort_num_attr(disp_nv)}>{_fmt_eok(disp_nv)}</td>"
+                    f"<td style='text-align:right'{_html_sort_num_attr(disp_nq)}>{_fmt_qty(disp_nq)}</td>"
+                    + prev_cells
                     + _krx_chg_pct_td(r.get("day_chg"), digits=1)
                     + _krx_chg_pct_td(r.get("ret_5d"), digits=1)
                     + f"<td style='text-align:right'{_html_sort_num_attr(rs_v)}>{html.escape(_fmt_rs(rs_v))}</td>"
                     "</tr>"
                 )
+            prev_ths = (
+                f"<th>{col_prev_val}</th><th>{col_prev_qty}</th>" if show_prev else ""
+            )
             daily = (
                 f"<h2>{html.escape(title)}</h2>"
                 "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' "
                 "style='border-collapse:collapse;font-size:12px;width:100%;background:#fff;'>"
                 "<thead><tr>"
-                "<th>순위</th><th>티커</th><th>종목명</th>"
-                "<th>순매수금액(억)</th><th>순매수량</th>"
-                "<th>당일상승률</th><th>5거래일</th><th>RS점수</th>"
+                "<th>순위</th><th>티커</th><th>종목명</th><th>섹터</th>"
+                f"<th>{col_val}</th><th>{col_qty}</th>"
+                + prev_ths
+                + "<th>당일상승률</th><th>5거래일</th><th>RS점수</th>"
                 "</tr></thead><tbody>"
                 + "".join(rows)
                 + "</tbody></table>"
             )
         return f"<section>{daily}{rank_html}</section>"
 
-    plot_dates = _investor_dates_upto(ref_d, INV_RANK_DAYS)
+    def _investor_page_html(*, days: int, side: str) -> str:
+        """side='buy' 면 net_val 내림차순, 'sell' 이면 오름차순 Top20."""
+        ascending = side == "sell"
+        agg = _investor_net_val_agg(engine, ref_d, days=days)
+        range_dates = _investor_dates_upto(ref_d, days)
+        start_d = range_dates[0] if range_dates else ref_d
+        plot_dates = _investor_dates_upto(ref_d, INV_RANK_DAYS)
 
-    sections = []
-    for key, label, codes in _INVESTOR_TOP_GROUPS:
-        use = codes if codes else (key,)
-        try:
-            df = _enrich_returns_rs(_load_top(use))
-        except Exception as e:
-            if not quiet:
-                print(f"경고: {label} Top 조회 실패 ({e})")
-            df = pd.DataFrame()
-        try:
-            long_df = _load_rank20_long(use, plot_dates)
-            rank_html = _rank20_html(label, long_df, plot_dates)
-        except Exception as e:
-            if not quiet:
-                print(f"경고: {label} 20일 추이 실패 ({e})")
-            rank_html = (
-                f"<h3>{html.escape(label)} 최근 20거래일 일별 Top20</h3>"
-                "<p style='color:#666;font-size:13px;'>20일 추이 생성 실패</p>"
+        prev_agg = None
+        if days <= 1:
+            _pair = _investor_dates_upto(ref_d, 2)
+            if len(_pair) >= 2:
+                prev_d = _pair[0]
+                prev_agg = _investor_net_val_agg(engine, prev_d, days=1)
+
+        sections = []
+        for key, label, codes in _INVESTOR_TOP_GROUPS:
+            use = codes if codes else (key,)
+            try:
+                df = _enrich_returns_rs(
+                    _top_from_agg(agg, use, ascending=ascending, prev_agg=prev_agg)
+                )
+            except Exception as e:
+                if not quiet:
+                    print(f"경고: {label} Top 조회 실패 ({e})")
+                df = pd.DataFrame()
+            try:
+                long_df = _load_rank20_long(use, plot_dates, ascending=ascending)
+                rank_html = _rank20_html(label, long_df, plot_dates, side=side)
+            except Exception as e:
+                if not quiet:
+                    print(f"경고: {label} 20일 추이 실패 ({e})")
+                side_label = "순매도" if side == "sell" else "순매수"
+                rank_html = (
+                    f"<h3>{html.escape(label)} 최근 20거래일 일별 {side_label} Top20</h3>"
+                    "<p style='color:#666;font-size:13px;'>20일 추이 생성 실패</p>"
+                )
+            sections.append(
+                _table_html(label, df, rank_html, days=days, side=side, start_d=start_d)
             )
-        sections.append(_table_html(label, df, rank_html))
 
-    html_doc = f"""<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>투자자 순매수 상위 ({ref_d})</title>
-  <style>
-    body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #111; background: #fafafa; }}
-    h1 {{ padding: 16px 20px; margin: 0; font-size: 1.25rem; background: #fff; border-bottom: 1px solid #e0e0e0; }}
-    .note {{ padding: 10px 20px; font-size: 13px; color: #444; background: #fff; border-bottom: 1px solid #eee; line-height: 1.5; }}
-    section {{ padding: 16px 20px 8px; }}
-    section h2 {{ font-size: 1.05rem; margin: 0 0 10px; }}
-    section h3 {{ font-size: 0.98rem; margin: 18px 0 8px; color: #333; }}
-    .inv-rank20-wrap {{ overflow: auto; max-height: 560px; border-radius: 8px; border: 1px solid #e6e6e6; background: #fff; }}
-    table.inv-rank20 {{ border-collapse: collapse; font-size: 11px; width: 100%; background: #fff; }}
-    table.inv-rank20 th, table.inv-rank20 td {{ border: 1px solid #eee; padding: 5px 6px; vertical-align: top; min-width: 96px; }}
-    table.inv-rank20 thead th {{ position: sticky; top: 0; background: #fafafa; z-index: 1; text-align: center; }}
-    table.inv-rank20 td.datecol {{ position: sticky; left: 0; background: #fff; font-weight: 600; min-width: 96px; text-align: center; }}
-    table.inv-rank20 tr.latest td {{ background: #fff8e1; }}
-    table.inv-rank20 tr.latest td.datecol {{ background: #ffecb3; }}
-  </style>
-</head>
-<body>
-  <h1>투자자별 순매수금액 상위</h1>
-  <div class="note">
-    기준일: <strong>{ref_d}</strong> (<code>krx_investor_trade_krx</code> 최신 <code>date</code>).<br/>
-    순서: 연기금등(6000) → 투신(3000) → 사모(3100) → 금융투자(1000) → 기관합계(7050) → 외국인=9000(기타외국인 9001 제외).<br/>
-    순매수금액(억) = <code>net_val</code>/1e8 (양수 빨강). 전역제외·보통주(이름) 필터 적용.
-    <strong>표시: 시총 3,000억 이상</strong>.<br/>
-    <strong>당일상승률</strong>: 기준일 종가 ÷ 전거래일 종가 − 1.
-    <strong>5거래일</strong>: 기준일 종가 ÷ 5거래일 전 종가 − 1.
-    <strong>RS점수</strong>: rs_avg 가중 백분위(0~100).<br/>
-    각 그룹 아래 표: 최근 20거래일 일별 순매수 Top20 (칸=종목명+억, 순위개선 빨강/악화 파랑).<br/>
-    파일: {html.escape(os.path.basename(out_path))}
-  </div>
-  {"".join(sections)}
-{KRX_SORTABLE_TABLE_CSS_JS}
-</body>
-</html>"""
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html_doc)
+        return _INVESTOR_PAGE_CSS + "".join(sections) + KRX_SORTABLE_TABLE_CSS_JS
+
+    page_divs = [
+        _investor_page_html(days=1, side="buy"),
+        _investor_page_html(days=5, side="buy"),
+        _investor_page_html(days=1, side="sell"),
+        _investor_page_html(days=5, side="sell"),
+    ]
+    doc_title = f"투자자별 순매수/순매도 상위 ({ref_d})"
+    _write_toggle_pages_html(
+        out_path,
+        page_divs,
+        doc_title=doc_title,
+        head_title=doc_title,
+        btn_labels=_INVESTOR_BTN_LABELS,
+        page_descs=_INVESTOR_PAGE_DESCS,
+    )
     if not quiet:
         print(f"완료: 투자자 순매수 HTML 저장: {out_path}")
         try:

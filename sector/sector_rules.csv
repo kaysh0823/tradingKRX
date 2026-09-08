@@ -1,0 +1,341 @@
+source,label,major,sub,weight
+krx,전기·전자,전기전자,기타,1
+krx,IT 서비스,IT소프트웨어,기타,1
+krx,화학,화학,기타,1
+krx,기계·장비,기계,기타,1
+krx,제약,제약바이오,기타,1
+krx,일반서비스,서비스,기타,1
+krx,유통,유통소비,기타,1
+krx,운송장비·부품,자동차,기타,1
+krx,금속,철강금속,기타,1
+krx,의료·정밀기기,의료기기,기타,1
+krx,음식료·담배,음식료,기타,1
+krx,기타금융,금융,기타,1
+krx,오락·문화,미디어콘텐츠,기타,1
+krx,건설,건설,기타,1
+krx,섬유·의류,섬유패션,기타,1
+krx,비금속,건자재,기타,1
+krx,금융,금융,기타,1
+krx,운송·창고,운송,기타,1
+krx,증권,금융,증권,1
+krx,종이·목재,제지목재,기타,1
+krx,기타제조,기타,기타,1
+krx,통신,통신,기타,1
+krx,보험,금융,보험,1
+krx,전기·가스,유틸리티,기타,1
+krx,부동산,부동산리츠,기타,1
+krx,"농업, 임업 및 어업",농수산,기타,1
+krx,은행,금융,은행,1
+krx,전기·가스·수도,유틸리티,기타,1
+krx,출판·매체복제,미디어콘텐츠,출판,1
+naver_industry,제약,제약바이오,제약,2
+naver_industry,반도체와반도체장비,반도체,종합,2
+naver_industry,자동차부품,자동차,부품,2
+naver_industry,화학,화학,종합,2
+naver_industry,IT서비스,IT소프트웨어,SI,2
+naver_industry,전자장비와기기,전기전자,전자부품,2
+naver_industry,기계,기계,산업기계,2
+naver_industry,건강관리장비와용품,의료기기,장비,2
+naver_industry,식품,음식료,식품,2
+naver_industry,"섬유,의류,신발,호화품",섬유패션,의류,2
+naver_industry,창업투자,금융,창투,2
+naver_industry,건설,건설,종합건설,2
+naver_industry,소프트웨어,IT소프트웨어,소프트웨어,2
+naver_industry,디스플레이장비및부품,디스플레이,장비부품,2
+naver_industry,전기제품,전기전자,전기제품,2
+naver_industry,화장품,화장품,브랜드,2
+naver_industry,생물공학,제약바이오,바이오텍,2
+naver_industry,핸드셋,전기전자,휴대폰,2
+naver_industry,방송과엔터테인먼트,미디어콘텐츠,방송,2
+naver_industry,통신장비,통신,장비,2
+naver_industry,철강,철강금속,철강,2
+naver_industry,건축자재,건자재,자재,2
+naver_industry,비철금속,철강금속,비철,2
+naver_industry,생명과학도구및서비스,제약바이오,연구서비스,2
+naver_industry,증권,금융,증권,2
+naver_industry,전기장비,전기전자,전기장비,2
+naver_industry,우주항공과국방,방산우주,방산,2
+naver_industry,게임엔터테인먼트,게임,게임,2
+naver_industry,에너지장비및서비스,정유에너지,장비서비스,2
+naver_industry,상업서비스와공급품,서비스,기업서비스,2
+naver_industry,부동산,부동산리츠,부동산,2
+naver_industry,건강관리업체및서비스,의료기기,헬스케어서비스,2
+naver_industry,조선,조선,조선,2
+naver_industry,포장재,화학,포장재,2
+naver_industry,교육서비스,교육,교육,2
+naver_industry,컴퓨터와주변기기,IT소프트웨어,하드웨어,2
+naver_industry,가정용기기와용품,유통소비,가전생활,2
+naver_industry,복합기업,지주,복합,2
+naver_industry,"호텔,레스토랑,레저",여행레저,호텔레저,2
+naver_industry,전자제품,전기전자,전자제품,2
+naver_industry,석유와가스,정유에너지,석유가스,2
+naver_industry,광고,미디어콘텐츠,광고,2
+naver_industry,양방향미디어와서비스,IT소프트웨어,인터넷,2
+naver_industry,음료,음식료,음료,2
+naver_industry,건강관리기술,의료기기,헬스케어IT,2
+naver_industry,종이와목재,제지목재,제지,2
+naver_industry,판매업체,유통소비,판매,2
+naver_industry,항공화물운송과물류,운송,물류,2
+naver_industry,건축제품,건자재,제품,2
+naver_industry,레저용장비와제품,여행레저,레저용품,2
+naver_industry,자동차,자동차,완성차,2
+naver_industry,백화점과일반상점,유통소비,백화점,2
+naver_industry,가스유틸리티,유틸리티,가스,2
+naver_industry,가정용품,유통소비,생활용품,2
+naver_industry,손해보험,금융,손해보험,2
+naver_industry,해운사,운송,해운,2
+naver_industry,가구,유통소비,가구,2
+naver_industry,은행,금융,은행,2
+naver_industry,운송인프라,운송,인프라,2
+naver_industry,도로와철도운송,운송,육상,2
+naver_industry,출판,미디어콘텐츠,출판,2
+naver_industry,식품과기본식료품소매,유통소비,식품소매,2
+naver_industry,항공사,운송,항공,2
+naver_industry,인터넷과카탈로그소매,유통소비,이커머스,2
+naver_industry,무역회사와판매업체,유통소비,무역,2
+naver_industry,기타금융,금융,기타금융,2
+naver_industry,디스플레이패널,디스플레이,패널,2
+naver_industry,전문소매,유통소비,전문소매,2
+naver_industry,전기유틸리티,유틸리티,전력,2
+naver_industry,생명보험,금융,생명보험,2
+naver_industry,무선통신서비스,통신,서비스,2
+naver_industry,다각화된통신서비스,통신,서비스,2
+naver_industry,복합유틸리티,유틸리티,복합,2
+naver_industry,담배,음식료,담배,2
+naver_industry,다각화된소비자서비스,서비스,소비자서비스,2
+naver_industry,카드,금융,카드,2
+naver_industry,사무용전자제품,전기전자,사무기기,2
+naver_industry,문구류,유통소비,문구,2
+naver_theme,반도체 장비,반도체,장비,3
+naver_theme,반도체 재료/부품,반도체,소재,3
+naver_theme,시스템반도체,반도체,설계,3
+naver_theme,HBM(고대역폭메모리),반도체,메모리,3
+naver_theme,3D 낸드(NAND),반도체,메모리,3
+naver_theme,전력반도체,반도체,전력반도체,3
+naver_theme,반도체 기판(FC-BGA/PCB/MLB 등),반도체,기판,3
+naver_theme,유리 기판,반도체,기판,3
+naver_theme,뉴로모픽 반도체,반도체,설계,3
+naver_theme,CXL(컴퓨트익스프레스링크),반도체,설계,3
+naver_theme,소캠(SOCAMM),반도체,메모리,3
+naver_theme,온디바이스 AI,반도체,설계,3
+naver_theme,냉각시스템(액침냉각 등),반도체,장비,3
+naver_theme,PCB(FPCB 등),전기전자,PCB,3
+naver_theme,MLCC(적층세라믹콘덴서),전기전자,수동부품,3
+naver_theme,페라이트,전기전자,수동부품,3
+naver_theme,카메라모듈/부품,전기전자,카메라모듈,3
+naver_theme,휴대폰부품,전기전자,휴대폰부품,3
+naver_theme,스마트폰,전기전자,휴대폰,3
+naver_theme,갤럭시 부품주,전기전자,휴대폰부품,3
+naver_theme,폴더블폰,전기전자,휴대폰부품,3
+naver_theme,무선충전기술,전기전자,전자부품,3
+naver_theme,전자파,전기전자,전자부품,3
+naver_theme,터치패널(스마트폰/태블릿PC 등),디스플레이,부품,3
+naver_theme,OLED(유기 발광 다이오드),디스플레이,OLED,3
+naver_theme,플렉서블 디스플레이,디스플레이,OLED,3
+naver_theme,마이크로 LED,디스플레이,LED,3
+naver_theme,LED,디스플레이,LED,3
+naver_theme,LED장비,디스플레이,장비,3
+naver_theme,2차전지,2차전지,종합,3
+naver_theme,2차전지(소재/부품),2차전지,소재,3
+naver_theme,2차전지(장비),2차전지,장비,3
+naver_theme,2차전지(전고체),2차전지,차세대,3
+naver_theme,2차전지(LFP/리튬인산철),2차전지,소재,3
+naver_theme,2차전지(나트륨이온),2차전지,차세대,3
+naver_theme,2차전지(생산),2차전지,셀,3
+naver_theme,폐배터리,2차전지,리사이클,3
+naver_theme,리튬,2차전지,소재,3
+naver_theme,니켈,2차전지,소재,3
+naver_theme,전력저장장치(ESS),2차전지,ESS,3
+naver_theme,전기차 화재 방지(배터리 열폭주 등),2차전지,부품,3
+naver_theme,자동차부품,자동차,부품,3
+naver_theme,전기차,자동차,전기차,3
+naver_theme,전기차(충전소/충전기),자동차,충전인프라,3
+naver_theme,자율주행차,자동차,전장ADAS,3
+naver_theme,스마트카(SMART CAR),자동차,전장ADAS,3
+naver_theme,타이어,자동차,타이어,3
+naver_theme,렌터카,자동차,서비스,3
+naver_theme,자전거,유통소비,레저용품,3
+naver_theme,전기자전거,유통소비,레저용품,3
+naver_theme,조선,조선,조선소,3
+naver_theme,조선기자재,조선,기자재,3
+naver_theme,해운,운송,해운,3
+naver_theme,종합 물류,운송,물류,3
+naver_theme,콜드체인(저온 유통),운송,물류,3
+naver_theme,철도,운송,철도,3
+naver_theme,항공/저가 항공사(LCC),운송,항공,3
+naver_theme,항공기부품,방산우주,항공부품,3
+naver_theme,방위산업/전쟁 및 테러,방산우주,방산,3
+naver_theme,우주항공산업(누리호/인공위성 등),방산우주,우주위성,3
+naver_theme,드론(Drone),방산우주,무인기,3
+naver_theme,UAM(도심항공모빌리티),방산우주,UAM,3
+naver_theme,원자력발전,원전전력,원전,3
+naver_theme,원자력발전소 해체,원전전력,원전해체,3
+naver_theme,핵융합에너지,원전전력,핵융합,3
+naver_theme,전력설비,원전전력,전력설비,3
+naver_theme,스마트그리드(지능형전력망),원전전력,전력설비,3
+naver_theme,전선,원전전력,전선,3
+naver_theme,태양광에너지,신재생,태양광,3
+naver_theme,우주태양광(페로브스카이트 등),신재생,태양광,3
+naver_theme,풍력에너지,신재생,풍력,3
+naver_theme,수소에너지(수소차/연료전지 등),신재생,수소,3
+naver_theme,고체산화물 연료전지(SOFC),신재생,수소,3
+naver_theme,온실가스(탄소배출권)/탄소 포집·활용·저장(CCUS),환경,탄소,3
+naver_theme,폐기물처리,환경,폐기물,3
+naver_theme,탈 플라스틱(친환경/생분해성 등),환경,친환경소재,3
+naver_theme,수자원(양적/질적 개선),환경,수처리,3
+naver_theme,황사/미세먼지,환경,대기,3
+naver_theme,공기청정기,유통소비,가전생활,3
+naver_theme,제습기,유통소비,가전생활,3
+naver_theme,밥솥,유통소비,가전생활,3
+naver_theme,로봇(산업용/협동로봇 등),로봇,산업로봇,3
+naver_theme,지능형로봇/인공지능(AI),로봇,AI로봇,3
+naver_theme,피지컬 AI/휴머노이드 로봇,로봇,휴머노이드,3
+naver_theme,스마트팩토리(스마트공장),로봇,FA,3
+naver_theme,공작기계,기계,공작기계,3
+naver_theme,건설기계,기계,건설기계,3
+naver_theme,3D 프린터,기계,정밀기계,3
+naver_theme,피팅(관이음쇠)/밸브,기계,부품,3
+naver_theme,철강 주요종목,철강금속,철강,3
+naver_theme,철강 중소형,철강금속,철강,3
+naver_theme,강관업체(Steel pipe),철강금속,강관,3
+naver_theme,비철금속,철강금속,비철,3
+naver_theme,희귀금속(희토류 등),철강금속,희소금속,3
+naver_theme,귀금속(금/은),철강금속,귀금속,3
+naver_theme,그래핀,화학,신소재,3
+naver_theme,탄소나노튜브(CNT),화학,신소재,3
+naver_theme,맥신(MXene),화학,신소재,3
+naver_theme,초전도체,화학,신소재,3
+naver_theme,석유화학,화학,석유화학,3
+naver_theme,정유,정유에너지,정유,3
+naver_theme,LNG(액화천연가스),정유에너지,LNG,3
+naver_theme,LPG(액화석유가스),정유에너지,LPG,3
+naver_theme,도시가스,유틸리티,가스,3
+naver_theme,주유소,정유에너지,유통,3
+naver_theme,셰일가스(Shale Gas),정유에너지,석유가스,3
+naver_theme,자원개발,정유에너지,자원개발,3
+naver_theme,윤활유,화학,정밀화학,3
+naver_theme,페인트,화학,정밀화학,3
+naver_theme,비료,화학,정밀화학,3
+naver_theme,요소수,화학,정밀화학,3
+naver_theme,화학섬유,화학,화섬,3
+naver_theme,시멘트/레미콘,건자재,시멘트,3
+naver_theme,아스콘(아스팔트 콘크리트),건자재,아스콘,3
+naver_theme,골판지 제조,제지목재,골판지,3
+naver_theme,제지,제지목재,제지,3
+naver_theme,조림사업,제지목재,임업,3
+naver_theme,모듈러주택,건설,모듈러,3
+naver_theme,리모델링/인테리어,건설,인테리어,3
+naver_theme,건설 중소형,건설,종합건설,3
+naver_theme,해저터널(지하화/지하도로 등),건설,토목,3
+naver_theme,GTX(수도권 광역급행철도),건설,토목,3
+naver_theme,네옴시티,건설,해외건설,3
+naver_theme,전후 재건(우크라/중동 전쟁 등),건설,해외건설,3
+naver_theme,우크라이나 재건,건설,해외건설,3
+naver_theme,리츠(REITs),부동산리츠,리츠,3
+naver_theme,부동산 보유 자산주,부동산리츠,자산주,3
+naver_theme,바이오텍(biotechnology),제약바이오,바이오텍,3
+naver_theme,제약업체,제약바이오,제약,3
+naver_theme,바이오시밀러(복제 바이오의약품),제약바이오,바이오시밀러,3
+naver_theme,유전자 치료제/분석,제약바이오,유전자치료,3
+naver_theme,줄기세포,제약바이오,세포치료,3
+naver_theme,제대혈,제약바이오,세포치료,3
+naver_theme,오가노이드,제약바이오,세포치료,3
+naver_theme,면역항암제,제약바이오,항암,3
+naver_theme,비만치료제,제약바이오,대사질환,3
+naver_theme,치매,제약바이오,중추신경,3
+naver_theme,탈모 치료,제약바이오,기타신약,3
+naver_theme,마이크로바이옴,제약바이오,마이크로바이옴,3
+naver_theme,mRNA(메신저 리보핵산),제약바이오,백신,3
+naver_theme,보톡스(보툴리눔톡신),제약바이오,보툴리눔,3
+naver_theme,건강기능식품,음식료,건강기능식품,3
+naver_theme,의료기기,의료기기,장비,3
+naver_theme,미용기기,화장품,미용기기,3
+naver_theme,의료AI,의료기기,헬스케어IT,3
+naver_theme,원격진료/비대면진료(U-Healthcare),의료기기,헬스케어IT,3
+naver_theme,치아 치료(임플란트 등),의료기기,임플란트,3
+naver_theme,화장품,화장품,브랜드,3
+naver_theme,패션/의류,섬유패션,의류,3
+naver_theme,음식료업종,음식료,식품,3
+naver_theme,"주류업(주정, 에탄올 등)",음식료,주류,3
+naver_theme,사료,음식료,사료,3
+naver_theme,육계,농수산,축산,3
+naver_theme,수산,농수산,수산,3
+naver_theme,농업,농수산,농업,3
+naver_theme,콩/대두,농수산,농업,3
+naver_theme,김밥(냉동김밥 등),음식료,식품,3
+naver_theme,소매유통,유통소비,판매,3
+naver_theme,편의점,유통소비,편의점,3
+naver_theme,백화점,유통소비,백화점,3
+naver_theme,홈쇼핑,유통소비,홈쇼핑,3
+naver_theme,면세점,유통소비,면세점,3
+naver_theme,종합상사,유통소비,무역,3
+naver_theme,캐릭터상품,유통소비,캐릭터,3
+naver_theme,키오스크(KIOSK),IT소프트웨어,하드웨어,3
+naver_theme,게임,게임,게임,3
+naver_theme,모바일게임(스마트폰),게임,모바일게임,3
+naver_theme,웹툰,미디어콘텐츠,웹툰,3
+naver_theme,영상콘텐츠,미디어콘텐츠,영상,3
+naver_theme,영화,미디어콘텐츠,영화,3
+naver_theme,음원/음반,미디어콘텐츠,음악,3
+naver_theme,엔터테인먼트,미디어콘텐츠,엔터,3
+naver_theme,미디어(방송/신문),미디어콘텐츠,방송,3
+naver_theme,광고,미디어콘텐츠,광고,3
+naver_theme,SNS(소셜네트워크서비스),IT소프트웨어,인터넷,3
+naver_theme,클라우드 컴퓨팅,IT소프트웨어,클라우드,3
+naver_theme,SI(시스템통합),IT소프트웨어,SI,3
+naver_theme,NI(네트워크통합),IT소프트웨어,SI,3
+naver_theme,보안주(정보),IT소프트웨어,정보보안,3
+naver_theme,보안주(물리),IT소프트웨어,물리보안,3
+naver_theme,CCTV＆DVR,IT소프트웨어,물리보안,3
+naver_theme,바이오인식(생체인식),IT소프트웨어,정보보안,3
+naver_theme,AI 챗봇(챗GPT 등),IT소프트웨어,AI,3
+naver_theme,딥페이크(deepfake),IT소프트웨어,AI,3
+naver_theme,음성인식,IT소프트웨어,AI,3
+naver_theme,양자암호/양자컴퓨팅,IT소프트웨어,양자,3
+naver_theme,블록체인,IT소프트웨어,블록체인,3
+naver_theme,가상화폐(비트코인 등),IT소프트웨어,블록체인,3
+naver_theme,NFT(대체불가토큰),IT소프트웨어,블록체인,3
+naver_theme,STO(토큰증권 발행),금융,토큰증권,3
+naver_theme,스테이블코인,금융,토큰증권,3
+naver_theme,핀테크(FinTech),금융,핀테크,3
+naver_theme,전자결제(전자화폐),금융,결제,3
+naver_theme,삼성페이,금융,결제,3
+naver_theme,애플페이,금융,결제,3
+naver_theme,인터넷은행,금융,인터넷은행,3
+naver_theme,마이데이터,금융,핀테크,3
+naver_theme,화폐/금융자동화기기(디지털화폐 등),금융,금융기기,3
+naver_theme,은행,금융,은행,3
+naver_theme,증권,금융,증권,3
+naver_theme,손해보험,금융,손해보험,3
+naver_theme,생명보험,금융,생명보험,3
+naver_theme,창투사,금융,창투,3
+naver_theme,지주사,지주,지주,3
+naver_theme,기업인수목적회사(SPAC),스팩,스팩,3
+naver_theme,메타버스(Metaverse),IT소프트웨어,메타버스,3
+naver_theme,가상현실(VR),IT소프트웨어,메타버스,3
+naver_theme,증강현실(AR),IT소프트웨어,메타버스,3
+naver_theme,사물인터넷,IT소프트웨어,IoT,3
+naver_theme,RFID(NFC 등),IT소프트웨어,IoT,3
+naver_theme,스마트홈(홈네트워크),IT소프트웨어,IoT,3
+naver_theme,재택근무/스마트워크,IT소프트웨어,소프트웨어,3
+naver_theme,모바일솔루션(스마트폰),IT소프트웨어,소프트웨어,3
+naver_theme,모바일콘텐츠(스마트폰/태블릿PC),IT소프트웨어,소프트웨어,3
+naver_theme,유심(USIM),통신,부품,3
+naver_theme,5G(5세대 이동통신),통신,장비,3
+naver_theme,통신장비,통신,장비,3
+naver_theme,광통신(광케이블/광섬유 등),통신,광통신,3
+naver_theme,통신,통신,서비스,3
+naver_theme,교육/온라인 교육,교육,교육,3
+naver_theme,여행,여행레저,여행,3
+naver_theme,호텔/리조트,여행레저,호텔레저,3
+naver_theme,카지노,여행레저,카지노,3
+naver_theme,테마파크,여행레저,테마파크,3
+naver_theme,골프,여행레저,골프,3
+naver_theme,"스포츠행사 수혜(올림픽, 월드컵 등)",여행레저,스포츠,3
+naver_theme,지역화폐,금융,결제,3
+naver_theme,마리화나(대마),제약바이오,기타신약,3
+naver_theme,"구충제(펜벤다졸, 이버멕틴 등)",제약바이오,기타신약,3
+naver_theme,마스크,의료기기,소모품,3
+naver_theme,"백신/진단시약/방역(신종플루, AI 등)",제약바이오,백신,3
+naver_theme,코로나19(진단키트),의료기기,진단,3
+naver_theme,4차산업 수혜주,IT소프트웨어,AI,3

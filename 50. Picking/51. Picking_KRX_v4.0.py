@@ -3840,9 +3840,55 @@ def _screening_summary_themes(engine, tickers):
         df = pd.read_sql_query(q, con=engine, params=tuple(ut))
         for _, r in df.iterrows():
             out[str(r["ticker"]).zfill(6)] = str(r["theme_str"] or "")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ _screening_summary_themes 실패: {type(e).__name__}: {e}")
     return out
+
+
+def _screening_summary_sectors(engine, tickers):
+    """v_ticker_sector_wide 기준 sector1/sector2. 키는 6자리 ticker."""
+    out = {str(t).zfill(6): ("", "") for t in tickers}
+    if engine is None or not tickers:
+        return out
+    ut = sorted({str(t).zfill(6) for t in tickers})
+    try:
+        _ph = ",".join(["%s"] * len(ut))
+        q = f"""
+            SELECT ticker, sector1, sector2
+            FROM v_ticker_sector_wide
+            WHERE ticker IN ({_ph})
+        """
+        df = pd.read_sql_query(q, con=engine, params=tuple(ut))
+        for _, r in df.iterrows():
+            out[str(r["ticker"]).zfill(6)] = (
+                str(r["sector1"] or ""),
+                str(r["sector2"] or ""),
+            )
+    except Exception as e:
+        print(f"⚠️ _screening_summary_sectors 실패: {type(e).__name__}: {e}")
+    return out
+
+
+def _sector_tilt_counts(sector_map, tickers):
+    """sector1 기준 선정 종목 수. 반환: (total, [(label, n, pct), ...]) 내림차순, 미분류 마지막."""
+    from collections import Counter
+
+    ut = sorted({str(t).zfill(6) for t in tickers})
+    total = len(ut)
+    cnt = Counter()
+    for tk in ut:
+        s1, _ = sector_map.get(tk, ("", ""))
+        s1 = str(s1 or "").strip()
+        cnt[s1 if s1 else "(미분류)"] += 1
+    known = [(k, n) for k, n in cnt.items() if k != "(미분류)"]
+    known.sort(key=lambda x: (-x[1], x[0]))
+    rows = [
+        (lab, n, (100.0 * n / total) if total else 0.0) for lab, n in known
+    ]
+    if "(미분류)" in cnt:
+        n = cnt["(미분류)"]
+        rows.append(("(미분류)", n, (100.0 * n / total) if total else 0.0))
+    return total, rows
 
 
 def _screening_summary_mcap_tv_shares(engine, tickers):
@@ -3988,6 +4034,7 @@ def export_screening_summary_html(
         tickers = selected_df["ticker"].astype(str).unique().tolist()
         energy_map = _energy_ratio_tradingkis_style(engine, tickers)
         theme_map = _screening_summary_themes(engine, tickers)
+        sector_map = _screening_summary_sectors(engine, tickers)
         mcap_map, mcap_share_map, tv_share_map = _screening_summary_mcap_tv_shares(engine, tickers)
         rows = []
         for _, r in selected_df.iterrows():
@@ -3996,6 +4043,11 @@ def export_screening_summary_html(
             tkz = tk.zfill(6)
             name = r.get("company", "")
             th = theme_map.get(tkz, "")
+            s1, s2 = sector_map.get(tkz, ("", ""))
+            if s1 and s2:
+                sec_disp = f"{s1} · {s2}"
+            else:
+                sec_disp = s1 or s2 or ""
             mc_raw = mcap_map.get(tkz, np.nan)
             # 표시: 시총 ≥ DISPLAY_MCAP_MIN (스크리닝 유니버스와 동일)
             if not (np.isfinite(mc_raw) and float(mc_raw) >= DISPLAY_MCAP_MIN):
@@ -4015,6 +4067,7 @@ def export_screening_summary_html(
                         "스크리닝명": scr,
                         "ticker": tk,
                         "종목명": name,
+                        "섹터": sec_disp,
                         "테마명": th,
                         "현재가": "",
                         "sma5위": "",
@@ -4039,6 +4092,7 @@ def export_screening_summary_html(
                         "_sort_sn": scr or "",
                         "_sort_tk": tkz,
                         "_sort_nm": str(name) if name is not None else "",
+                        "_sort_sec": sec_disp or "",
                         "_sort_th": th or "",
                         "_sort_close": None,
                         "_sort_s5": "",
@@ -4120,6 +4174,7 @@ def export_screening_summary_html(
                     "스크리닝명": scr_name,
                     "ticker": tk,
                     "종목명": name,
+                    "섹터": sec_disp,
                     "테마명": th,
                     "현재가": f"{close:,.0f}" if np.isfinite(close) else "",
                     "sma5위": s5,
@@ -4144,6 +4199,7 @@ def export_screening_summary_html(
                     "_sort_sn": scr_name or "",
                     "_sort_tk": tkz,
                     "_sort_nm": str(name) if name is not None else "",
+                    "_sort_sec": sec_disp or "",
                     "_sort_th": th or "",
                     "_sort_close": float(close) if np.isfinite(close) else None,
                     "_sort_s5": s5,
@@ -4173,6 +4229,7 @@ def export_screening_summary_html(
             "스크리닝명",
             "ticker",
             "종목명",
+            "섹터",
             "테마명",
             "현재가",
             "sma5위",
@@ -4199,6 +4256,7 @@ def export_screening_summary_html(
             "_sort_sn",
             "_sort_tk",
             "_sort_nm",
+            "_sort_sec",
             "_sort_th",
             "_sort_close",
             "_sort_s5",
@@ -4222,6 +4280,7 @@ def export_screening_summary_html(
             "_sort_frgn",
         ]
         sort_types = [
+            "str",
             "str",
             "str",
             "str",
@@ -4251,6 +4310,7 @@ def export_screening_summary_html(
             "스크리닝명",
             "ticker",
             "종목명",
+            "섹터",
             "테마명",
             "현재가",
             "sma5위 여부",
@@ -4284,14 +4344,14 @@ def export_screening_summary_html(
             return f' data-sort-type="str" data-sort="{esc}"'
 
         th_titles = {
-            10: "최근 120거래일 중 종가가 시가 대비 +10% 이상 상승한 날의 비중(%)",
-            12: "전체 보통주 시가총액 합 대비 해당 종목 시가총액 비중(%)",
-            13: "전체 보통주 당일 거래대금 합 대비 해당 종목 거래대금 비중(%)",
-            19: "기관(연기금+투신+사모) 순매수금액 OSC. 기관합계(7050)가 아님.",
-            20: "국민연금등(6000) 순매수금액 OSC",
-            21: "투신(3000) 순매수금액 OSC",
-            22: "사모(3100) 순매수금액 OSC",
-            23: "외국인(9000) 순매수금액 OSC",
+            11: "최근 120거래일 중 종가가 시가 대비 +10% 이상 상승한 날의 비중(%)",
+            13: "전체 보통주 시가총액 합 대비 해당 종목 시가총액 비중(%)",
+            14: "전체 보통주 당일 거래대금 합 대비 해당 종목 거래대금 비중(%)",
+            20: "기관(연기금+투신+사모) 순매수금액 OSC. 기관합계(7050)가 아님.",
+            21: "국민연금등(6000) 순매수금액 OSC",
+            22: "투신(3000) 순매수금액 OSC",
+            23: "사모(3100) 순매수금액 OSC",
+            24: "외국인(9000) 순매수금액 OSC",
         }
         ths = "".join(
             f'<th class="sortable" data-col="{i}" title="{html_module.escape(th_titles.get(i, "클릭: 정렬"))}">'
@@ -4354,6 +4414,21 @@ def export_screening_summary_html(
 })();
 </script>
 """
+        _tilt_total, _tilt_rows = _sector_tilt_counts(sector_map, tickers)
+        _tilt_show = [r for r in _tilt_rows if r[0] != "(미분류)"][:15]
+        _tilt_show += [r for r in _tilt_rows if r[0] == "(미분류)"]
+        _tilt_lis = "".join(
+            f"<li>{html_module.escape(lab)}&nbsp;&nbsp;{n}건&nbsp;&nbsp;({pct:.1f}%)</li>"
+            for lab, n, pct in _tilt_show
+        )
+        sector_tilt_html = f"""
+<h3 style="font-family:Segoe UI,Malgun Gothic,sans-serif;margin:12px 0 6px">섹터 쏠림 (sector1 기준)</h3>
+<p style="font-family:Segoe UI,Malgun Gothic,sans-serif;font-size:12px;color:#555;margin:0 0 8px">
+선정 종목 {_tilt_total}개 기준, sector1 상위 15개</p>
+<ul style="font-family:Segoe UI,Malgun Gothic,sans-serif;font-size:13px;line-height:1.55;margin:0 0 16px;padding-left:1.2rem">
+{_tilt_lis}
+</ul>
+"""
         body = f"""
 <h2 style="font-family:Segoe UI,Malgun Gothic,sans-serif">스크리닝 요약 ({html_module.escape(folder_name)})</h2>
 <p style="font-family:Segoe UI,Malgun Gothic,sans-serif">행 수: {n_rows}.
@@ -4361,6 +4436,7 @@ def export_screening_summary_html(
 기관OSC는 연기금+투신+사모 순매수금액 OSC(누적 {INVESTOR_OSC_CUM_DAYS}일)이며 기관합계(7050)가 아닙니다.
 외국인OSC는 9000 순매수금액 OSC입니다.
 외국인 지분율(%) = KRX 12023 외국인보유량 기준.</p>
+{sector_tilt_html}
 <table id="summaryTable" class="s">
 <thead><tr>{ths}</tr></thead>
 <tbody>{"".join(trs)}</tbody>
@@ -4380,18 +4456,18 @@ table.s th.sortable {{ cursor:pointer; user-select:none; }}
 table.s th.sortable:hover {{ background:#dde8f2; }}
 table.s th.sort-asc::after {{ content:" \\25B2"; font-size:0.65em; opacity:0.85; }}
 table.s th.sort-desc::after {{ content:" \\25BC"; font-size:0.65em; opacity:0.85; }}
-table.s td:nth-child(5),
-table.s td:nth-child(9),
+table.s td:nth-child(6),
 table.s td:nth-child(10),
 table.s td:nth-child(11),
 table.s td:nth-child(12),
 table.s td:nth-child(13),
 table.s td:nth-child(14),
-table.s td:nth-child(18) {{ text-align:right; }}
-table.s td:nth-child(6), table.s td:nth-child(7), table.s td:nth-child(8),
-table.s td:nth-child(15), table.s td:nth-child(16), table.s td:nth-child(17),
-table.s td:nth-child(19), table.s td:nth-child(20), table.s td:nth-child(21),
-table.s td:nth-child(22), table.s td:nth-child(23), table.s td:nth-child(24) {{ text-align:center; }}
+table.s td:nth-child(15),
+table.s td:nth-child(19) {{ text-align:right; }}
+table.s td:nth-child(7), table.s td:nth-child(8), table.s td:nth-child(9),
+table.s td:nth-child(16), table.s td:nth-child(17), table.s td:nth-child(18),
+table.s td:nth-child(20), table.s td:nth-child(21), table.s td:nth-child(22),
+table.s td:nth-child(23), table.s td:nth-child(24), table.s td:nth-child(25) {{ text-align:center; }}
 table.s tbody tr:nth-child(even) {{ background:#fafafa; }}
 </style></head><body>
 {body}
@@ -4785,6 +4861,17 @@ def run_main(do_summary=True, do_charts=False):
 
     screening_time = time.time() - screening_start_time
     print(f"⏱️ 스크리닝 완료: {screening_time:.2f}초")
+
+    if selected_df is not None and len(selected_df) > 0:
+        _sec_map = _screening_summary_sectors(
+            engine, selected_df["ticker"].astype(str).tolist()
+        )
+        _tilt_n, _tilt_rows = _sector_tilt_counts(
+            _sec_map, selected_df["ticker"].astype(str).tolist()
+        )
+        print("📊 섹터 쏠림 Top 10 (sector1)")
+        for _lab, _n, _pct in _tilt_rows[:10]:
+            print(f"   · {_lab}: {_n}건 ({_pct:.1f}%)")
 
     # 디버깅 정보 출력
     print("\n" + "=" * 80)
