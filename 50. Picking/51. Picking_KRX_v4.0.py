@@ -165,6 +165,7 @@ risk = 0.005
 
 # 스크리닝·요약표 표시 유니버스 시총 하한 (naverPub / 21 리포트 표시와 동일)
 DISPLAY_MCAP_MIN = 300_000_000_000  # 3,000억
+SECTOR_CONCENTRATION_WARN = 0.15  # 대분류 1위 비중 경고 임계
 
 # 성능 최적화 설정
 MAX_WORKERS_DATA_LOAD = 10  # 데이터 로딩용 워커 수
@@ -3869,8 +3870,23 @@ def _screening_summary_sectors(engine, tickers):
     return out
 
 
-def _sector_tilt_counts(sector_map, tickers):
-    """sector1 기준 선정 종목 수. 반환: (total, [(label, n, pct), ...]) 내림차순, 미분류 마지막."""
+def _sector1_major_label(sector1: str) -> str:
+    """sector1 → 대분류. '_' 첫 번째 앞부분. 빈 값이면 '(미분류)'."""
+    s1 = str(sector1 or "").strip()
+    if not s1:
+        return "(미분류)"
+    return s1.split("_", 1)[0]
+
+
+def _sector_tilt_counts(sector_map, tickers, *, level: str = "detail"):
+    """선정 종목 섹터 쏠림 집계.
+
+    level:
+      - 'detail': sector1 전체 키
+      - 'major': sector1 의 '_' 첫 토큰(대분류)
+    반환: (total, [(label, n, pct), ...]) 내림차순, '(미분류)' 마지막.
+    pct 는 0~100.
+    """
     from collections import Counter
 
     ut = sorted({str(t).zfill(6) for t in tickers})
@@ -3878,8 +3894,12 @@ def _sector_tilt_counts(sector_map, tickers):
     cnt = Counter()
     for tk in ut:
         s1, _ = sector_map.get(tk, ("", ""))
-        s1 = str(s1 or "").strip()
-        cnt[s1 if s1 else "(미분류)"] += 1
+        if level == "major":
+            lab = _sector1_major_label(s1)
+        else:
+            s1 = str(s1 or "").strip()
+            lab = s1 if s1 else "(미분류)"
+        cnt[lab] += 1
     known = [(k, n) for k, n in cnt.items() if k != "(미분류)"]
     known.sort(key=lambda x: (-x[1], x[0]))
     rows = [
@@ -3889,6 +3909,22 @@ def _sector_tilt_counts(sector_map, tickers):
         n = cnt["(미분류)"]
         rows.append(("(미분류)", n, (100.0 * n / total) if total else 0.0))
     return total, rows
+
+
+def _sector_tilt_line(lab: str, n: int, pct: float, *, warn: bool = False) -> str:
+    """콘솔/HTML 공통 한 줄. warn 이면 ' ⚠️ 쏠림' 접미."""
+    suffix = "  ⚠️ 쏠림" if warn else ""
+    return f"{lab}: {n}건 ({pct:.1f}%){suffix}"
+
+
+def _sector_tilt_should_warn(rows, idx: int) -> bool:
+    """대분류 1위(미분류 제외 첫 행) 비중이 임계 초과 시 True."""
+    if idx != 0 or not rows:
+        return False
+    lab, _n, pct = rows[0]
+    if lab == "(미분류)":
+        return False
+    return (pct / 100.0) > SECTOR_CONCENTRATION_WARN
 
 
 def _screening_summary_mcap_tv_shares(engine, tickers):
@@ -4414,19 +4450,37 @@ def export_screening_summary_html(
 })();
 </script>
 """
-        _tilt_total, _tilt_rows = _sector_tilt_counts(sector_map, tickers)
-        _tilt_show = [r for r in _tilt_rows if r[0] != "(미분류)"][:15]
-        _tilt_show += [r for r in _tilt_rows if r[0] == "(미분류)"]
-        _tilt_lis = "".join(
-            f"<li>{html_module.escape(lab)}&nbsp;&nbsp;{n}건&nbsp;&nbsp;({pct:.1f}%)</li>"
-            for lab, n, pct in _tilt_show
+        _tilt_total, _tilt_major = _sector_tilt_counts(
+            sector_map, tickers, level="major"
         )
+        _tilt_total, _tilt_detail = _sector_tilt_counts(
+            sector_map, tickers, level="detail"
+        )
+
+        def _tilt_ul(rows, top_n: int, *, warn_top1: bool) -> str:
+            show = [r for r in rows if r[0] != "(미분류)"][:top_n]
+            show += [r for r in rows if r[0] == "(미분류)"]
+            items = []
+            for i, (lab, n, pct) in enumerate(show):
+                warn = warn_top1 and _sector_tilt_should_warn(rows, i)
+                line = _sector_tilt_line(lab, n, pct, warn=warn)
+                items.append(f"<li>{html_module.escape(line)}</li>")
+            return "".join(items)
+
+        _major_ul = _tilt_ul(_tilt_major, 15, warn_top1=True)
+        _detail_ul = _tilt_ul(_tilt_detail, 15, warn_top1=False)
         sector_tilt_html = f"""
-<h3 style="font-family:Segoe UI,Malgun Gothic,sans-serif;margin:12px 0 6px">섹터 쏠림 (sector1 기준)</h3>
+<h3 style="font-family:Segoe UI,Malgun Gothic,sans-serif;margin:12px 0 6px">섹터 쏠림 — 대분류</h3>
+<p style="font-family:Segoe UI,Malgun Gothic,sans-serif;font-size:12px;color:#555;margin:0 0 8px">
+선정 종목 {_tilt_total}개 기준, sector1 대분류(첫 '_' 앞) 상위 15개</p>
+<ul style="font-family:Segoe UI,Malgun Gothic,sans-serif;font-size:13px;line-height:1.55;margin:0 0 16px;padding-left:1.2rem">
+{_major_ul}
+</ul>
+<h3 style="font-family:Segoe UI,Malgun Gothic,sans-serif;margin:12px 0 6px">섹터 쏠림 — 세부</h3>
 <p style="font-family:Segoe UI,Malgun Gothic,sans-serif;font-size:12px;color:#555;margin:0 0 8px">
 선정 종목 {_tilt_total}개 기준, sector1 상위 15개</p>
 <ul style="font-family:Segoe UI,Malgun Gothic,sans-serif;font-size:13px;line-height:1.55;margin:0 0 16px;padding-left:1.2rem">
-{_tilt_lis}
+{_detail_ul}
 </ul>
 """
         body = f"""
@@ -4866,12 +4920,16 @@ def run_main(do_summary=True, do_charts=False):
         _sec_map = _screening_summary_sectors(
             engine, selected_df["ticker"].astype(str).tolist()
         )
-        _tilt_n, _tilt_rows = _sector_tilt_counts(
-            _sec_map, selected_df["ticker"].astype(str).tolist()
-        )
-        print("📊 섹터 쏠림 Top 10 (sector1)")
-        for _lab, _n, _pct in _tilt_rows[:10]:
-            print(f"   · {_lab}: {_n}건 ({_pct:.1f}%)")
+        _tk_list = selected_df["ticker"].astype(str).tolist()
+        _maj_n, _maj_rows = _sector_tilt_counts(_sec_map, _tk_list, level="major")
+        _det_n, _det_rows = _sector_tilt_counts(_sec_map, _tk_list, level="detail")
+        print("📊 섹터 쏠림 — 대분류 Top 10")
+        for _i, (_lab, _n, _pct) in enumerate(_maj_rows[:10]):
+            _warn = _sector_tilt_should_warn(_maj_rows, _i)
+            print(f"   · {_sector_tilt_line(_lab, _n, _pct, warn=_warn)}")
+        print("📊 섹터 쏠림 — 세부 Top 10")
+        for _lab, _n, _pct in _det_rows[:10]:
+            print(f"   · {_sector_tilt_line(_lab, _n, _pct)}")
 
     # 디버깅 정보 출력
     print("\n" + "=" * 80)

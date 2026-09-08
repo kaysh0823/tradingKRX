@@ -175,6 +175,9 @@ DEFAULT_OUTPUT_BASE_DIR = r"C:\Users\hachi\OneDrive\01. Trading\picking\KRX"
 # 리포트 표 표시/선정 필터만 시총 ≥ 3,000억
 DISPLAY_MCAP_MIN = 300_000_000_000
 
+RUN_DATE = date.today()  # 실행 시작 시점 고정 — 자정 넘김 대비
+RUN_DATE_STR = RUN_DATE.strftime("%Y-%m-%d")
+
 
 def _filter_display_mcap(df: pd.DataFrame, mcap_col: str = "mcap") -> pd.DataFrame:
     """표시용: 시총 ≥ DISPLAY_MCAP_MIN. 지표 계산·breadth 유니버스에는 쓰지 않는다."""
@@ -324,6 +327,7 @@ def _ensure_krx_analysis_schema(engine) -> None:
             name VARCHAR(256),
             theme_str TEXT,
             market VARCHAR(16),
+            mcap BIGINT NULL,
             rs_rank DOUBLE,
             rs_score DOUBLE,
             tv_rank DOUBLE,
@@ -488,6 +492,7 @@ def _migrate_krx_analysis_tv_rank_prev_columns(conn) -> None:
     """기존 DB: CREATE IF NOT EXISTS는 신규 컬럼을 추가하지 않으므로 ALTER로 보강."""
     specs = (
         ("krx_analysis_mj_top100", "tv_rank_prev", "DOUBLE NULL", "rs_rank"),
+        ("krx_analysis_vol_spread_top100", "mcap", "BIGINT NULL", "market"),
         ("krx_analysis_vol_spread_top100", "tv_rank_prev", "DOUBLE NULL", "drb_avg"),
         ("krx_analysis_vol_spread_top100", "pos_20", "DOUBLE NULL", "tv_rank"),
         ("krx_analysis_vol_spread_top100", "pos_50", "DOUBLE NULL", "pos_20"),
@@ -508,7 +513,10 @@ def _migrate_krx_analysis_tv_rank_prev_columns(conn) -> None:
         ).first()
         if not ex:
             continue
-        conn.execute(text(f"ALTER TABLE `{_tbl}` ADD COLUMN `{_col}` {_typ} AFTER `{_after}`"))
+        conn.execute(
+            text(f"ALTER TABLE `{_tbl}` ADD COLUMN `{_col}` {_typ} AFTER `{_after}`")
+        )
+        print(f"✓ {_tbl}: ADD COLUMN {_col} {_typ}")
 
 
 def _krx_analysis_snapshot_date_columns(conn, table: str) -> list[str]:
@@ -556,7 +564,8 @@ def _save_krx_analysis_table(engine, table: str, df: pd.DataFrame | None, ref_tr
             if k in out.columns and k not in date_cols:
                 out = out.drop(columns=[k], errors="ignore")
         for c in date_cols:
-            out[c] = ref_trade_date
+            # report_date = 리포트 생성일(실행 고정), ref_trade_date = 데이터 기준 거래일
+            out[c] = RUN_DATE if c == "report_date" else ref_trade_date
         # PK (일자, ticker) 등: 동일 ticker 중복 행이 있으면 INSERT 단계에서 1062 발생 (JOIN 중복 등)
         if table == "krx_analysis_mj_tv_rank" and "ticker" in out.columns:
             out = out.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
@@ -1587,7 +1596,7 @@ def _mj_fast_top100_tickers_from_db(engine, quiet: bool = False) -> set[str]:
 
     rows_out: list[dict[str, object]] = []
     out_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-    out_dir = os.path.join(out_base, date.today().strftime("%Y-%m-%d"))
+    out_dir = os.path.join(out_base, RUN_DATE_STR)
     os.makedirs(out_dir, exist_ok=True)
     out_rank = os.path.join(out_dir, "market_judgment_tv_rank.csv")
 
@@ -1774,7 +1783,7 @@ def write_rs_high_list_html(
     신고가여부: D-0 종가 > D-1 말 기준 N일 최고 종가인 경우 최장 N만 표시(200/120/50일 신고가).
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-    out_dir = os.path.join(base, date.today().strftime("%Y-%m-%d"))
+    out_dir = os.path.join(base, RUN_DATE_STR)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "rs_high_list.html")
     out_talent_path = os.path.join(out_dir, "talent_list.html")
@@ -2022,7 +2031,7 @@ def write_rs_high_list_html(
 
     _tickers_all = sorted(set(_tickers) | set_rs_top100_talent)
     output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-    _rank_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
+    _rank_dir = os.path.join(output_base, RUN_DATE_STR)
     tv_rank_path = os.path.join(_rank_dir, "market_judgment_tv_rank.csv")
     tv_rank_map: dict[str, float] = {}
     try:
@@ -2948,7 +2957,7 @@ def write_120d_breakout_list_html(
     - 반환 티커 집합은 신고가 기준(호출부 호환). DB 저장도 신고가만.
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-    out_dir = os.path.join(base, date.today().strftime("%Y-%m-%d"))
+    out_dir = os.path.join(base, RUN_DATE_STR)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "breakout_120d_high_list.html")
 
@@ -3019,7 +3028,7 @@ def write_120d_breakout_list_html(
         ohlcv[c] = pd.to_numeric(ohlcv[c], errors="coerce")
 
     output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-    _rank_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
+    _rank_dir = os.path.join(output_base, RUN_DATE_STR)
     rank_path = os.path.join(_rank_dir, "market_judgment_tv_rank.csv")
     rank_map: dict[str, float] = {}
     cur_map: dict[str, float] = {}
@@ -4376,7 +4385,7 @@ def write_volatility_spread_top100_html(
 
     base = output_dir or os.path.join(
         os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR),
-        date.today().strftime("%Y-%m-%d"),
+        RUN_DATE_STR,
     )
     os.makedirs(base, exist_ok=True)
     out_path = os.path.join(base, "volatility_spread_top100.html")
@@ -6029,7 +6038,7 @@ def run_market_dashboard(
         # ATR 산점도는 후단 스냅 준비 후 9페이지로 붙여 최종 HTML 조립
         # 순서: 1 ADL / 2 CVI / 3 시총가중변동성 / 4 Zweig / 5 SMA비중 / 6 신고가 / 7 ADR / 8 모멘텀 / 9 ATR산점도
         output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-        output_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
+        output_dir = os.path.join(output_base, RUN_DATE_STR)
         os.makedirs(output_dir, exist_ok=True)
         out_path = os.path.join(output_dir, "market_AD_line.html")
         dash_state["path"] = out_path
@@ -6419,7 +6428,7 @@ def run_market_dashboard(
                 pass
 
             output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-            out_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
+            out_dir = os.path.join(output_base, RUN_DATE_STR)
             os.makedirs(out_dir, exist_ok=True)
             out_rank = os.path.join(out_dir, "market_judgment_tv_rank.csv")
 
@@ -7154,7 +7163,7 @@ def run_market_dashboard(
 
         ref_d = pd.to_datetime(snap["last_date"].max())
         output_base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-        out_dir = os.path.join(output_base, date.today().strftime("%Y-%m-%d"))
+        out_dir = os.path.join(output_base, RUN_DATE_STR)
         os.makedirs(out_dir, exist_ok=True)
         out_tv = os.path.join(out_dir, "거래대금.html")
         out_energy = os.path.join(out_dir, "에너지배율.html")
@@ -7494,7 +7503,7 @@ def run_market_dashboard(
 def _announce_krx_reports_from_disk(len_rs: int, len_bo: int) -> None:
     """quiet 1차 저장 직후, 세 리포트 교집합이 없을 때: 콘솔·브라우저만 한 번(재계산 없음)."""
     base = os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-    out_dir = os.path.join(base, date.today().strftime("%Y-%m-%d"))
+    out_dir = os.path.join(base, RUN_DATE_STR)
     p_ad = os.path.join(out_dir, "market_AD_line.html")
     p_tv = os.path.join(out_dir, "거래대금.html")
     p_energy = os.path.join(out_dir, "에너지배율.html")
@@ -7640,7 +7649,7 @@ def write_investor_net_buy_top_html(
     외국인=9000(기타외국인 9001 제외). 전역제외·보통주(이름) 필터.
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
-    out_dir = os.path.join(base, date.today().strftime("%Y-%m-%d"))
+    out_dir = os.path.join(base, RUN_DATE_STR)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "투자자_순매수상위.html")
 
