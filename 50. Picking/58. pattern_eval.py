@@ -62,6 +62,8 @@ EVAL_STEP = 5  # 5거래일마다 평가 → 3년이면 약 150시점
 EVAL_VOLUME_PROFILE = False  # True 면 p41·p42 를 시점별 매물대로 평가
                              # 게이트 통과 슬롯마다 gen_tBand 재계산 → 약 40분 추가
 EVAL_GATES = True  # 게이트 단계별 코호트 성과 측정
+EVAL_SECTOR_NEUTRAL = True
+SECTOR_MIN_MEMBERS = 10  # 구성종목이 이보다 적은 섹터는 시장지수로 폴백
 HORIZONS = (20, 60)
 UNMEASURED_CODES = (
     frozenset() if EVAL_VOLUME_PROFILE else frozenset({"p41", "p42"})
@@ -199,6 +201,63 @@ def _load_index_closes(engine, start_date) -> dict:
         s = s[~s.index.duplicated(keep="last")]
         out[mkt] = s
         print(f"  지수 {tk}({mkt}) {len(s)}봉 [{src}]")
+    return out
+
+
+def _load_ticker_major(engine) -> dict:
+    """ticker → 대분류. v_ticker_sector_primary.sector_key 의 '_' 앞부분."""
+    try:
+        q = "SELECT ticker, sector_key FROM v_ticker_sector_primary"
+        df = pd.read_sql_query(q, con=engine)
+        out = {}
+        for r in df.itertuples(index=False):
+            k = str(r.sector_key or "")
+            if k:
+                out[str(r.ticker).zfill(6)] = k.split("_", 1)[0]
+        return out
+    except Exception as e:
+        print(f"⚠️ _load_ticker_major 실패: {type(e).__name__}: {e}")
+        return {}
+
+
+def _build_sector_index(indicators_data, ticker_major) -> dict:
+    """대분류 → Series(date → 지수레벨). 구성종목 일간수익률 등가중 평균의 누적."""
+    from collections import defaultdict
+
+    rets_by_major = defaultdict(list)
+    for tk, idf in indicators_data.items():
+        maj = ticker_major.get(str(tk).zfill(6)) or ticker_major.get(str(tk))
+        if not maj:
+            continue
+        if idf is None or len(idf) < 2 or "close" not in getattr(idf, "columns", []):
+            continue
+        close = idf["close"].astype(float).copy()
+        close.index = pd.to_datetime(close.index).normalize()
+        close = close[~close.index.duplicated(keep="last")].sort_index()
+        ret = close.pct_change()
+        rets_by_major[maj].append(ret)
+
+    member_n = {m: len(rs) for m, rs in rets_by_major.items()}
+    out = {}
+    excluded = 0
+    for maj, rets in rets_by_major.items():
+        n = len(rets)
+        if n < SECTOR_MIN_MEMBERS:
+            excluded += 1
+            continue
+        panel = pd.concat(rets, axis=1)
+        avg_ret = panel.mean(axis=1, skipna=True).dropna()
+        if avg_ret.empty:
+            excluded += 1
+            continue
+        out[maj] = (1.0 + avg_ret).cumprod()
+
+    print(
+        f"섹터 지수 {len(out)}개 (제외 {excluded}개, 최소 {SECTOR_MIN_MEMBERS}종목)"
+    )
+    for maj, n in sorted(member_n.items(), key=lambda x: -x[1])[:10]:
+        tag = "" if n >= SECTOR_MIN_MEMBERS and maj in out else " (제외)"
+        print(f"   · {maj}: {n}종목{tag}")
     return out
 
 
@@ -344,6 +403,20 @@ mcap_by_ticker = _load_mcap_lookup(engine, list(indicators_data.keys()), _start_
 index_closes = _load_index_closes(engine, _start_sql)
 ticker_market = _load_ticker_market(engine)
 
+ticker_major = {}
+sector_index = {}
+if EVAL_SECTOR_NEUTRAL:
+    ticker_major = _load_ticker_major(engine)
+    if not ticker_major:
+        EVAL_SECTOR_NEUTRAL = False
+        print(
+            "⚠️ ticker_major 비어 있음 — EVAL_SECTOR_NEUTRAL=False 로 전환 "
+            "(섹터중립 계산 생략, 시장 대비만 측정)"
+        )
+    else:
+        print(f"섹터 매핑 {len(ticker_major):,}종목")
+        sector_index = _build_sector_index(indicators_data, ticker_major)
+
 PATTERN_CODES = [c for c in p51.PATTERN_REGISTRY.keys() if c != "p29b"]
 print(f"패턴 {len(PATTERN_CODES)}개 (p29b 제외·p29a 통합), min_bars={cfg['min_bars']}, "
       f"EVAL_YEARS={EVAL_YEARS}, EVAL_STEP={EVAL_STEP}")
@@ -359,11 +432,26 @@ base_records = []  # {date, 20: ex|None, 60: ex|None} — 구간별 __BASE__ 용
 gate_records = []  # EVAL_GATES: {date,ticker,stage,atr14_close,mcap,20,60}
 lookback = EVAL_YEARS * 250
 _STAGE_RANK = {"S0": 0, "S1": 1, "S2": 2, "S3": 3}
+_sec_fallback_n = 0
+
+
+def _sec_close_for(tk, idx_s):
+    """섹터 등가중 지수; 없으면 시장지수 폴백. EVAL_SECTOR_NEUTRAL 일 때만 호출."""
+    global _sec_fallback_n
+    sec = ticker_major.get(str(tk).zfill(6)) or ticker_major.get(str(tk))
+    sec_close = sector_index.get(sec) if sec else None
+    if sec_close is None or getattr(sec_close, "empty", True):
+        _sec_fallback_n += 1
+        return idx_s
+    return sec_close
+
 
 if EVAL_VOLUME_PROFILE:
     print("⚠️ EVAL_VOLUME_PROFILE=True — 슬롯별 매물대 재계산으로 40분 이상 추가 소요")
 if EVAL_GATES:
     print("⚠️ EVAL_GATES=True — 전체 슬롯 게이트 단계·전진수익 기록 (패턴은 S3만)")
+if EVAL_SECTOR_NEUTRAL:
+    print("⚠️ EVAL_SECTOR_NEUTRAL=True — 시장·섹터 초과수익 병행 측정")
 
 for k, i in tqdm(indicators_data.items(), desc="패턴 평가"):
     if i is None or len(i) < cfg["min_bars"]:
@@ -414,6 +502,7 @@ for k, i in tqdm(indicators_data.items(), desc="패턴 평가"):
 
         # 베이스라인: 게이트 통과 슬롯 전체의 초과수익
         _be = {"date": dt}
+        sec_close = _sec_close_for(_tk, idx_s) if EVAL_SECTOR_NEUTRAL else None
         for h in HORIZONS:
             if EVAL_GATES:
                 _ex = gate_records[-1].get(h)
@@ -423,6 +512,11 @@ for k, i in tqdm(indicators_data.items(), desc="패턴 평가"):
             if _ex is not None:
                 base_excess[h].append(float(_ex))
             _be[h] = _ex
+            if EVAL_SECTOR_NEUTRAL:
+                ex_sec = _fwd_excess(i, t, h, sec_close)
+                _be[f"{h}_sec"] = (
+                    float(ex_sec) if ex_sec is not None and np.isfinite(ex_sec) else None
+                )
         base_records.append(_be)
 
         rs_snap = rs_by_date.get(dt)
@@ -453,6 +547,7 @@ for k, i in tqdm(indicators_data.items(), desc="패턴 평가"):
 print(f"평가 슬롯(date×ticker 게이트 통과): {n_eval_pairs:,}")
 print(f"평가 일자 수: {len(slot_dates):,}")
 print(f"히트 수: {len(hits):,}")
+
 
 _dates = sorted({d for (d, _c, _t) in hits})
 _slot_dates = sorted(slot_dates)
@@ -531,11 +626,21 @@ if not hits_df.empty:
         mkt = ticker_market.get(str(r.ticker), "")
         idx_s = index_closes.get(mkt)
         row = {"date": _as_ts(r.date), "code": r.code, "ticker": r.ticker}
+        sec_close = (
+            _sec_close_for(str(r.ticker), idx_s) if EVAL_SECTOR_NEUTRAL else None
+        )
         for h in HORIZONS:
             ex = _fwd_excess(idf, pos, h, idx_s)
             row[h] = float(ex) if ex is not None and np.isfinite(ex) else None
+            if EVAL_SECTOR_NEUTRAL:
+                ex_sec = _fwd_excess(idf, pos, h, sec_close)
+                row[f"{h}_sec"] = (
+                    float(ex_sec) if ex_sec is not None and np.isfinite(ex_sec) else None
+                )
         _hit_ex_rows.append(row)
 hit_ex_df = pd.DataFrame(_hit_ex_rows)
+if EVAL_SECTOR_NEUTRAL:
+    print(f"섹터지수 폴백(시장지수 대체) 건수: {_sec_fallback_n:,}")
 
 _base_rec_df = pd.DataFrame(base_records)
 if not _base_rec_df.empty:
@@ -573,6 +678,14 @@ def _summarize_split(label, start, end) -> pd.DataFrame:
         _base[f"{pref}_median_excess"] = st["median"]
         _base[f"{pref}_winrate"] = st["winrate"]
         _base[f"{pref}_std"] = st["std"]
+        if EVAL_SECTOR_NEUTRAL:
+            col = f"{h}_sec"
+            vals_sec = (
+                base_f[col].tolist() if col in base_f.columns and len(base_f) else []
+            )
+            st_sec = _excess_stats(vals_sec)
+            _base[f"{pref}_mean_excess_sec"] = st_sec["mean"]
+            _base[f"{pref}_winrate_sec"] = st_sec["winrate"]
     rows.append(_base)
 
     if hit_ex_df.empty:
@@ -594,25 +707,28 @@ def _summarize_split(label, start, end) -> pd.DataFrame:
         group = meta.get("group", "")
         unmeasured = code in UNMEASURED_CODES
         if unmeasured:
-            rows.append(
-                {
-                    "split": label,
-                    "code": code,
-                    "group": group,
-                    "name": name,
-                    "status": "미측정",
-                    "n_hits": 0,
-                    "avg_hits_per_date": np.nan,
-                    "h20_mean_excess": np.nan,
-                    "h20_median_excess": np.nan,
-                    "h20_winrate": np.nan,
-                    "h20_std": np.nan,
-                    "h60_mean_excess": np.nan,
-                    "h60_median_excess": np.nan,
-                    "h60_winrate": np.nan,
-                    "h60_std": np.nan,
-                }
-            )
+            _urow = {
+                "split": label,
+                "code": code,
+                "group": group,
+                "name": name,
+                "status": "미측정",
+                "n_hits": 0,
+                "avg_hits_per_date": np.nan,
+                "h20_mean_excess": np.nan,
+                "h20_median_excess": np.nan,
+                "h20_winrate": np.nan,
+                "h20_std": np.nan,
+                "h60_mean_excess": np.nan,
+                "h60_median_excess": np.nan,
+                "h60_winrate": np.nan,
+                "h60_std": np.nan,
+            }
+            if EVAL_SECTOR_NEUTRAL:
+                for h in HORIZONS:
+                    _urow[f"h{h}_mean_excess_sec"] = np.nan
+                    _urow[f"h{h}_winrate_sec"] = np.nan
+            rows.append(_urow)
             continue
 
         n_hits = int((hits_f["code"] == code).sum()) if not hits_f.empty else 0
@@ -634,6 +750,16 @@ def _summarize_split(label, start, end) -> pd.DataFrame:
             rec[f"{pref}_median_excess"] = st["median"]
             rec[f"{pref}_winrate"] = st["winrate"]
             rec[f"{pref}_std"] = st["std"]
+            if EVAL_SECTOR_NEUTRAL:
+                col = f"{h}_sec"
+                vals_sec = (
+                    sub_ex[col].tolist()
+                    if (not sub_ex.empty and col in sub_ex.columns)
+                    else []
+                )
+                st_sec = _excess_stats(vals_sec)
+                rec[f"{pref}_mean_excess_sec"] = st_sec["mean"]
+                rec[f"{pref}_winrate_sec"] = st_sec["winrate"]
         rows.append(rec)
 
     return pd.DataFrame(rows)
@@ -647,6 +773,12 @@ for _lab, _st, _en in EVAL_SPLITS:
     print(f"📊 구간 요약: {_lab}")
     print("=" * 80)
     _show = _sdf.drop(columns=["split"], errors="ignore").copy()
+    if EVAL_SECTOR_NEUTRAL:
+        _hide_sec = [
+            c for c in _show.columns
+            if c.endswith("_sec") and not c.startswith("h60_")
+        ]
+        _show = _show.drop(columns=_hide_sec, errors="ignore")
     for c in _show.columns:
         if _show[c].dtype.kind == "f":
             _show[c] = _show[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
@@ -747,6 +879,59 @@ for c in ("h60Δ_23_24", "h60Δ_25_26"):
     _cshow[c] = _cshow[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
 print(_cshow.to_string(index=False))
 
+# 시장중립 vs 섹터중립 (전체 기간 h60Δ)
+sector_neutral_df = None
+if EVAL_SECTOR_NEUTRAL and _df_all is not None:
+    _sn_rows = []
+    _base_mkt = float(_df_all.loc["__BASE__", "h60_mean_excess"])
+    _base_sec = float(_df_all.loc["__BASE__", "h60_mean_excess_sec"])
+    for code in codes_meas:
+        if code not in _df_all.index:
+            continue
+        name = _pattern_name(code)
+        n = int(_df_all.loc[code, "n_hits"])
+        d_mkt = float(_df_all.loc[code, "h60_mean_excess"]) - _base_mkt
+        d_sec = float(_df_all.loc[code, "h60_mean_excess_sec"]) - _base_sec
+        if not np.isfinite(d_mkt) or d_mkt <= 0:
+            residual = np.nan
+            verdict = "-"
+        elif abs(d_mkt) < 1e-12:
+            residual = np.nan
+            verdict = "-"
+        elif not np.isfinite(d_sec):
+            residual = np.nan
+            verdict = "-"
+        else:
+            residual = d_sec / d_mkt
+            if residual >= 0.7:
+                verdict = "종목"
+            elif residual >= 0.3:
+                verdict = "혼합"
+            else:
+                verdict = "업종"
+        _sn_rows.append(
+            {
+                "code": code,
+                "name": name,
+                "n": n,
+                "h60Δ_시장": d_mkt,
+                "h60Δ_섹터": d_sec,
+                "잔존율": residual,
+                "판정": verdict,
+            }
+        )
+    sector_neutral_df = pd.DataFrame(_sn_rows)
+    sector_neutral_df = sector_neutral_df.sort_values(
+        "h60Δ_시장", ascending=False, na_position="last"
+    )
+    print("=" * 80)
+    print("📊 시장중립 vs 섹터중립 (h60Δ = 패턴 − 구간 __BASE__, 전체 기간)")
+    print("=" * 80)
+    _snshow = sector_neutral_df.copy()
+    for c in ("h60Δ_시장", "h60Δ_섹터", "잔존율"):
+        _snshow[c] = _snshow[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
+    print(_snshow.to_string(index=False))
+
 summary_path = OUTPUT_DIR / "pattern_eval_summary.csv"
 overlap_path = OUTPUT_DIR / "pattern_eval_overlap.csv"
 split_path = OUTPUT_DIR / "pattern_eval_summary_by_split.csv"
@@ -761,6 +946,10 @@ print(f"저장: {summary_path}")
 print(f"저장: {overlap_path}")
 print(f"저장: {split_path}")
 print(f"저장: {cons_path}")
+if sector_neutral_df is not None:
+    sn_path = OUTPUT_DIR / "pattern_eval_sector_neutral.csv"
+    sector_neutral_df.to_csv(sn_path, index=False, encoding="utf-8-sig")
+    print(f"저장: {sn_path}")
 
 # --- 게이트 단계·ATR 분위 성과 (EVAL_GATES) ---
 if EVAL_GATES and gate_records:
@@ -930,4 +1119,12 @@ else:
 print("※ 일관성: 구간 히트<100 이면 '-' (표본 부족)")
 if EVAL_GATES:
     print("※ EVAL_GATES: S0=모집단 → S3=__BASE__(기본+ATR)")
+if EVAL_SECTOR_NEUTRAL:
+    print(
+        "※ 섹터 매핑은 현재 시점 스냅샷이다. 과거 시점의 소속이 아니므로\n"
+        "  업종이 바뀐 종목에는 경미한 선견 편향이 있다."
+    )
+    print(
+        "※ 섹터지수는 등가중이며 상장폐지 종목이 빠져 있어 생존편향이 남는다."
+    )
 print("=" * 80)

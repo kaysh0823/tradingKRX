@@ -174,6 +174,7 @@ DEFAULT_OUTPUT_BASE_DIR = r"C:\Users\hachi\OneDrive\01. Trading\picking\KRX"
 # 계산 모수 = 시장 전체 보통주(전역제외, 시총 하한 없음)
 # 리포트 표 표시/선정 필터만 시총 ≥ 3,000억
 DISPLAY_MCAP_MIN = 300_000_000_000
+MJTOP100_ROW_BG_MODE = "mcap"   # "mcap" | "tv_spread"(구 동작 복원)
 
 RUN_DATE = date.today()  # 실행 시작 시점 고정 — 자정 넘김 대비
 RUN_DATE_STR = RUN_DATE.strftime("%Y-%m-%d")
@@ -948,6 +949,8 @@ def _mj_html_energy_top50_by_market(
         return f"<td style='text-align:right;color:{_mj_energy_ratio_font_color(x)}'{_sv(x)}>{x:.2f}</td>"
 
     n = len(d)
+    if "mcap" not in d.columns:
+        print("⚠️ 에너지배율 Top50: mcap 컬럼 없음 — 행 배경 흰색")
     parts: list[str] = [
         f'<div class="mj-html-table-wrap"><h3 style="margin:10px 0 6px 0;font-size:1.05rem;">{html.escape(title)}</h3>',
         '<table class="krx-sortable mjtop100" border="0" cellpadding="5" cellspacing="0" '
@@ -978,11 +981,6 @@ def _mj_html_energy_top50_by_market(
     for i in range(n):
         tk = "" if pd.isna(d["ticker"].iloc[i]) else str(d["ticker"].iloc[i])
         nm = "" if pd.isna(d["name"].iloc[i]) else str(d["name"].iloc[i])
-        tk_cell = html.escape(tk)
-        nm_cell = html.escape(nm)
-        if tk in highlight_set:
-            tk_cell = f"<b>{tk_cell}</b>"
-            nm_cell = f"<b>{nm_cell}</b>"
         er3 = float(d["energy_ratio_3d"].iloc[i]) if np.isfinite(d["energy_ratio_3d"].iloc[i]) else np.nan
         er0 = float(d["energy_ratio"].iloc[i]) if np.isfinite(d["energy_ratio"].iloc[i]) else np.nan
         er1 = d["energy_ratio_d1"].iloc[i]
@@ -1008,6 +1006,9 @@ def _mj_html_energy_top50_by_market(
         _chg5 = chg5_map.get(tk)
         if _chg5 is None and "chg_pct_5d" in d.columns:
             _chg5 = d["chg_pct_5d"].iloc[i]
+        _hi = tk in highlight_set
+        tk_cell = _krx_entity_html(tk, _chg, bold=_hi)
+        nm_cell = _krx_entity_html(nm, _chg, bold=_hi)
         _rs = rs_rank_map.get(tk)
         if _rs is None and "rs_rank" in d.columns:
             _rs = d["rs_rank"].iloc[i]
@@ -1021,7 +1022,9 @@ def _mj_html_energy_top50_by_market(
             _rs_txt = ""
         _hf = high_flags.get(tk, {})
         high_txt = _nd_high_label_from_ox_flags(_hf)
-        parts.append("<tr>")
+        parts.append(
+            f'<tr style="background-color:{_krx_mcap_row_bg(d["mcap"].iloc[i] if "mcap" in d.columns else None)};">'
+        )
         parts.append(f"<td style='text-align:center;color:{fc_base}'{_sv(i + 1)}>{i + 1}</td>")
         parts.append(f"<td style='text-align:right;color:{fc_base}'{_sv(prv)}>{html.escape(prv_txt)}</td>")
         parts.append(
@@ -1147,6 +1150,51 @@ _KRX_COLOR_DOWN = "#1565c0"
 _KRX_COLOR_FLAT = "#212121"
 _KRX_COLOR_NA = "#757575"
 
+_KRX_MCAP_1조 = 1_000_000_000_000.0
+_KRX_MCAP_5000억 = 500_000_000_000.0
+KRX_MCAP_BG_LARGE = "#c8e6c9"   # 시총 1조 이상
+KRX_MCAP_BG_MID   = "#bbdefb"   # 5천억 이상 1조 미만
+KRX_MCAP_BG_SMALL = "#ffe0b2"   # 5천억 미만
+KRX_MCAP_BG_NA    = "#ffffff"   # 결측·0
+
+KRX_TABLE_LEGEND_HTML = (
+    '행 배경(시가총액, 원): <span style="background:#c8e6c9;padding:0 6px">1조 이상</span>, '
+    '<span style="background:#bbdefb;padding:0 6px">5천억 이상 1조 미만</span>, '
+    '<span style="background:#ffe0b2;padding:0 6px">5천억 미만</span>, 결측·0은 흰색.<br/>'
+    '글자색: <span style="color:#c62828">빨강 = 당일 상승</span>, '
+    '<span style="color:#1565c0">파랑 = 당일 하락</span>, '
+    '<span style="color:#757575">회색 = 데이터 없음</span>.<br/>'
+    '<strong>볼드</strong>: (종목 표) RS·거래대금·방향우세 3개 리포트에 모두 등장한 종목 / '
+    '(20거래일 그리드) 전일에도 같은 표에 있던 종목.<br/>'
+)
+
+
+def _krx_mcap_row_bg(mcap) -> str:
+    """종목 1행 표 공통: 시가총액(원) 3단계 행 배경 — 정본."""
+    if mcap is None:
+        return KRX_MCAP_BG_NA
+    try:
+        if isinstance(mcap, float) and pd.isna(mcap):
+            return KRX_MCAP_BG_NA
+        v = float(mcap)
+    except (TypeError, ValueError):
+        return KRX_MCAP_BG_NA
+    if not np.isfinite(v) or v <= 0:
+        return KRX_MCAP_BG_NA
+    if v >= _KRX_MCAP_1조:
+        return KRX_MCAP_BG_LARGE
+    if v >= _KRX_MCAP_5000억:
+        return KRX_MCAP_BG_MID
+    return KRX_MCAP_BG_SMALL
+
+
+def _krx_entity_html(text, chg, *, bold: bool = False) -> str:
+    """종목코드·종목명 셀 내용 정본: escape → (볼드) → 당일 등락 색."""
+    inner = html.escape("" if text is None else str(text))
+    if bold:
+        inner = f"<strong>{inner}</strong>"
+    return _krx_colored_html(inner, chg)
+
 
 def _krx_rank_change_value(curr_rank, prev_rank) -> float | None:
     """순위 변동 = 전일 순위 − 당일 순위 (양수면 순위 상승·개선)."""
@@ -1187,10 +1235,11 @@ def _krx_fmt_rank_change_cell(curr_rank, prev_rank) -> tuple[str, float | None, 
 # HTML 표: thead 칼럼 클릭 시 오름·내림차순 정렬 (table에 class="krx-sortable" 부여)
 KRX_SORTABLE_TABLE_CSS_JS = """
 <style>
-table.krx-sortable thead th { cursor: pointer; user-select: none; padding-right: 16px; }
-table.krx-sortable thead th:hover { background: rgba(0,0,0,0.06); }
-table.krx-sortable thead th.sort-asc::after { content: " ▲"; font-size: 10px; color: #1976d2; }
-table.krx-sortable thead th.sort-desc::after { content: " ▼"; font-size: 10px; color: #1976d2; }
+table.krx-sortable thead th { cursor: pointer; user-select: none; padding-right: 16px;
+                              background: #37474f; color: #fff; font-weight: 600; }
+table.krx-sortable thead th:hover { background: #455a64; }
+table.krx-sortable thead th.sort-asc::after  { content: " ▲"; font-size: 10px; color: #ffd54f; }
+table.krx-sortable thead th.sort-desc::after { content: " ▼"; font-size: 10px; color: #ffd54f; }
 </style>
 <script>
 (function () {
@@ -2243,27 +2292,6 @@ def write_rs_high_list_html(
             return th[:95] + "…"
         return th
 
-    _MCAP_1조 = 1_000_000_000_000.0
-    _MCAP_5000억 = 500_000_000_000.0
-
-    def _mcap_row_bg(mcap) -> str:
-        """시총(원): 1조 이상 / 5천억~1조 미만 / 5천억 미만 행 배경."""
-        if mcap is None:
-            return "#ffffff"
-        try:
-            if isinstance(mcap, float) and pd.isna(mcap):
-                return "#ffffff"
-            v = float(mcap)
-        except (TypeError, ValueError):
-            return "#ffffff"
-        if not np.isfinite(v) or v <= 0:
-            return "#ffffff"
-        if v >= _MCAP_1조:
-            return "#c8e6c9"
-        if v >= _MCAP_5000억:
-            return "#bbdefb"
-        return "#ffe0b2"
-
     def _table_rows(sub: pd.DataFrame) -> str:
         if sub.empty:
             return "<p>해당 없음</p>"
@@ -2272,7 +2300,7 @@ def write_rs_high_list_html(
         for rank, (_, row) in enumerate(sub.iterrows(), start=1):
             nm = row.get("name")
             th = _fmt_theme_cell(row.get("theme_str", ""))
-            bg = _mcap_row_bg(row.get("mcap"))
+            bg = _krx_mcap_row_bg(row.get("mcap"))
             _tk = str(row.get("ticker", ""))
             _is_hi = _tk in _highlight_set
             _chg = row.get("chg_pct")
@@ -2339,7 +2367,7 @@ def write_rs_high_list_html(
         for rank, (_, row) in enumerate(sub.iterrows(), start=1):
             nm = row.get("name")
             th = _fmt_theme_cell(row.get("theme_str", ""))
-            bg = _mcap_row_bg(row.get("mcap"))
+            bg = _krx_mcap_row_bg(row.get("mcap"))
             _tk = str(row.get("ticker", ""))
             _is_hi = _tk in _highlight_set
             _chg = chg_map.get(_tk)
@@ -2419,7 +2447,7 @@ def write_rs_high_list_html(
         for rank, (_, row) in enumerate(sub.iterrows(), start=1):
             nm = row.get("name")
             th = _fmt_theme_cell(row.get("theme_str", ""))
-            bg = _mcap_row_bg(row.get("mcap"))
+            bg = _krx_mcap_row_bg(row.get("mcap"))
             _tk = str(row.get("ticker", ""))
             _is_hi = _tk in _highlight_set
             _chg = row.get("chg_pct")
@@ -2688,7 +2716,7 @@ def write_rs_high_list_html(
                             label = f"{nm}({tk})" if nm else tk
                             cell_main = html.escape(label)
                             if tk in prev_set:
-                                cell_main = f"<b>{cell_main}</b>"
+                                cell_main = f"<strong>{cell_main}</strong>"
                             cell_main = _krx_colored_html(cell_main, _rs20_chg_map.get((tk, dkey)))
                             tail_parts = []
                             try:
@@ -2737,7 +2765,7 @@ def write_rs_high_list_html(
     .theme-summary {{ font-size: 12px; color: #333; margin: 0 0 12px 0; line-height: 1.55; max-width: 100%; }}
     .theme-summary .tc {{ color: #666; font-weight: 600; }}
     table.rs20 {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e6e6e6; }}
-    table.rs20 thead th {{ position: sticky; top: 0; background: #fafafa; z-index: 1; }}
+    table.rs20 thead th {{ position: sticky; top: 0; z-index: 1; }}
     table.rs20 th, table.rs20 td {{ border: 1px solid #eee; padding: 8px 8px; font-size: 12px; vertical-align: top; }}
     table.rs20 th {{ text-align: center; font-weight: 700; color: #222; }}
     table.rs20 td {{ min-width: 110px; }}
@@ -2757,9 +2785,7 @@ def write_rs_high_list_html(
     D-0·D-1·D-2 에너지배율은 <a href="{html.escape(os.path.basename(out_energy_path))}"><code>{html.escape(os.path.basename(out_energy_path))}</code></a>를 참고하세요.<br/>
     <strong>신고가여부</strong>: 당일(D-0) 종가가 전일(D-1) 기준 N일 최고 종가를 상향 돌파하면
     <strong>200일 신고가</strong> / <strong>120일 신고가</strong> / <strong>50일 신고가</strong> 중 <strong>가장 긴 기간 하나만</strong> 표시합니다(성립하지 않으면 빈칸).<br/>
-    행 배경(시가총액, 원): <span style="background:#c8e6c9;padding:0 6px">1조 이상</span>,
-    <span style="background:#bbdefb;padding:0 6px">5천억 이상 1조 미만</span>,
-    <span style="background:#ffe0b2;padding:0 6px">5천억 미만</span>, 결측·0은 흰색.<br/>
+    {KRX_TABLE_LEGEND_HTML}
     파일: {os.path.basename(out_path)}<br/>
     <strong>표 정렬</strong>: 각 표의 칼럼 헤더를 클릭하면 해당 열 기준으로 오름차순·내림차순이 번갈아 적용됩니다.<br/>
   </div>
@@ -2824,9 +2850,7 @@ def write_rs_high_list_html(
     <strong>2·3절</strong>: <code>rs_high_list.html</code>과 동일 유니버스를 Talent120 내림차순으로 표시합니다(RS10~120d 칼럼 없음).<br/>
     RS 리스트는 <a href="{html.escape(os.path.basename(out_path))}"><code>{html.escape(os.path.basename(out_path))}</code></a>를 참고하세요.<br/>
     <strong>신고가여부</strong>: 200일 / 120일 / 50일 신고가 중 <strong>가장 긴 기간 하나만</strong> 표시합니다.<br/>
-    행 배경(시가총액, 원): <span style="background:#c8e6c9;padding:0 6px">1조 이상</span>,
-    <span style="background:#bbdefb;padding:0 6px">5천억 이상 1조 미만</span>,
-    <span style="background:#ffe0b2;padding:0 6px">5천억 미만</span>, 결측·0은 흰색.<br/>
+    {KRX_TABLE_LEGEND_HTML}
     파일: {os.path.basename(out_talent_path)}<br/>
     <strong>표 정렬</strong>: 칼럼 헤더 클릭 시 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.
   </div>
@@ -3284,37 +3308,6 @@ def write_120d_breakout_list_html(
             except Exception:
                 return ""
 
-        _MCAP_1조 = 1_000_000_000_000.0
-        _MCAP_5000억 = 500_000_000_000.0
-
-        def _mcap_row_bg(mcap) -> str:
-            if mcap is None:
-                return "#ffffff"
-            try:
-                if isinstance(mcap, float) and pd.isna(mcap):
-                    return "#ffffff"
-                v = float(mcap)
-            except (TypeError, ValueError):
-                return "#ffffff"
-            if not np.isfinite(v) or v <= 0:
-                return "#ffffff"
-            if v >= _MCAP_1조:
-                return "#c8e6c9"
-            if v >= _MCAP_5000억:
-                return "#bbdefb"
-            return "#ffe0b2"
-
-        def _color_ref(chg):
-            """신저가 페이지는 하락이 정상이므로 색상 기준 부호를 뒤집는다."""
-            if not is_low:
-                return chg
-            try:
-                if chg is None or (isinstance(chg, float) and (np.isnan(chg) or not np.isfinite(chg))):
-                    return chg
-                return -float(chg)
-            except (TypeError, ValueError):
-                return chg
-
         def _table(sub: pd.DataFrame) -> str:
             if sub.empty:
                 return "<p>해당 없음</p>"
@@ -3332,7 +3325,7 @@ def write_120d_breakout_list_html(
                 th = (r.get("theme_str") or "").strip()
                 if len(th) > 96:
                     th = th[:95] + "…"
-                bg = _mcap_row_bg(r.get("mcap"))
+                bg = _krx_mcap_row_bg(r.get("mcap"))
                 _tk = str(r.get("ticker", ""))
                 _is_hi = _tk in set([str(x) for x in (highlight_tickers or set())])
                 tv_rank = r.get("tv_rank")
@@ -3342,15 +3335,14 @@ def write_120d_breakout_list_html(
                 rsr = r.get("rs_rank")
                 rsr_txt = "" if rsr is None or (isinstance(rsr, float) and (np.isnan(rsr) or not np.isfinite(rsr))) else f"{int(float(rsr)):,}"
                 _chg = r.get("chg_1d_pct")
-                _cref = _color_ref(_chg)
                 _tk_inner = html.escape(_tk)
                 if _is_hi:
                     _tk_inner = f"<strong>{_tk_inner}</strong>"
-                _tk_cell = _krx_colored_html(_tk_inner, _cref)
+                _tk_cell = _krx_colored_html(_tk_inner, _chg)
                 _nm_inner = html.escape(str(r.get("name", "")))
                 if _is_hi:
                     _nm_inner = f"<strong>{_nm_inner}</strong>"
-                _nm_cell = _krx_colored_html(_nm_inner, _cref)
+                _nm_cell = _krx_colored_html(_nm_inner, _chg)
                 lines.append(
                     f"<tr style=\"background-color:{bg};\">"
                     f"<td style='text-align:center'{_html_sort_num_attr(i)}>{i}</td>"
@@ -3361,8 +3353,8 @@ def write_120d_breakout_list_html(
                     f"<td style='text-align:right'{_html_sort_num_attr(r.get('mcap'))}>{_fmt_money(r.get('mcap'))}</td>"
                     f"<td style='text-align:right'{_html_sort_num_attr(tv_rank)}>{tv_rank_txt}</td>"
                     f"<td style='text-align:right'{_html_sort_num_attr(cur)}>{cur_txt}</td>"
-                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('chg_1d_pct'))}>{_fmt_pct(r.get('chg_1d_pct'))}</td>"
-                    f"<td style='text-align:right'{_html_sort_num_attr(r.get('ret_5d_pct'))}>{_fmt_pct(r.get('ret_5d_pct'))}</td>"
+                    f"{_krx_chg_pct_td(r.get('chg_1d_pct'))}"
+                    f"{_krx_chg_pct_td(r.get('ret_5d_pct'))}"
                     f"<td style='text-align:right'{_html_sort_num_attr(r.get('elapsed_high_td'))}>{int(r.get('elapsed_high_td', 0))}</td>"
                     f"<td style='text-align:right'{_html_sort_num_attr(r.get('elapsed_td'))}>{int(r.get('elapsed_td', 0))}</td>"
                     f"<td style='text-align:right'{_html_sort_num_attr(r.get('up_from_low_pct'))}>{_fmt_pct(r.get('up_from_low_pct'))}</td>"
@@ -3390,19 +3382,18 @@ def write_120d_breakout_list_html(
                 "</tr></thead><tbody>",
             ]
             for i, (_, r) in enumerate(sub.iterrows(), start=1):
-                bg = _mcap_row_bg(r.get("mcap"))
+                bg = _krx_mcap_row_bg(r.get("mcap"))
                 _tk = str(r.get("ticker", ""))
                 _is_hi = _tk in set([str(x) for x in (highlight_tickers or set())])
                 _chg = r.get("chg_1d_pct")
-                _cref = _color_ref(_chg)
                 _tk_inner = html.escape(_tk)
                 if _is_hi:
                     _tk_inner = f"<strong>{_tk_inner}</strong>"
-                _tk_cell = _krx_colored_html(_tk_inner, _cref)
+                _tk_cell = _krx_colored_html(_tk_inner, _chg)
                 _nm_inner = html.escape(str(r.get("name", "")))
                 if _is_hi:
                     _nm_inner = f"<strong>{_nm_inner}</strong>"
-                _nm_cell = _krx_colored_html(_nm_inner, _cref)
+                _nm_cell = _krx_colored_html(_nm_inner, _chg)
                 o10 = str(r.get("is_10w_high", "") or "")
                 o20 = str(r.get("is_20w_high", "") or "")
                 o50 = str(r.get("is_50w_high", "") or "")
@@ -3544,9 +3535,8 @@ def write_120d_breakout_list_html(
     현재가: 최신일 종가 기준.<br/>
     <strong>주봉 신저가 표</strong>(아래 각 시장 표): 일봉을 금요일 주간(<code>W-FRI</code>)으로 묶어 주간 종가(해당 주 <strong>마지막 거래일 종가</strong>)를 사용합니다.
     당일이 속한 주의 주봉 종가가 직전 10·20·50개 주봉 종가 각각의 최저값에 <strong>미달(&lt;)</strong>하면 <strong>O</strong>, 아니면 <strong>X</strong>, 주봉 이력이 부족하면 빈칸입니다.<br/>
-    테마: <code>krx_theme_stock</code> 기준. 행 배경(시가총액, 원): <span style="background:#c8e6c9;padding:0 6px">1조 이상</span>,
-    <span style="background:#bbdefb;padding:0 6px">5천억 이상 1조 미만</span>,
-    <span style="background:#ffe0b2;padding:0 6px">5천억 미만</span>.<br/>
+    테마: <code>krx_theme_stock</code> 기준.<br/>
+    {KRX_TABLE_LEGEND_HTML}
     <strong>표 정렬</strong>: 칼럼 헤더 클릭 시 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
     파일: {html.escape(os.path.basename(out_path))}
   </div>
@@ -3565,9 +3555,8 @@ def write_120d_breakout_list_html(
     현재가: 최신일 종가 기준.<br/>
     <strong>주봉 신고가 표</strong>(아래 각 시장 표): 일봉을 금요일 주간(<code>W-FRI</code>)으로 묶어 주간 종가(해당 주 <strong>마지막 거래일 종가</strong>)를 사용합니다.
     당일이 속한 주의 주봉 종가가 직전 10·20·50개 주봉 종가 각각의 최고값을 <strong>초과(&gt;)</strong>하면 <strong>O</strong>, 아니면 <strong>X</strong>, 주봉 이력이 부족하면 빈칸입니다.<br/>
-    테마: <code>krx_theme_stock</code> 기준. 행 배경(시가총액, 원): <span style="background:#c8e6c9;padding:0 6px">1조 이상</span>,
-    <span style="background:#bbdefb;padding:0 6px">5천억 이상 1조 미만</span>,
-    <span style="background:#ffe0b2;padding:0 6px">5천억 미만</span>.<br/>
+    테마: <code>krx_theme_stock</code> 기준.<br/>
+    {KRX_TABLE_LEGEND_HTML}
     <strong>표 정렬</strong>: 칼럼 헤더 클릭 시 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
     파일: {html.escape(os.path.basename(out_path))}
   </div>
@@ -4220,6 +4209,8 @@ def _html_vol_spread_composite_top50_table(
     sub["composite_pct"] = (sub["pct_clv_avg"] + sub["pct_net_dir"] + sub["pct_drb_avg"]) / 3.0
     sub = sub.sort_values("composite_pct", ascending=False, na_position="last").head(50).reset_index(drop=True)
     sub["tv_rank_prev"] = pd.to_numeric(sub["ticker"].astype(str).map(prev_tv_rank_map), errors="coerce")
+    if "mcap" not in sub.columns:
+        print("⚠️ 방향우세 종합 Top50: mcap 없음 — 행 배경 흰색")
 
     def _fclv(v) -> str:
         try:
@@ -4283,11 +4274,15 @@ def _html_vol_spread_composite_top50_table(
     for i, (_, r) in enumerate(sub.iterrows(), start=1):
         _tk = str(r["ticker"])
         _hi = _tk in highlight_set
-        _nm = html.escape(str(r.get("name", "")))
-        _tk_e = html.escape(_tk)
-        if _hi:
-            _tk_e = f"<strong>{_tk_e}</strong>"
-            _nm = f"<strong>{_nm}</strong>"
+        _chg = None
+        if "chg_1d_pct" in sub.columns:
+            _chg = r.get("chg_1d_pct")
+        elif "chg_1d_pct" in full_df.columns:
+            _hit = full_df.loc[full_df["ticker"].astype(str) == _tk, "chg_1d_pct"]
+            if len(_hit):
+                _chg = _hit.iloc[0]
+        _tk_e = _krx_entity_html(_tk, _chg, bold=_hi)
+        _nm = _krx_entity_html(r.get("name", ""), _chg, bold=_hi)
         _rs_s_txt = ""
         try:
             _rsv = r.get("rs_score")
@@ -4300,7 +4295,7 @@ def _html_vol_spread_composite_top50_table(
         _rc_txt, _rc_sv, _rc_col = _krx_fmt_rank_change_cell(i, _prv)
         _mkt = html.escape(str(r.get("market", "") or ""))
         lines.append(
-            "<tr>"
+            f'<tr style="background-color:{_krx_mcap_row_bg(r.get("mcap") if "mcap" in sub.columns else None)};">'
             f"<td style='text-align:center'{_html_sort_num_attr(i)}>{i}</td>"
             f"<td style='text-align:right'{_html_sort_num_attr(_prv)}>{html.escape(_prv_txt)}</td>"
             f"<td style='text-align:right;color:{_rc_col}'{_html_sort_num_attr(_rc_sv)}>{html.escape(_rc_txt)}</td>"
@@ -4600,6 +4595,8 @@ def write_volatility_spread_top100_html(
             return ""
 
     def _table_for_market(sub_df: pd.DataFrame) -> str:
+        if "mcap" not in sub_df.columns:
+            print("⚠️ 방향우세 Top100: mcap 없음 — 행 배경 흰색")
         lines = [
             "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:12px;width:100%;'>",
             "<thead><tr>",
@@ -4632,7 +4629,7 @@ def write_volatility_spread_top100_html(
             _tvp = r.get("tv_rank_prev")
             _rc_txt, _rc_sv, _rc_col = _krx_fmt_rank_change_cell(i, _tvp)
             lines.append(
-                f"<tr>"
+                f'<tr style="background-color:{_krx_mcap_row_bg(r.get("mcap") if "mcap" in sub_df.columns else None)};">'
                 f"<td style='text-align:center'{_html_sort_num_attr(i)}>{i}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(_tvp)}>{_fmt_rank_cell(_tvp)}</td>"
                 f"<td style='text-align:right;color:{_rc_col}'{_html_sort_num_attr(_rc_sv)}>{html.escape(_rc_txt)}</td>"
@@ -4758,6 +4755,7 @@ def write_volatility_spread_top100_html(
     당일 상승률·3일간 상승률: 전일·3거래일 전 종가 대비 최신 종가 등락률(%). 이전 신고가 경과일수: 전일 기준 120일 최고 종가 도달일~당일 거래일 간격.<br/>
     테마: <code>krx_theme_stock</code> 기준. 파일: {html.escape(os.path.basename(out_path))}<br/>
     <strong>맨 위 표</strong>: 코스피·코스닥 유니버스를 합친 동일 풀에서 CLV·순방향·DRB 각각의 백분위(<code>rank(pct=True)</code>×100)를 구한 뒤, 세 값의 산술평균을 <strong>종합백분위</strong>로 두고 높은 순으로 상위 50만 표시합니다. 전일 순위는 직전 거래일 시장 내 거래대금 순위입니다. 그 아래는 시장별 방향 우세 순 표입니다.<br/>
+    {KRX_TABLE_LEGEND_HTML}
     <strong>표 정렬</strong>: 칼럼 헤더 클릭 시 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.
   </div>
   {table_html}
@@ -6328,7 +6326,7 @@ def run_market_dashboard(
                         label = f"{nm}({tk})" if nm else tk
                         cell_main = html.escape(label)
                         if tk in prev_day_set:
-                            cell_main = f"<b>{cell_main}</b>"
+                            cell_main = f"<strong>{cell_main}</strong>"
                         cell_main = _krx_colored_html(cell_main, _tv_chg_map.get((tk, dkey)))
                         row[f"Top{i+1}"] = cell_main + (
                             f"<br/><span class='tv'>{html.escape(tvs)}</span>" if tvs else ""
@@ -6700,17 +6698,6 @@ def run_market_dashboard(
             def _mj_chg_font_color(v) -> str:
                 return _krx_chg_font_color(v)
 
-            def _mj_sma_cell_color(px: float, sma_v: float) -> str:
-                """현재가 대비 SMA: 위 빨강, 아래 파랑, 동일·부족 데이터는 기본색."""
-                _base = "#212121"
-                if not (np.isfinite(px) and np.isfinite(sma_v)):
-                    return "#757575"
-                if px > sma_v:
-                    return "#c62828"
-                if px < sma_v:
-                    return "#1565c0"
-                return _base
-
             def _fmt_chg_pct(v):
                 try:
                     if v is None or pd.isna(v):
@@ -6768,14 +6755,22 @@ def run_market_dashboard(
                 return out
 
             n_rows = len(df)
-            row_bgs = _mj_row_bgs_tv_vs_mcap()
+            row_bgs = (
+                _mj_row_bgs_tv_vs_mcap()
+                if MJTOP100_ROW_BG_MODE == "tv_spread"
+                else [_krx_mcap_row_bg(x) for x in df["mcap"]]
+            )
             _fc = "#212121"
 
             tk_raw = ["" if pd.isna(x) else str(x) for x in df["ticker"]]
             name_raw = ["" if pd.isna(x) else str(x) for x in df["name"]]
-            tk_col = [f"<b>{html.escape(t)}</b>" if t in _highlight_set else html.escape(t) for t in tk_raw]
+            tk_col = [
+                _krx_entity_html(t, df["chg_pct"].iloc[i], bold=(t in _highlight_set))
+                for i, t in enumerate(tk_raw)
+            ]
             name_col = [
-                f"<b>{html.escape(n)}</b>" if tk_raw[i] in _highlight_set else html.escape(n) for i, n in enumerate(name_raw)
+                _krx_entity_html(n, df["chg_pct"].iloc[i], bold=(tk_raw[i] in _highlight_set))
+                for i, n in enumerate(name_raw)
             ]
             rs_rank_col = [
                 "" if pd.isna(x) else str(int(float(x))) for x in pd.to_numeric(df.get("rs_rank"), errors="coerce").fillna(np.nan)
@@ -6843,8 +6838,8 @@ def run_market_dashboard(
                 _uf(),
                 _uf(),
                 rank_chg_color,
-                [_mj_chg_font_color(df["chg_pct"].iloc[i]) for i in range(n_rows)],
-                [_mj_chg_font_color(df["chg_pct"].iloc[i]) for i in range(n_rows)],
+                _uf(),
+                _uf(),
                 _uf(),
                 _uf(),
                 _uf(),
@@ -7363,7 +7358,7 @@ def run_market_dashboard(
     .theme-summary {{ font-size: 12px; color: #333; margin: 0 0 12px 0; line-height: 1.55; max-width: 100%; }}
     .theme-summary .tc {{ color: #666; font-weight: 600; }}
     table.tv20 {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e6e6e6; }}
-    table.tv20 thead th {{ position: sticky; top: 0; background: #fafafa; z-index: 1; }}
+    table.tv20 thead th {{ position: sticky; top: 0; z-index: 1; }}
     table.tv20 th, table.tv20 td {{ border: 1px solid #eee; padding: 8px 8px; font-size: 12px; vertical-align: top; }}
     table.tv20 th {{ text-align: center; font-weight: 700; color: #222; }}
     table.tv20 td {{ min-width: 110px; }}
@@ -7378,7 +7373,6 @@ def run_market_dashboard(
   <div class="note">
     거래대금은 OHLCV 최신 구간 기준입니다. 시가총액·종목명은 <code>krx_ticker</code> 최신 기준일 기준입니다.
     테마는 <code>krx_theme_stock</code> 기준입니다. 거래대금 비중은 해당 시장 당일 합산 거래대금 대비, 시총 비중은 해당 시장 시가총액 합 대비입니다.
-    거래대금 상위 100 표는 행마다 거래대금 전체비중이 시총 전체비중보다 크면 붉은 배경, 작으면 푸른 배경으로 강조됩니다(차이 크기는 같은 표 안에서 상대 비교).
     <strong>전일 순위</strong>는 직전 거래일 시장 내 거래대금 순위이며, <strong>RS순위·신고가여부</strong>는 표 오른쪽 끝 칼럼입니다.<br/>
     <strong>신고가여부</strong>: 당일(D-0) 종가가 전일(D-1) 기준 N일 최고 종가를 상향 돌파하면
     <strong>200일 / 120일 / 50일 신고가</strong> 중 <strong>가장 긴 기간 하나만</strong> 표시합니다.<br/>
@@ -7388,6 +7382,7 @@ def run_market_dashboard(
     Talent(일) = 최근 120거래일 중 (전일종가 대비 등락률 ≥ +10%)인 날 수이며, 거래대금 상위 100 내 요약은 코스피 평균 {_fmt_talent_stat(_st_k.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_k.get('talent_p95'))}, 코스닥 평균 {_fmt_talent_stat(_st_q.get('talent_mean'))} / 상위5% {_fmt_talent_stat(_st_q.get('talent_p95'))} 입니다.<br/>
     ATR3/종가 vs 시가총액 분포는 <a href="{html.escape(os.path.basename(out_ad))}"><code>{html.escape(os.path.basename(out_ad))}</code></a> <strong>9페이지(ATR3/종가 vs 시가총액)</strong>를 참고하세요.<br/>
     일별 거래대금 Top20 표는 코스피·코스닥 각각 <strong>해당 시장 종목만</strong> 대상으로 당일 거래대금(종가×거래량) 기준 상위 20입니다. 행 날짜는 두 시장 OHLCV가 공통으로 갖는 최근 20거래일입니다.<br/>
+    {KRX_TABLE_LEGEND_HTML}
     <strong>표 정렬</strong>: 거래대금 상위 100·일별 Top20 표에서 칼럼 헤더를 클릭하면 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
     파일: {os.path.basename(out_tv)}
   </div>
@@ -7453,6 +7448,7 @@ def run_market_dashboard(
     <strong>신고가 여부</strong>: 당일(D-0) 종가가 전일(D-1) 기준 N일 최고 종가를 상향 돌파하면
     <strong>200일 신고가</strong> / <strong>120일 신고가</strong> / <strong>50일 신고가</strong> 중 <strong>가장 긴 기간 하나만</strong> 표시합니다.<br/>
     거래대금 상위 100·일별 Top20은 <a href="{html.escape(os.path.basename(out_tv))}"><code>{html.escape(os.path.basename(out_tv))}</code></a>를 참고하세요.<br/>
+    {KRX_TABLE_LEGEND_HTML}
     파일: {os.path.basename(out_energy)}
   </div>
   <section>
@@ -7582,7 +7578,7 @@ _INVESTOR_PAGE_CSS = """
   .inv-rank20-wrap { overflow: auto; max-height: 560px; border-radius: 8px; border: 1px solid #e6e6e6; background: #fff; }
   table.inv-rank20 { border-collapse: collapse; font-size: 11px; width: 100%; background: #fff; }
   table.inv-rank20 th, table.inv-rank20 td { border: 1px solid #eee; padding: 5px 6px; vertical-align: top; min-width: 96px; }
-  table.inv-rank20 thead th { position: sticky; top: 0; background: #fafafa; z-index: 1; text-align: center; }
+  table.inv-rank20 thead th { position: sticky; top: 0; z-index: 1; text-align: center; }
   table.inv-rank20 td.datecol { position: sticky; left: 0; background: #fff; font-weight: 600; min-width: 96px; text-align: center; }
   table.inv-rank20 tr.latest td { background: #fff8e1; }
   table.inv-rank20 tr.latest td.datecol { background: #ffecb3; }
@@ -7773,9 +7769,6 @@ def write_investor_net_buy_top_html(
 
     INV_RANK_DAYS = 20
     INV_RANK_N = 20
-    RANK_IMPROVE = "#d32f2f"
-    RANK_WORSEN = "#1565c0"
-    RANK_NEUTRAL = "#212121"
 
     def _ohlcv_dates_upto(end: date, n: int) -> list:
         try:
@@ -8071,14 +8064,14 @@ def write_investor_net_buy_top_html(
                     eok_s = f"{eok:+,.0f}"
                 except (TypeError, ValueError):
                     eok_s = ""
-                color = RANK_NEUTRAL
+                color = _KRX_COLOR_FLAT
                 if prev_d is not None:
                     prev_rk = rank_map.get((prev_d, tk))
                     if prev_rk is not None:
                         if rk < prev_rk:
-                            color = RANK_IMPROVE
+                            color = _KRX_COLOR_UP
                         elif rk > prev_rk:
-                            color = RANK_WORSEN
+                            color = _KRX_COLOR_DOWN
                 inner = f"{html.escape(nm)}<br>{html.escape(eok_s)}"
                 tds.append(f"<td style='color:{color};text-align:left'>{inner}</td>")
             tr_cls = " class='latest'" if d == latest else ""
@@ -8127,6 +8120,8 @@ def write_investor_net_buy_top_html(
             )
         else:
             rows = []
+            if "mcap" not in df.columns and not inv_mcap_map:
+                print("⚠️ 투자자 순매수·순매도 Top20: mcap 없음 — 행 배경 흰색")
             for i, r in df.iterrows():
                 nv = r.get("net_val")
                 nq = r.get("net_qty")
@@ -8162,10 +8157,15 @@ def write_investor_net_buy_top_html(
                         f"<td style='text-align:right;color:{pcol}'{_html_sort_num_attr(disp_pnv if pnv_txt else None)}>{html.escape(pnv_txt)}</td>"
                         f"<td style='text-align:right'{_html_sort_num_attr(disp_pnq if pnq_txt else None)}>{html.escape(pnq_txt)}</td>"
                     )
+                _tk = str(r.get("ticker") or "")
+                if "mcap" in df.columns:
+                    _mc = r.get("mcap")
+                else:
+                    _mc = inv_mcap_map.get(_tk.zfill(6)) or inv_mcap_map.get(_tk)
                 rows.append(
-                    "<tr>"
+                    f'<tr style="background-color:{_krx_mcap_row_bg(_mc)};">'
                     f"<td style='text-align:center'{_html_sort_num_attr(i + 1)}>{i + 1}</td>"
-                    f"<td style='text-align:center'>{html.escape(str(r.get('ticker') or ''))}</td>"
+                    f"<td style='text-align:center'>{html.escape(_tk)}</td>"
                     f"<td style='text-align:left'>{html.escape(str(r.get('name') or ''))}</td>"
                     f"<td style='text-align:left'>{html.escape(str(r.get('sector') or ''))}</td>"
                     f"<td style='text-align:right;color:{col}'{_html_sort_num_attr(disp_nv)}>{_fmt_eok(disp_nv)}</td>"
@@ -8235,7 +8235,12 @@ def write_investor_net_buy_top_html(
                 _table_html(label, df, rank_html, days=days, side=side, start_d=start_d)
             )
 
-        return _INVESTOR_PAGE_CSS + "".join(sections) + KRX_SORTABLE_TABLE_CSS_JS
+        return (
+            _INVESTOR_PAGE_CSS
+            + f'<div class="note" style="padding:10px 4px;font-size:13px;color:#444;line-height:1.55;">{KRX_TABLE_LEGEND_HTML}</div>'
+            + "".join(sections)
+            + KRX_SORTABLE_TABLE_CSS_JS
+        )
 
     page_divs = [
         _investor_page_html(days=1, side="buy"),
