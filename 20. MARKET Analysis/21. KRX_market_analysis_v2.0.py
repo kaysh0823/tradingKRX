@@ -116,7 +116,15 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from env_config import load_project_env, require_env, db_url, db_connect_kwargs
 load_project_env()
-from indicators_core import atr_wilder, energy_ratio, price_positions, rs_avg, talent_up_count
+from indicators_core import (
+    atr_wilder,
+    bollinger_band_width,
+    bollinger_band_width_q,
+    energy_ratio,
+    price_positions,
+    rs_avg,
+    talent_up_count,
+)
 from exclusions import drop_excluded, filter_common_stock_df, filter_tickers
 
 #!/usr/bin/env python
@@ -175,6 +183,13 @@ DEFAULT_OUTPUT_BASE_DIR = r"C:\Users\hachi\OneDrive\01. Trading\picking\KRX"
 # 리포트 표 표시/선정 필터만 시총 ≥ 3,000억
 DISPLAY_MCAP_MIN = 300_000_000_000
 MJTOP100_ROW_BG_MODE = "mcap"   # "mcap" | "tv_spread"(구 동작 복원)
+RS_LIST_MIN_AVG = 80.0   # RS 리스트 표시 하한 (rs_avg)
+BBW_SQUEEZE_Q_MAX = 0.5    # band20_q 상한 (0~1, 최근 125일 밴드폭 범위 내 위치)
+BBW_WINDOW = 20
+BBW_SIGMA = 2.0
+BBW_LOOKBACK = 125
+BBW_PB_MIN = 0.8            # %b 하한
+BBW_PB_TV_RANK_MAX = 100    # 거래대금 시장순위 상한
 
 RUN_DATE = date.today()  # 실행 시작 시점 고정 — 자정 넘김 대비
 RUN_DATE_STR = RUN_DATE.strftime("%Y-%m-%d")
@@ -186,6 +201,14 @@ def _filter_display_mcap(df: pd.DataFrame, mcap_col: str = "mcap") -> pd.DataFra
         return df
     mc = pd.to_numeric(df[mcap_col], errors="coerce")
     return df[mc.notna() & (mc >= DISPLAY_MCAP_MIN)].copy()
+
+
+def _filter_rs_avg_min(df: pd.DataFrame, col: str = "_rs_avg") -> pd.DataFrame:
+    """표시용: rs_avg ≥ RS_LIST_MIN_AVG. 지표 계산·유니버스에는 쓰지 않는다."""
+    if df is None or df.empty or col not in df.columns:
+        return df
+    v = pd.to_numeric(df[col], errors="coerce")
+    return df[v.notna() & (v >= RS_LIST_MIN_AVG)].copy()
 
 
 # kor_stock_db: 일별 리포트 표 스냅샷 (KRX_market_analysis 산출물)
@@ -262,7 +285,7 @@ def _ensure_krx_analysis_schema(engine) -> None:
             ticker VARCHAR(16) NOT NULL,
             rs_date DATE,
             market_type VARCHAR(16),
-            rs_10d DOUBLE, rs_20d DOUBLE, rs_50d DOUBLE, rs_120d DOUBLE,
+            rs_10d DOUBLE, rs_20d DOUBLE, rs_50d DOUBLE, rs_120d DOUBLE, rs_200d DOUBLE,
             rs_avg DOUBLE,
             name VARCHAR(256),
             mcap DOUBLE,
@@ -498,6 +521,7 @@ def _migrate_krx_analysis_tv_rank_prev_columns(conn) -> None:
         ("krx_analysis_vol_spread_top100", "pos_20", "DOUBLE NULL", "tv_rank"),
         ("krx_analysis_vol_spread_top100", "pos_50", "DOUBLE NULL", "pos_20"),
         ("krx_analysis_vol_spread_top100", "pos_120", "DOUBLE NULL", "pos_50"),
+        ("krx_analysis_rs_high_list", "rs_200d", "DOUBLE NULL", "rs_120d"),
     )
     for _tbl, _col, _typ, _after in specs:
         if _krx_analysis_table_has_column(conn, _tbl, _col):
@@ -540,6 +564,7 @@ def _save_krx_analysis_table(engine, table: str, df: pd.DataFrame | None, ref_tr
         _ensure_krx_analysis_schema(engine)
         _krx_analysis_schema_engines.add(eid)
     rd = ref_trade_date.isoformat()
+    rd_run = RUN_DATE.isoformat() if hasattr(RUN_DATE, "isoformat") else str(RUN_DATE)
     with engine.begin() as conn:
         _migrate_krx_analysis_tv_rank_prev_columns(conn)
         date_cols = _krx_analysis_snapshot_date_columns(conn, table)
@@ -548,15 +573,22 @@ def _save_krx_analysis_table(engine, table: str, df: pd.DataFrame | None, ref_tr
             date_cols = ["ref_trade_date"]
 
         if len(date_cols) == 2:
-            conn.execute(
+            _del_res = conn.execute(
                 text(
-                    f"DELETE FROM `{table}` WHERE ref_trade_date = :rd OR report_date = :rd"
+                    f"DELETE FROM `{table}` WHERE ref_trade_date = :rd OR report_date = :rd_run"
                 ),
-                {"rd": rd},
+                {"rd": rd, "rd_run": rd_run},
             )
         else:
             c0 = date_cols[0]
-            conn.execute(text(f"DELETE FROM `{table}` WHERE `{c0}` = :rd"), {"rd": rd})
+            _v = rd_run if c0 == "report_date" else rd
+            _del_res = conn.execute(text(f"DELETE FROM `{table}` WHERE `{c0}` = :v"), {"v": _v})
+        try:
+            _n = int(getattr(_del_res, "rowcount", 0) or 0)
+            if _n > 0:
+                print(f"[snapshot] {table}: 기존 {_n}행 교체")
+        except Exception:
+            pass
 
         if df is None or df.empty:
             return
@@ -1125,6 +1157,7 @@ def _rs_high_list_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
         "rs_20d",
         "rs_50d",
         "rs_120d",
+        "rs_200d",
         "rs_avg",
         "name",
         "mcap",
@@ -1164,7 +1197,7 @@ KRX_TABLE_LEGEND_HTML = (
     '글자색: <span style="color:#c62828">빨강 = 당일 상승</span>, '
     '<span style="color:#1565c0">파랑 = 당일 하락</span>, '
     '<span style="color:#757575">회색 = 데이터 없음</span>.<br/>'
-    '<strong>볼드</strong>: (종목 표) RS·거래대금·방향우세 3개 리포트에 모두 등장한 종목 / '
+    '<strong>볼드</strong>: (종목 표) RS·거래대금·%b 3개 리포트에 모두 등장한 종목 / '
     '(20거래일 그리드) 전일에도 같은 표에 있던 종목.<br/>'
 )
 
@@ -1817,6 +1850,182 @@ def _compute_250d_high_flag_map(engine, tickers: list[str], roll_d: int = 250, l
     return out
 
 
+def _bband_metrics_frame(engine, sub: pd.DataFrame) -> pd.DataFrame:
+    """RS 리스트 표시 대상(sub)에 band20_q·band20_w·%b 를 붙인다(필터·정렬 없음)."""
+    if sub is None or getattr(sub, "empty", True):
+        return pd.DataFrame()
+    tickers = sub["ticker"].astype(str).unique().tolist()
+    if not tickers:
+        return pd.DataFrame()
+    try:
+        ref_m = pd.read_sql_query("SELECT MAX(date) AS d FROM krx_ohlcv", con=engine)
+        ref_d = pd.to_datetime(ref_m.iloc[0]["d"], errors="coerce")
+    except Exception:
+        return pd.DataFrame()
+    if pd.isna(ref_d):
+        return pd.DataFrame()
+    cutoff = (ref_d.normalize() - pd.Timedelta(days=900)).strftime("%Y-%m-%d")
+    parts: list[pd.DataFrame] = []
+    chunk_size = 450
+    for i in range(0, len(tickers), chunk_size):
+        chunk = [str(x) for x in tickers[i : i + chunk_size]]
+        ph = ",".join(["%s"] * len(chunk))
+        q = f"""
+            SELECT ticker, date, close
+            FROM krx_ohlcv
+            WHERE date >= %s AND ticker IN ({ph})
+        """
+        bind = tuple([cutoff] + chunk)
+        try:
+            parts.append(pd.read_sql_query(q, con=engine, params=bind))
+        except Exception:
+            continue
+    if not parts:
+        return pd.DataFrame()
+    ohlcv = pd.concat(parts, ignore_index=True)
+    if ohlcv.empty:
+        return pd.DataFrame()
+    ohlcv["ticker"] = ohlcv["ticker"].astype(str)
+    ohlcv["date"] = pd.to_datetime(ohlcv["date"], errors="coerce")
+    ohlcv = ohlcv.dropna(subset=["date"]).sort_values(["ticker", "date"]).reset_index(drop=True)
+    ohlcv["close"] = pd.to_numeric(ohlcv["close"], errors="coerce")
+
+    min_bars = int(BBW_WINDOW) + int(BBW_LOOKBACK)
+    metric_rows: list[dict] = []
+    for t, g in ohlcv.groupby("ticker", sort=False):
+        close = pd.to_numeric(g["close"], errors="coerce").reset_index(drop=True)
+        if len(close) < min_bars:
+            continue
+        band20_w = bollinger_band_width(close, window=BBW_WINDOW, n_sigma=BBW_SIGMA)
+        band20_q = bollinger_band_width_q(
+            close, window=BBW_WINDOW, n_sigma=BBW_SIGMA, lookback=BBW_LOOKBACK
+        )
+        mid = close.rolling(BBW_WINDOW, min_periods=BBW_WINDOW).mean()
+        std = close.rolling(BBW_WINDOW, min_periods=BBW_WINDOW).std(ddof=1)
+        up = mid + BBW_SIGMA * std
+        lo = mid - BBW_SIGMA * std
+        pb = (close - lo) / (up - lo).replace(0, np.nan)
+        try:
+            qv = float(band20_q.iloc[-1])
+            wv = float(band20_w.iloc[-1])
+            pbv = float(pb.iloc[-1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        metric_rows.append(
+            {"ticker": str(t), "band20_q": qv, "band20_w": wv, "pb": pbv}
+        )
+    if not metric_rows:
+        return pd.DataFrame()
+    mdf = pd.DataFrame(metric_rows)
+    out = sub.copy()
+    out["ticker"] = out["ticker"].astype(str)
+    return out.merge(mdf, on="ticker", how="inner")
+
+
+def _bband_squeeze_filter(m: pd.DataFrame) -> pd.DataFrame:
+    if m is None or getattr(m, "empty", True):
+        return pd.DataFrame()
+    out = m[m["band20_q"].notna() & (m["band20_q"] <= BBW_SQUEEZE_Q_MAX)].copy()
+    return out.sort_values("band20_q", ascending=True, na_position="last")
+
+
+def _bband_pb_filter(m: pd.DataFrame) -> pd.DataFrame:
+    if m is None or getattr(m, "empty", True):
+        return pd.DataFrame()
+    out = m.copy()
+    pb = pd.to_numeric(out.get("pb"), errors="coerce")
+    tv = pd.to_numeric(out.get("tv_rank"), errors="coerce")
+    out = out[
+        pb.notna()
+        & (pb >= BBW_PB_MIN)
+        & tv.notna()
+        & (tv <= BBW_PB_TV_RANK_MAX)
+    ].copy()
+    return out.sort_values("pb", ascending=False, na_position="last")
+
+
+def _bband_squeeze_table_html(sub: pd.DataFrame, highlight_set: set[str]) -> str:
+    if sub is None or getattr(sub, "empty", True):
+        return "<p>해당 없음</p>"
+
+    def _fmt_rs(v):
+        if pd.isna(v):
+            return ""
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    def _fmt_theme(th) -> str:
+        th = (th or "").strip() if pd.notna(th) else ""
+        if len(th) > 96:
+            return th[:95] + "…"
+        return th
+
+    rows: list[str] = []
+    for rank, (_, row) in enumerate(sub.iterrows(), start=1):
+        _tk = str(row.get("ticker", ""))
+        _hi = _tk in highlight_set
+        _chg = row.get("chg_pct")
+        _tk_cell = _krx_entity_html(_tk, _chg, bold=_hi)
+        _nm_cell = _krx_entity_html(row.get("name", ""), _chg, bold=_hi)
+        th = _fmt_theme(row.get("theme_str", ""))
+        bg = _krx_mcap_row_bg(row.get("mcap"))
+        qv = row.get("band20_q")
+        wv = row.get("band20_w")
+        pbv = row.get("pb")
+        try:
+            q_txt = f"{float(qv):.3f}" if qv is not None and np.isfinite(float(qv)) else ""
+        except (TypeError, ValueError):
+            q_txt = ""
+        try:
+            w_txt = f"{float(wv) * 100:.2f}" if wv is not None and np.isfinite(float(wv)) else ""
+        except (TypeError, ValueError):
+            w_txt = ""
+        try:
+            pb_txt = f"{float(pbv):.2f}" if pbv is not None and np.isfinite(float(pbv)) else ""
+        except (TypeError, ValueError):
+            pb_txt = ""
+        _tv_rank = row.get("tv_rank")
+        _tv_rank_txt = ""
+        try:
+            if _tv_rank is not None and not (
+                isinstance(_tv_rank, float) and (np.isnan(_tv_rank) or not np.isfinite(_tv_rank))
+            ):
+                _tv_rank_txt = f"{int(float(_tv_rank)):,}"
+        except Exception:
+            _tv_rank_txt = ""
+        rows.append(
+            f'<tr style="background-color:{bg};">'
+            f"<td style='text-align:center'{_html_sort_num_attr(rank)}>{rank}</td>"
+            f"<td>{_tk_cell}</td>"
+            f"<td>{_nm_cell}</td>"
+            f"<td>{html.escape(th)}</td>"
+            f"<td style='text-align:right'{_html_sort_num_attr(qv)}>{html.escape(q_txt)}</td>"
+            f"<td style='text-align:right'{_html_sort_num_attr(wv if w_txt else None)}>{html.escape(w_txt)}</td>"
+            f"<td style='text-align:right'{_html_sort_num_attr(pbv)}>{html.escape(pb_txt)}</td>"
+            f"{_krx_chg_pct_td(row.get('chg_pct'))}"
+            f"{_krx_chg_pct_td(row.get('chg_pct_5d'))}"
+            f"<td style='text-align:right'{_html_sort_num_attr(row.get('_rs_avg'))}>{_fmt_rs(row.get('_rs_avg'))}</td>"
+            f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_200d'))}>{_fmt_rs(row.get('rs_200d'))}</td>"
+            f"<td style='text-align:right'{_html_sort_num_attr(_tv_rank)}>{_tv_rank_txt}</td>"
+            f"<td style='text-align:center'>{'' if pd.isna(row.get('신고가여부')) else row.get('신고가여부', '')}</td>"
+            "</tr>"
+        )
+    return (
+        "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' "
+        "style='border-collapse:collapse;font-size:12px;width:100%;'>"
+        "<thead><tr>"
+        "<th>순위</th><th>종목코드</th><th>종목명</th><th>테마</th>"
+        "<th>BBW q</th><th>BBW(%)</th><th>%b</th>"
+        "<th>당일 상승률(%)</th><th>5일 상승률(%)</th>"
+        "<th>RSavg</th><th>RS200d</th><th>거래대금 순위</th><th>신고가여부</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
 def write_rs_high_list_html(
     engine,
     output_base_dir: str | None = None,
@@ -1837,6 +2046,7 @@ def write_rs_high_list_html(
     out_path = os.path.join(out_dir, "rs_high_list.html")
     out_talent_path = os.path.join(out_dir, "talent_list.html")
     out_energy_path = os.path.join(out_dir, "에너지배율.html")
+    out_bbw_path = os.path.join(out_dir, "볼린저밴드.html")
 
     q = """
         SELECT
@@ -1907,7 +2117,6 @@ def write_rs_high_list_html(
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    _rs_cols = ["rs_20d", "rs_50d", "rs_120d", "rs_200d"]
     df["_rs_avg"] = rs_avg(frame=df, cols=("rs_20d", "rs_50d", "rs_120d", "rs_200d"))
 
     df["mcap"] = pd.to_numeric(df.get("mcap"), errors="coerce")
@@ -2338,10 +2547,11 @@ def write_rs_high_list_html(
                 f"<td>{html.escape(th)}</td>"
                 f"{_krx_chg_pct_td(row.get('chg_pct'))}"
                 f"{_krx_chg_pct_td(row.get('chg_pct_5d'))}"
-                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_10d'))}>{_fmt_rs(row['rs_10d'])}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_20d'))}>{_fmt_rs(row['rs_20d'])}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_50d'))}>{_fmt_rs(row['rs_50d'])}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_120d'))}>{_fmt_rs(row['rs_120d'])}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(row.get('_rs_avg'))}>{_fmt_rs(row.get('_rs_avg'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_20d'))}>{_fmt_rs(row.get('rs_20d'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_50d'))}>{_fmt_rs(row.get('rs_50d'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_120d'))}>{_fmt_rs(row.get('rs_120d'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_200d'))}>{_fmt_rs(row.get('rs_200d'))}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(_tv_rank)}>{_tv_rank_txt}</td>"
                 f"<td style='text-align:center'>{'' if pd.isna(row.get('신고가여부')) else row.get('신고가여부', '')}</td>"
                 "</tr>"
@@ -2351,7 +2561,7 @@ def write_rs_high_list_html(
             "<thead><tr>"
             "<th>순위</th><th>전일 순위</th><th>순위 변동</th><th>종목코드</th><th>종목명</th><th>테마</th>"
             "<th>당일 상승률(%)</th><th>5일 상승률(%)</th>"
-            "<th>RS10d</th><th>RS20d</th><th>RS50d</th><th>RS120d</th>"
+            "<th>RSavg</th><th>RS20d</th><th>RS50d</th><th>RS120d</th><th>RS200d</th>"
             "<th>거래대금 순위</th>"
             "<th>신고가여부</th>"
             "</tr></thead><tbody>"
@@ -2592,6 +2802,84 @@ def write_rs_high_list_html(
     qm = df[df["market_type"] == "KOSDAQ"].copy().sort_values("_rs_avg", ascending=False, na_position="last")
     k = _filter_display_mcap(k)
     qm = _filter_display_mcap(qm)
+    k = _filter_rs_avg_min(k)
+    qm = _filter_rs_avg_min(qm)
+
+    kb = qb = kp = qp = pd.DataFrame()
+    try:
+        _mk = _bband_metrics_frame(engine, k)
+        _mq = _bband_metrics_frame(engine, qm)
+        kb, qb = _bband_squeeze_filter(_mk), _bband_squeeze_filter(_mq)
+        kp, qp = _bband_pb_filter(_mk), _bband_pb_filter(_mq)
+        if kb.empty and qb.empty:
+            print("⚠️ 볼린저밴드·밴드수축: 해당 종목 없음(OHLCV 부족 또는 q 조건 미충족)")
+        if kp.empty and qp.empty:
+            print("⚠️ 볼린저밴드·%b: 해당 종목 없음(%b/거래대금 순위 조건 미충족)")
+        bbw_html_doc = f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>볼린저밴드</title>
+  <style>
+    body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #111; background: #fafafa; }}
+    h1 {{ padding: 16px 20px; margin: 0; font-size: 1.25rem; background: #fff; border-bottom: 1px solid #e0e0e0; }}
+    .note {{ padding: 10px 20px; font-size: 13px; color: #444; background: #fff; border-bottom: 1px solid #eee; line-height: 1.5; }}
+    section {{ padding: 16px 20px 24px; }}
+    section h2 {{ font-size: 1.05rem; margin: 0 0 10px; }}
+  </style>
+</head>
+<body>
+  <h1>볼린저밴드</h1>
+  <div class="note">
+    기준일: <strong>{ref_d}</strong> (<code>krx_relative_strength</code> 최신 <code>date</code>).<br/>
+    대상: RS 리스트와 동일 모수(<strong>rs_avg ≥ {RS_LIST_MIN_AVG:g}</strong> · 시총 ≥ {DISPLAY_MCAP_MIN/1e8:,.0f}억 · 전역제외).<br/>
+    <strong>BBW q</strong> = (밴드폭 − 최근 {BBW_LOOKBACK}일 최소) / (최근 {BBW_LOOKBACK}일 최대 − 최소). 0에 가까울수록 수축.
+    1·2절은 q ≤ {BBW_SQUEEZE_Q_MAX:g} 만 표시하며 q 오름차순입니다.<br/>
+    <strong>BBW(%)</strong> = (상단 − 하단) / 중심선 × 100. 절대 밴드폭이며 필터 기준은 아닙니다.<br/>
+    <strong>%b</strong> = (종가 − 하단) / (상단 − 하단). 0 근처는 하단, 1 근처는 상단.<br/>
+    3·4절: RS 리스트와 같은 모수에서 거래대금 시장순위 {BBW_PB_TV_RANK_MAX}위 이내이면서
+    %b ≥ {BBW_PB_MIN:g} 인 종목입니다. %b 내림차순이며, 밴드 상단 돌파·근접 구간을 뜻합니다.
+    2절까지의 수축 표와 조건이 겹치지 않으므로 같은 종목이 양쪽에 나올 수 있습니다.<br/>
+    산출: 종가 {BBW_WINDOW}일 SMA ± {BBW_SIGMA:g}σ (표본표준편차 ddof=1), <code>indicators_core</code> 정본.<br/>
+    {KRX_TABLE_LEGEND_HTML}
+    파일: {html.escape(os.path.basename(out_bbw_path))}<br/>
+    <strong>표 정렬</strong>: 칼럼 헤더 클릭 시 해당 열 기준 오름·내림차순이 번갈아 적용됩니다.<br/>
+  </div>
+  <section>
+    <h2>1. 코스피 — 밴드 수축 (band20_q ≤ {BBW_SQUEEZE_Q_MAX:g}, {len(kb)}종목)</h2>
+    {_bband_squeeze_table_html(kb, _highlight_set)}
+  </section>
+  <section>
+    <h2>2. 코스닥 — 밴드 수축 ({len(qb)}종목)</h2>
+    {_bband_squeeze_table_html(qb, _highlight_set)}
+  </section>
+  <section>
+    <h2>3. 코스피 — %b {BBW_PB_MIN:g} 이상 · 거래대금 {BBW_PB_TV_RANK_MAX}위 이내 ({len(kp)}종목)</h2>
+    {_bband_squeeze_table_html(kp, _highlight_set)}
+  </section>
+  <section>
+    <h2>4. 코스닥 — %b {BBW_PB_MIN:g} 이상 · 거래대금 {BBW_PB_TV_RANK_MAX}위 이내 ({len(qp)}종목)</h2>
+    {_bband_squeeze_table_html(qp, _highlight_set)}
+  </section>
+{KRX_SORTABLE_TABLE_CSS_JS}
+</body>
+</html>"""
+        with open(out_bbw_path, "w", encoding="utf-8") as f:
+            f.write(bbw_html_doc)
+    except Exception as e:
+        print(f"⚠️ 볼린저밴드 리포트 실패: {type(e).__name__}: {e}")
+        try:
+            _empty_bbw = f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"/><title>볼린저밴드</title></head>
+<body><h1>볼린저밴드</h1><p>해당 없음</p>
+<p style="color:#666;font-size:13px;">생성 실패: {html.escape(type(e).__name__)}: {html.escape(str(e))}</p>
+</body></html>"""
+            with open(out_bbw_path, "w", encoding="utf-8") as f:
+                f.write(_empty_bbw)
+        except Exception:
+            pass
+
     _theme_blurb_k = _rs_top_theme_terms_html(k, "코스피 (KOSPI)")
     _theme_blurb_q = _rs_top_theme_terms_html(qm, "코스닥 (KOSDAQ)")
 
@@ -2711,7 +2999,6 @@ def write_rs_high_list_html(
                                 continue
                             tk = str(dd.loc[i, "ticker"])
                             nm = str(dd.loc[i, "name"]).strip()
-                            r10 = dd.loc[i, "rs_10d"]
                             ravg = dd.loc[i, "_rs_avg"]
                             label = f"{nm}({tk})" if nm else tk
                             cell_main = html.escape(label)
@@ -2719,11 +3006,6 @@ def write_rs_high_list_html(
                                 cell_main = f"<strong>{cell_main}</strong>"
                             cell_main = _krx_colored_html(cell_main, _rs20_chg_map.get((tk, dkey)))
                             tail_parts = []
-                            try:
-                                if r10 is not None and np.isfinite(float(r10)):
-                                    tail_parts.append(f"RS10 {float(r10):.1f}")
-                            except Exception:
-                                pass
                             try:
                                 if ravg is not None and np.isfinite(float(ravg)):
                                     tail_parts.append(f"AVG {float(ravg):.1f}")
@@ -2755,7 +3037,7 @@ def write_rs_high_list_html(
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>RS 리스트 (RS10d&gt;=90, RS4구간 평균 정렬)</title>
+  <title>RS 리스트 (rs_avg &gt;= 80, RS 가중평균 정렬)</title>
   <style>
     body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #111; background: #fafafa; }}
     h1 {{ padding: 16px 20px; margin: 0; font-size: 1.25rem; background: #fff; border-bottom: 1px solid #e0e0e0; }}
@@ -2777,7 +3059,7 @@ def write_rs_high_list_html(
   <h1>RS 고분위 리스트</h1>
   <div class="note">
     기준일: <strong>{ref_d}</strong> (<code>krx_relative_strength</code> 최신 <code>date</code>).<br/>
-    조건: 최신일 <code>krx_relative_strength</code> 전 종목. 순위: 시장별 <strong>rs_avg</strong>(0.4·rs_200+0.3·rs_120+0.2·rs_50+0.1·rs_20) 내림차순(평균 컬럼 미표시).<br/>
+    조건: 최신일 <code>krx_relative_strength</code> 중 <strong>rs_avg ≥ 80</strong> (상수 RS_LIST_MIN_AVG). 순위: 시장별 <strong>rs_avg</strong>(0.4·rs_200+0.3·rs_120+0.2·rs_50+0.1·rs_20) 내림차순.<br/>
     <strong>표시: 시총 3,000억 이상</strong> (계산 모수는 시장 전체 보통주·전역제외).<br/>
     테마는 <code>krx_theme_stock</code> 기준입니다.<br/>
     <strong>당일 상승률(%)</strong>: 최신 종가 ÷ 직전 거래일 종가 − 1. <strong>5일 상승률(%)</strong>: 최신 종가 ÷ 5거래일 전 종가 − 1.<br/>
@@ -2797,7 +3079,7 @@ def write_rs_high_list_html(
   <section>
     <h2>2. 코스피 — 최근 20거래일 일별 RS Top20</h2>
     <div class="note" style="margin: 0 0 10px 0;">
-      해당 시장 전체 유니버스에서 일별 rs_20·50·120·200d 산술평균 상위 20입니다(표시: 시총 3,000억 이상). 각 칸은 <code>종목명(티커)</code>와 RS10·AVG 요약입니다.<br/>
+      해당 시장 전체 유니버스에서 일별 rs_20·50·120·200d 산술평균 상위 20입니다(표시: 시총 3,000억 이상). 각 칸은 <code>종목명(티커)</code>와 AVG 요약입니다.<br/>
       <strong>볼드</strong>: 전일 Top20에 있던 종목이 당일에도 포함된 경우(시장별 표에만 적용).
     </div>
     <div class="rs20-wrap">
@@ -2893,12 +3175,24 @@ def write_rs_high_list_html(
 
             webbrowser.open(out_path)
             webbrowser.open(out_talent_path)
+            if os.path.isfile(out_bbw_path):
+                webbrowser.open(out_bbw_path)
         except Exception:
             pass
 
-        print(f"완료: RS 고분위 리스트 HTML 저장: {out_path} (총 {len(df)}건, 전 종목, rs_avg 순)")
+        print(f"완료: RS 고분위 리스트 HTML 저장: {out_path} "
+              f"(rs_avg≥{RS_LIST_MIN_AVG:g} · 코스피 {len(k)} / 코스닥 {len(qm)}건)")
         print(f"완료: Talent 리스트 HTML 저장: {out_talent_path} (Talent20/50/120)")
-    return out_path, set(df["ticker"].astype(str).tolist())
+        if os.path.isfile(out_bbw_path):
+            print(f"완료: 볼린저밴드 리포트 HTML 저장: {out_bbw_path}")
+            print(
+                f"  · 밴드수축(q≤{BBW_SQUEEZE_Q_MAX:g}) 코스피 {len(kb)} / 코스닥 {len(qb)} · "
+                f"%b≥{BBW_PB_MIN:g}(거래대금 {BBW_PB_TV_RANK_MAX}위내) 코스피 {len(kp)} / 코스닥 {len(qp)}"
+            )
+    _pb_ret = pd.concat([kp, qp], ignore_index=True)
+    if _pb_ret.empty or "ticker" not in _pb_ret.columns:
+        return out_path, set()
+    return out_path, set(_pb_ret["ticker"].astype(str).tolist())
 
 
 def _weekly_close_high_breakout_ox(g: pd.DataFrame, side: str = "high") -> tuple[str, str, str]:
@@ -7638,6 +7932,7 @@ def write_investor_net_buy_top_html(
     engine,
     output_base_dir: str | None = None,
     quiet: bool = False,
+    highlight_tickers: set[str] | None = None,
 ) -> str | None:
     """
     투자자구분별 순매수/순매도 Top20 → 투자자_순매수상위.html (4페이지 토글).
@@ -7648,6 +7943,7 @@ def write_investor_net_buy_top_html(
     out_dir = os.path.join(base, RUN_DATE_STR)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "투자자_순매수상위.html")
+    _highlight_set = {str(x) for x in (highlight_tickers or set())}
 
     try:
         ref_df = pd.read_sql_query(
@@ -8065,6 +8361,7 @@ def write_investor_net_buy_top_html(
                 except (TypeError, ValueError):
                     eok_s = ""
                 color = _KRX_COLOR_FLAT
+                prev_rk = None
                 if prev_d is not None:
                     prev_rk = rank_map.get((prev_d, tk))
                     if prev_rk is not None:
@@ -8072,7 +8369,10 @@ def write_investor_net_buy_top_html(
                             color = _KRX_COLOR_UP
                         elif rk > prev_rk:
                             color = _KRX_COLOR_DOWN
-                inner = f"{html.escape(nm)}<br>{html.escape(eok_s)}"
+                _nm_html = html.escape(nm)
+                if prev_rk is not None:
+                    _nm_html = f"<strong>{_nm_html}</strong>"
+                inner = f"{_nm_html}<br>{html.escape(eok_s)}"
                 tds.append(f"<td style='color:{color};text-align:left'>{inner}</td>")
             tr_cls = " class='latest'" if d == latest else ""
             body_rows.append(f"<tr{tr_cls}>{''.join(tds)}</tr>")
@@ -8162,11 +8462,13 @@ def write_investor_net_buy_top_html(
                     _mc = r.get("mcap")
                 else:
                     _mc = inv_mcap_map.get(_tk.zfill(6)) or inv_mcap_map.get(_tk)
+                _hi_i = (_tk in _highlight_set) or (_tk.zfill(6) in _highlight_set)
+                _chg_i = r.get("day_chg")
                 rows.append(
                     f'<tr style="background-color:{_krx_mcap_row_bg(_mc)};">'
                     f"<td style='text-align:center'{_html_sort_num_attr(i + 1)}>{i + 1}</td>"
-                    f"<td style='text-align:center'>{html.escape(_tk)}</td>"
-                    f"<td style='text-align:left'>{html.escape(str(r.get('name') or ''))}</td>"
+                    f"<td style='text-align:center'>{_krx_entity_html(_tk, _chg_i, bold=_hi_i)}</td>"
+                    f"<td style='text-align:left'>{_krx_entity_html(r.get('name') or '', _chg_i, bold=_hi_i)}</td>"
                     f"<td style='text-align:left'>{html.escape(str(r.get('sector') or ''))}</td>"
                     f"<td style='text-align:right;color:{col}'{_html_sort_num_attr(disp_nv)}>{_fmt_eok(disp_nv)}</td>"
                     f"<td style='text-align:right'{_html_sort_num_attr(disp_nq)}>{_fmt_qty(disp_nq)}</td>"
@@ -8237,7 +8539,11 @@ def write_investor_net_buy_top_html(
 
         return (
             _INVESTOR_PAGE_CSS
-            + f'<div class="note" style="padding:10px 4px;font-size:13px;color:#444;line-height:1.55;">{KRX_TABLE_LEGEND_HTML}</div>'
+            + f'<div class="note" style="padding:10px 4px;font-size:13px;color:#444;line-height:1.55;">'
+            f"{KRX_TABLE_LEGEND_HTML}"
+            "이 리포트에서 <strong>볼드</strong>는 상단 Top20 표에서는 3개 리포트 교집합, "
+            "하단 20거래일 그리드에서는 전일에도 같은 표에 있던 종목을 뜻합니다."
+            f"</div>"
             + "".join(sections)
             + KRX_SORTABLE_TABLE_CSS_JS
         )
@@ -8280,12 +8586,12 @@ def main():
     print("\n[1/2] 리포트 1차(교집합 산출) 시작... (빠른 DB 쿼리 위주)")
     mj_set = _mj_fast_top100_tickers_from_db(engine, quiet=False)
     print("[1/2] 시장판단(교집합용) 산출 완료. RS/신고가 리스트 산출 중...")
-    _, rs_set = write_rs_high_list_html(engine, highlight_tickers=None, quiet=True)
+    _, pb_set = write_rs_high_list_html(engine, highlight_tickers=None, quiet=True)
     _, bo_set = write_120d_breakout_list_html(engine, highlight_tickers=None, quiet=True)
 
-    hi = {str(x) for x in (mj_set & rs_set & bo_set)}
+    hi = {str(x) for x in (mj_set & pb_set)}
     if hi:
-        print(f"\n[2/2] 교집합 {len(hi)}종목: 최종 리포트 생성 및 브라우저 오픈 중...")
+        print(f"\n[2/2] 교집합 {len(hi)}종목(RS·거래대금·%b): 최종 리포트 생성 및 브라우저 오픈 중...")
         _, ohlcv_cache = run_market_dashboard(
             engine=engine, ticker_list=ticker_list, memory_cache=memory_cache, highlight_tickers=hi, quiet=False
         )
@@ -8299,11 +8605,11 @@ def main():
             quiet=False,
             memory_cache=memory_cache,
         )
-        write_investor_net_buy_top_html(engine, quiet=False)
+        write_investor_net_buy_top_html(engine, quiet=False, highlight_tickers=hi)
     else:
         print("\n[2/2] 교집합 종목이 없어, 저장된 리포트를 안내합니다.")
-        write_investor_net_buy_top_html(engine, quiet=False)
-        _announce_krx_reports_from_disk(len_rs=len(rs_set), len_bo=len(bo_set))
+        write_investor_net_buy_top_html(engine, quiet=False, highlight_tickers=set())
+        _announce_krx_reports_from_disk(len_rs=len(pb_set), len_bo=len(bo_set))
 
 
 if __name__ == "__main__":
