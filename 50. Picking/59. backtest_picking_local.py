@@ -598,7 +598,7 @@ def build_factor_panel_local(
         universe["r5"] = np.nan
 
     sector = pd.read_sql(
-        "SELECT ticker, sector_cd FROM krx_ticker_sector",
+        "SELECT ticker, sector_cd FROM v_ticker_market",
         engine,
     )
     if not sector.empty:

@@ -516,7 +516,7 @@ USE_ADJ_PRICE = True   # True 면 주봉·RS 가 close_adj 계열을 사용
 # False 로 되돌리면 즉시 원본 종가 기준으로 복귀한다(롤백 스위치)
 
 # 수정주가(액면분할·병합·무상증자) — investingmap price_adjustments.mjs 정본
-PRICE_ADJ_SCAN = True       # 수정주가 이벤트 탐지 실행 여부
+PRICE_ADJ_SCAN = False       # 수정주가 이벤트 탐지 실행 여부
 PRICE_ADJ_DRY_RUN = False    # True 면 탐지·리포트만, DB 쓰기 없음
 PRICE_ADJ_FILL = True       # 이벤트 적재 후 _adj 컬럼 채우기 (DRY_RUN=False 일 때만)
 
@@ -1421,6 +1421,9 @@ def update_krx_info():
 
 
     # ## DB 저장 쿼리
+    # ⚠️ krx_ticker_sector 는 더 이상 RS 유니버스에 쓰이지 않는다(2026-09-13).
+    # 적재 코드가 주석 처리돼 갱신되지 않으므로 다른 용도로도 신뢰하지 마라.
+    # 섹터 정보는 krx_stock_sector_map / v_ticker_sector_primary 를 쓴다.
 
     # con = pymysql.connect(user='root',
     # passwd=require_env('DB_PASSWORD'),
@@ -5090,6 +5093,34 @@ try:
 except Exception as e:
     print(f"⚠️ 테이블 생성 확인 중 오류: {e}")
 
+# v_ticker_market 뷰 생성 (krx_ticker_sector 대체)
+create_view_query = """
+CREATE OR REPLACE VIEW v_ticker_market AS
+SELECT t.종목코드 AS ticker,
+       t.종목명  AS cp_nm,
+       CASE t.시장구분 WHEN 'KOSPI' THEN '1001'
+                      WHEN 'KOSDAQ' THEN '2001' END AS sector_cd,
+       t.시장구분 AS sector_nm
+FROM krx_ticker t
+WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
+  AND t.종목구분 = '보통주'
+  AND t.시장구분 IN ('KOSPI', 'KOSDAQ');
+"""
+try:
+    mycursor.execute(create_view_query)
+    con.commit()
+    mycursor.execute("""
+        SELECT sector_nm, COUNT(*)
+        FROM v_ticker_market
+        GROUP BY sector_nm
+    """)
+    _vm_counts = dict(mycursor.fetchall())
+    _k_cnt = _vm_counts.get('KOSPI', 0)
+    _kd_cnt = _vm_counts.get('KOSDAQ', 0)
+    print(f"· v_ticker_market: KOSPI {_k_cnt}, KOSDAQ {_kd_cnt}")
+except Exception as e:
+    print(f"⚠️ v_ticker_market 뷰 생성 중 오류: {e}")
+
 # 상대강도 저장 쿼리
 query_rs = """
     insert into krx_relative_strength (ticker, date, market_type, rs_10d, rs_20d, rs_50d, rs_120d, rs_200d)
@@ -5107,19 +5138,17 @@ query_rs = """
 query_kospi = """
     SELECT DISTINCT t.종목코드, t.시장구분
     FROM krx_ticker t
-    INNER JOIN krx_ticker_sector ts ON t.종목코드 = ts.ticker
     WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-    AND t.종목구분 = '보통주'
-    AND ts.sector_cd = '1001';
+      AND t.종목구분 = '보통주'
+      AND t.시장구분 = 'KOSPI';
 """
 
 query_kosdaq = """
     SELECT DISTINCT t.종목코드, t.시장구분
     FROM krx_ticker t
-    INNER JOIN krx_ticker_sector ts ON t.종목코드 = ts.ticker
     WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-    AND t.종목구분 = '보통주'
-    AND ts.sector_cd = '2001';
+      AND t.종목구분 = '보통주'
+      AND t.시장구분 = 'KOSDAQ';
 """
 
 kospi_stocks = pd.read_sql(query_kospi, con=engine)
@@ -5127,6 +5156,7 @@ kosdaq_stocks = pd.read_sql(query_kosdaq, con=engine)
 
 print(f"코스피 종목 수: {len(kospi_stocks)}")
 print(f"코스닥 종목 수: {len(kosdaq_stocks)}")
+print("· RS 유니버스: krx_ticker.시장구분 기준 (krx_ticker_sector 의존 제거)")
 
 # 처리 대상 날짜 결정
 if RS_BACKFILL:

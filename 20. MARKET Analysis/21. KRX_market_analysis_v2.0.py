@@ -809,7 +809,7 @@ def _load_energy_ratio_lag_maps(
             """
             SELECT ts.sector_cd, SUM(t.시가총액) AS total_mcap
             FROM krx_ticker t
-            INNER JOIN krx_ticker_sector ts ON t.종목코드 = ts.ticker
+            INNER JOIN v_ticker_market ts ON t.종목코드 = ts.ticker
             WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
               AND t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001')
@@ -832,7 +832,7 @@ def _load_energy_ratio_lag_maps(
             FROM krx_ohlcv o
             INNER JOIN krx_ticker t ON t.종목코드 = o.ticker
                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-            INNER JOIN krx_ticker_sector ts ON ts.ticker = o.ticker
+            INNER JOIN v_ticker_market ts ON ts.ticker = o.ticker
             WHERE t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001')
               AND DATE(o.date) IN ({phd})
@@ -1692,7 +1692,7 @@ def _load_tv_top100_universe(
         q = """
             SELECT o.ticker AS ticker
             FROM krx_ohlcv o
-            INNER JOIN krx_ticker_sector ts
+            INNER JOIN v_ticker_market ts
                 ON ts.ticker = o.ticker AND ts.sector_cd = %s
             INNER JOIN krx_ticker t
                 ON t.종목코드 = o.ticker
@@ -1737,7 +1737,7 @@ def _krx_tv_rank_prev_by_ticker(engine) -> dict[str, float]:
             INNER JOIN krx_ticker t ON t.종목코드 = o.ticker
                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
                 AND t.종목구분 = '보통주'
-            INNER JOIN krx_ticker_sector ts ON ts.ticker = o.ticker
+            INNER JOIN v_ticker_market ts ON ts.ticker = o.ticker
                 AND ts.sector_cd IN ('1001', '2001')
             WHERE DATE(o.date) = DATE(%s)
         """
@@ -1761,7 +1761,7 @@ def _mj_fast_top100_tickers_from_db(engine, quiet: bool = False) -> set[str]:
     '최신 OHLCV 일자' 기준 코스피·코스닥 각각 거래대금 Top100 티커 집합만 DB에서 산출.
 
     - 거래대금 = close * volume (당일)
-    - 유니버스: krx_ticker_sector.sector_cd in ('1001','2001') + krx_ticker 최신 기준일 보통주
+    - 유니버스: v_ticker_market.sector_cd in ('1001','2001') + krx_ticker 최신 기준일 보통주
     - 반환: (코스피 Top100) ∪ (코스닥 Top100)
     - 부가: 기존 로직 호환을 위해 market_judgment_tv_rank.csv 형태로 함께 저장
     """
@@ -1793,7 +1793,7 @@ def _mj_fast_top100_tickers_from_db(engine, quiet: bool = False) -> set[str]:
                 o.close AS current_price,
                 (o.close * o.volume) AS trade_value
             FROM krx_ohlcv o
-            INNER JOIN krx_ticker_sector ts
+            INNER JOIN v_ticker_market ts
                 ON ts.ticker = o.ticker
                AND ts.sector_cd = %s
             INNER JOIN krx_ticker t
@@ -2266,7 +2266,7 @@ def write_rs_high_list_html(
     q_mcap_only = """
         SELECT ts.sector_cd, SUM(t.시가총액) AS total_mcap
         FROM krx_ticker t
-        INNER JOIN krx_ticker_sector ts ON t.종목코드 = ts.ticker
+        INNER JOIN v_ticker_market ts ON t.종목코드 = ts.ticker
         WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
           AND t.종목구분 = '보통주'
           AND ts.sector_cd IN ('1001', '2001')
@@ -2289,7 +2289,7 @@ def write_rs_high_list_html(
             FROM krx_ohlcv o
             INNER JOIN krx_ticker t ON t.종목코드 = o.ticker
                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-            INNER JOIN krx_ticker_sector ts ON ts.ticker = o.ticker
+            INNER JOIN v_ticker_market ts ON ts.ticker = o.ticker
             WHERE t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001')
               AND DATE(o.date) IN ({_phd})
@@ -3466,7 +3466,7 @@ def write_120d_breakout_list_html(
     """
     당일 신고가/신저가 달성(200·120·50일) 리스트 HTML (2페이지 토글).
 
-    - 코스피/코스닥 구분: `krx_ticker_sector.sector_cd` (1001/2001)
+    - 코스피/코스닥 구분: `v_ticker_market.sector_cd` (1001/2001)
     - 반환 티커 집합은 신고가 기준(호출부 호환). DB 저장도 신고가만.
     """
     base = output_base_dir or os.getenv("KRX_OUTPUT_DIR", DEFAULT_OUTPUT_BASE_DIR)
@@ -3493,11 +3493,11 @@ def write_120d_breakout_list_html(
 
     try:
         kospi_list = pd.read_sql_query(
-            "SELECT ticker FROM krx_ticker_sector WHERE sector_cd = '1001';",
+            "SELECT ticker FROM v_ticker_market WHERE sector_cd = '1001';",
             con=engine,
         )["ticker"].astype(str).tolist()
         kosdaq_list = pd.read_sql_query(
-            "SELECT ticker FROM krx_ticker_sector WHERE sector_cd = '2001';",
+            "SELECT ticker FROM v_ticker_market WHERE sector_cd = '2001';",
             con=engine,
         )["ticker"].astype(str).tolist()
     except Exception as e:
@@ -5300,7 +5300,7 @@ def run_market_dashboard(
         # universe: 보통주만 (krx_ticker 최신 기준일) + 전역 제외 유지
         _univ_sql = """
             SELECT ts.ticker
-            FROM krx_ticker_sector ts
+            FROM v_ticker_market ts
             INNER JOIN krx_ticker t ON t.종목코드 = ts.ticker
             WHERE ts.sector_cd = %s
               AND t.종목구분 = '보통주'
@@ -6739,7 +6739,7 @@ def run_market_dashboard(
         q_meta = """
             SELECT t.종목코드 AS ticker, t.종목명 AS name, t.시가총액 AS mcap, ts.sector_cd
             FROM krx_ticker t
-            INNER JOIN krx_ticker_sector ts ON t.종목코드 = ts.ticker
+            INNER JOIN v_ticker_market ts ON t.종목코드 = ts.ticker
             WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
               AND t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001');

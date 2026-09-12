@@ -3782,7 +3782,7 @@ def _energy_ratio_tradingkis_style(engine, tickers):
             FROM `{OHLCV_TABLE}` o
             INNER JOIN krx_ticker t ON t.종목코드 = o.ticker
                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-            INNER JOIN krx_ticker_sector ts ON ts.ticker = o.ticker
+            INNER JOIN v_ticker_market ts ON ts.ticker = o.ticker
             WHERE t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001')
               AND DATE(o.date) = %s
@@ -3793,7 +3793,7 @@ def _energy_ratio_tradingkis_style(engine, tickers):
         q_mkt_m = """
             SELECT ts.sector_cd, SUM(t.시가총액) AS total_mcap
             FROM krx_ticker t
-            INNER JOIN krx_ticker_sector ts ON t.종목코드 = ts.ticker
+            INNER JOIN v_ticker_market ts ON t.종목코드 = ts.ticker
             WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
               AND t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001')
@@ -3803,7 +3803,7 @@ def _energy_ratio_tradingkis_style(engine, tickers):
         mcap_by_sec = {str(r["sector_cd"]): float(r["total_mcap"] or 0) for _, r in mm.iterrows()}
         _ph = ",".join(["%s"] * len(ut))
         q_sec = f"""
-            SELECT ticker, sector_cd FROM krx_ticker_sector
+            SELECT ticker, sector_cd FROM v_ticker_market
             WHERE sector_cd IN ('1001', '2001') AND ticker IN ({_ph})
         """
         sec_df = pd.read_sql_query(q_sec, con=engine, params=tuple(ut))
@@ -4648,7 +4648,7 @@ def create_charts_for_selected_stocks(selected_stock_list, rs_df, money, risk, e
         else:
             try:
                 # 지수 가져오기
-                query = """select sector_cd, sector_nm from krx_ticker_sector where ticker = '{}';"""
+                query = """select sector_cd, sector_nm from v_ticker_market where ticker = '{}';"""
                 query = query.format(stock.iloc[-1].ticker)                
                 sector = pd.read_sql_query(query, con=engine)
                 sector = sector.set_index('sector_cd')

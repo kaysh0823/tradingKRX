@@ -1554,7 +1554,7 @@ def _ret_pct_by_date(df) -> dict:
 def _load_dashboard_energy_data(engine, tickers_z6):
     """
     KRX_market_analysis와 동일 스키마 가정:
-    거래대금 = close*volume, 시장 시총·거래대금은 krx_ticker_sector sector_cd 1001/2001 합산.
+    거래대금 = close*volume, 시장 시총·거래대금은 v_ticker_market sector_cd 1001/2001 합산.
     """
     empty = {
         "dates": [],
@@ -1579,7 +1579,7 @@ def _load_dashboard_energy_data(engine, tickers_z6):
         q_mcap_only = """
             SELECT ts.sector_cd, SUM(t.시가총액) AS total_mcap
             FROM krx_ticker t
-            INNER JOIN krx_ticker_sector ts ON t.종목코드 = ts.ticker
+            INNER JOIN v_ticker_market ts ON t.종목코드 = ts.ticker
             WHERE t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
               AND t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001')
@@ -1594,7 +1594,7 @@ def _load_dashboard_energy_data(engine, tickers_z6):
             FROM krx_ohlcv o
             INNER JOIN krx_ticker t ON t.종목코드 = o.ticker
                 AND t.기준일 = (SELECT MAX(기준일) FROM krx_ticker)
-            INNER JOIN krx_ticker_sector ts ON ts.ticker = o.ticker
+            INNER JOIN v_ticker_market ts ON ts.ticker = o.ticker
             WHERE t.종목구분 = '보통주'
               AND ts.sector_cd IN ('1001', '2001')
               AND DATE(o.date) IN ({_phd})
@@ -3366,7 +3366,7 @@ for k, v in tqdm(indicators_data.items(), desc="차트 생성 중", position=0, 
         continue
 
     # 지수 가져오기
-    query = """select sector_cd, sector_nm from krx_ticker_sector where ticker = '{}';"""
+    query = """select sector_cd, sector_nm from v_ticker_market where ticker = '{}';"""
     query = query.format(k)
     
     sector = pd.read_sql_query(query, con=engine)
