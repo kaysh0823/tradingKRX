@@ -178,6 +178,7 @@ except Exception:
 
 DEFAULT_DB_URL = db_url()
 DEFAULT_OUTPUT_BASE_DIR = r"C:\Users\hachi\OneDrive\01. Trading\picking\KRX"
+USE_ADJ_PRICE = True   # krx_ohlcv 과거 구간 조회 시 *_adj 컬럼 사용
 
 # 계산 모수 = 시장 전체 보통주(전역제외, 시총 하한 없음)
 # 리포트 표 표시/선정 필터만 시총 ≥ 3,000억
@@ -825,6 +826,7 @@ def _load_energy_ratio_lag_maps(
     phd = ",".join(["%s"] * len(date_strs))
     market_tv: dict[tuple[str, str], float] = {}
     try:
+        # SUM(o.close * o.volume): close_adj × volume_adj = close × volume 이므로 결과 동일 (원본 유지)
         q_mkt = f"""
             SELECT DATE(o.date) AS d, ts.sector_cd, SUM(o.close * o.volume) AS total_tv
             FROM krx_ohlcv o
@@ -845,6 +847,7 @@ def _load_energy_ratio_lag_maps(
 
     per_tv: dict[tuple[str, str], float] = {}
     try:
+        # SUM(o.close * o.volume): close_adj × volume_adj = close × volume 이므로 결과 동일 (원본 유지)
         for i in range(0, len(tickers), chunk):
             ct = tickers[i : i + chunk]
             pht = ",".join(["%s"] * len(ct))
@@ -870,7 +873,7 @@ def _load_energy_ratio_lag_maps(
                 ct = tickers[i : i + chunk]
                 pht = ",".join(["%s"] * len(ct))
                 q_ch = f"""
-                    SELECT ticker, date, close FROM krx_ohlcv
+                    SELECT ticker, date, {_adj("close")} FROM krx_ohlcv
                     WHERE date >= %s AND date <= %s AND ticker IN ({pht})
                     ORDER BY ticker, date
                 """
@@ -1230,6 +1233,8 @@ KRX_TABLE_LEGEND_HTML = (
     '<span style="color:#757575">회색 = 데이터 없음</span>.<br/>'
     '<strong>볼드</strong>: (종목 표) RS·거래대금·%b 3개 리포트에 모두 등장한 종목 / '
     '(20거래일 그리드) 전일에도 같은 표에 있던 종목.<br/>'
+    '가격·거래량은 액면분할·병합·무상증자를 소급 반영한 수정주가 기준입니다 '
+    '(krx_price_adjustment, 2026-09-12 적용). 시가총액·거래대금은 원본입니다.<br/>'
 )
 
 
@@ -1274,6 +1279,16 @@ def _krx_fmt_bn(x) -> str:
         return f"{v / KRX_MONEY_UNIT:,.1f}"
     except Exception:
         return ""
+
+
+def _adj(col: str, alias: str | None = None) -> str:
+    """가격·거래량 컬럼의 수정주가 별칭. USE_ADJ_PRICE=False 면 원본."""
+    a = alias or col.split(".")[-1]
+    if not USE_ADJ_PRICE:
+        return f"{col} AS {a}"
+    base = col.split(".")[-1]
+    pre = (col.rsplit(".", 1)[0] + ".") if "." in col else ""
+    return f"COALESCE({pre}{base}_adj, {col}) AS {a}"
 
 
 _KRX_SECTOR_MAP_CACHE: dict[int, dict[str, str]] = {}
@@ -1516,7 +1531,7 @@ def _compute_nd_close_high_breakout_flags(
         ct = tickers[i : i + chunk]
         ph = ",".join(["%s"] * len(ct))
         q = f"""
-            SELECT ticker, date, close
+            SELECT ticker, date, {_adj("close")}
             FROM krx_ohlcv
             WHERE date >= %s AND ticker IN ({ph})
         """
@@ -1628,7 +1643,7 @@ def _load_ticker_d0_chg_pct_map(engine, tickers: list[str], chunk: int = 400) ->
             chunk_t = [str(t) for t in tickers[i : i + chunk]]
             ph = ",".join(["%s"] * len(chunk_t))
             q = f"""
-                SELECT ticker, date, close
+                SELECT ticker, date, {_adj("close")}
                 FROM krx_ohlcv
                 WHERE date IN (%s, %s) AND ticker IN ({ph})
             """
@@ -1714,6 +1729,7 @@ def _krx_tv_rank_prev_by_ticker(engine) -> dict[str, float]:
         if len(dl) < 2:
             return {}
         d_prev_s = pd.Timestamp(dl[1]).normalize().strftime("%Y-%m-%d")
+        # SUM(o.close * o.volume): close_adj × volume_adj = close × volume 이므로 결과 동일 (원본 유지)
         q = """
             SELECT o.ticker AS ticker, ts.sector_cd AS sector_cd,
                    (o.close * o.volume) AS tv
@@ -1768,6 +1784,8 @@ def _mj_fast_top100_tickers_from_db(engine, quiet: bool = False) -> set[str]:
         d_str = ""
 
     for sector_cd in ("1001", "2001"):
+        # o.close AS current_price: 최신일 기준이라 조정계수가 항상 1 (원본 유지)
+        # (o.close * o.volume): close_adj × volume_adj = close × volume 동일
         q = """
             SELECT
                 o.ticker AS ticker,
@@ -1888,7 +1906,7 @@ def _compute_250d_high_flag_map(engine, tickers: list[str], roll_d: int = 250, l
         chunk = [str(x) for x in tickers[i : i + chunk_size]]
         ph = ",".join(["%s"] * len(chunk))
         q = f"""
-            SELECT ticker, date, high, close
+            SELECT ticker, date, {_adj("high")}, {_adj("close")}
             FROM krx_ohlcv
             WHERE date >= %s AND ticker IN ({ph})
         """
@@ -1949,7 +1967,7 @@ def _bband_metrics_frame(engine, sub: pd.DataFrame) -> pd.DataFrame:
         chunk = [str(x) for x in tickers[i : i + chunk_size]]
         ph = ",".join(["%s"] * len(chunk))
         q = f"""
-            SELECT ticker, date, close
+            SELECT ticker, date, {_adj("close")}
             FROM krx_ohlcv
             WHERE date >= %s AND ticker IN ({ph})
         """
@@ -2131,7 +2149,8 @@ def write_rs_high_list_html(
     out_energy_path = os.path.join(out_dir, "에너지배율.html")
     out_bbw_path = os.path.join(out_dir, "볼린저밴드.html")
 
-    q = """
+    # 최신일 1행이라 조정계수 1이지만 표시 일관성을 위해 last_close·last_volume 둘 다 _adj 적용
+    q = f"""
         SELECT
             r.ticker,
             r.date,
@@ -2143,8 +2162,8 @@ def write_rs_high_list_html(
             r.rs_200d,
             t.종목명 AS name,
             t.시가총액 AS mcap,
-            o.close AS last_close,
-            o.volume AS last_volume
+            {_adj("o.close", "last_close")},
+            {_adj("o.volume", "last_volume")}
         FROM krx_relative_strength r
         INNER JOIN (
             SELECT MAX(date) AS d FROM krx_relative_strength
@@ -2264,6 +2283,7 @@ def write_rs_high_list_html(
     market_tv_by_date_sec: dict[tuple[str, str], float] = {}
     if _active_strs:
         _phd = ",".join(["%s"] * len(_active_strs))
+        # SUM(o.close * o.volume): close_adj × volume_adj = close × volume 동일 (원본 유지)
         q_mkt_tv = f"""
             SELECT DATE(o.date) AS d, ts.sector_cd, SUM(o.close * o.volume) AS total_tv
             FROM krx_ohlcv o
@@ -2289,6 +2309,7 @@ def write_rs_high_list_html(
     if _active_strs and _tickers:
         _phd = ",".join(["%s"] * len(_active_strs))
         try:
+            # SUM(o.close * o.volume): close_adj × volume_adj = close × volume 동일 (원본 유지)
             for _i in range(0, len(_tickers), _chunk):
                 _chunk_t = _tickers[_i : _i + _chunk]
                 _pht = ",".join(["%s"] * len(_chunk_t))
@@ -2376,6 +2397,7 @@ def write_rs_high_list_html(
     if _active_strs and _extra_tv:
         _phd = ",".join(["%s"] * len(_active_strs))
         try:
+            # SUM(o.close * o.volume): close_adj × volume_adj = close × volume 동일 (원본 유지)
             for _i in range(0, len(_extra_tv), _chunk):
                 _chunk_t = _extra_tv[_i : _i + _chunk]
                 _pht = ",".join(["%s"] * len(_chunk_t))
@@ -2427,7 +2449,7 @@ def write_rs_high_list_html(
                 _chunk_t = _tickers_all[_i : _i + _chunk]
                 _pht = ",".join(["%s"] * len(_chunk_t))
                 q_ch = f"""
-                    SELECT ticker, date, close FROM krx_ohlcv
+                    SELECT ticker, date, {_adj("close")} FROM krx_ohlcv
                     WHERE date >= %s AND date <= %s AND ticker IN ({_pht})
                     ORDER BY ticker, date
                 """
@@ -2488,7 +2510,7 @@ def write_rs_high_list_html(
                     _chunk_t = _tickers_all[_i : _i + _chunk]
                     _pht = ",".join(["%s"] * len(_chunk_t))
                     q_tc = f"""
-                        SELECT o.ticker, o.date, o.open, o.close
+                        SELECT o.ticker, o.date, {_adj("o.open")}, {_adj("o.close")}
                         FROM krx_ohlcv o
                         WHERE o.date >= %s AND o.ticker IN ({_pht})
                         ORDER BY o.ticker, o.date
@@ -3124,7 +3146,7 @@ def write_rs_high_list_html(
                         _ct = _rs20_tks[_i : _i + _chunk_rs]
                         _pht = ",".join(["%s"] * len(_ct))
                         _qoh = f"""
-                            SELECT ticker, date, close
+                            SELECT ticker, date, {_adj("close")}
                             FROM krx_ohlcv
                             WHERE date IN ({_phd}) AND ticker IN ({_pht})
                         """
@@ -3494,7 +3516,7 @@ def write_120d_breakout_list_html(
         chunk = universe[i : i + chunk_size]
         ph = ",".join(["%s"] * len(chunk))
         q = f"""
-            SELECT ticker, date, high, low, close, volume
+            SELECT ticker, date, {_adj("high")}, {_adj("low")}, {_adj("close")}, {_adj("volume")}
             FROM krx_ohlcv
             WHERE date >= %s AND ticker IN ({ph})
         """
@@ -4245,7 +4267,7 @@ def _market_dash_load_ohlcv_parallel(
     def _load_chunk(chunk: list[str]) -> pd.DataFrame:
         ph = ",".join(["%s"] * len(chunk))
         q = f"""
-            SELECT ticker, date, open, high, low, close, volume, mcap
+            SELECT ticker, date, {_adj("open")}, {_adj("high")}, {_adj("low")}, {_adj("close")}, {_adj("volume")}, mcap
             FROM krx_ohlcv
             WHERE ticker IN ({ph}) AND date >= %s
             ORDER BY ticker, date
@@ -5262,6 +5284,7 @@ def run_market_dashboard(
     """코스피/코스닥 시장 대시보드 + 거래대금 HTML 생성. (Top100 티커 집합, OHLCV 캐시) 반환."""
 
     _log = print if not quiet else (lambda *a, **k: None)
+    _log(f"· USE_ADJ_PRICE={USE_ADJ_PRICE} (과거 구간 OHLCV 수정주가 사용)")
     ohlcv_data: dict = {}
     # 대시보드 HTML 재기록용(후단에서 ATR 산점도 페이지를 붙여 최종 조립)
     dash_state: dict = {"path": None, "figs": None}
@@ -5313,6 +5336,7 @@ def run_market_dashboard(
         )
 
         def load_index_ohlcv(index_ticker: str) -> pd.DataFrame:
+            # krx_index_ohlcv: 지수는 조정 대상이 아니므로 그대로 둔다.
             q = f"select date, close, volume from krx_index_ohlcv where ticker = '{index_ticker}';"
             df = pd.read_sql_query(q, con=engine)
             if df.empty:
@@ -6573,7 +6597,7 @@ def run_market_dashboard(
                     chunk = need_db[i : i + chunk_size]
                     ph = ",".join(["%s"] * len(chunk))
                     q = f"""
-                        SELECT ticker, date, open, high, low, close, volume, mcap
+                        SELECT ticker, date, {_adj("open")}, {_adj("high")}, {_adj("low")}, {_adj("close")}, {_adj("volume")}, mcap
                         FROM krx_ohlcv
                         WHERE date >= %s AND ticker IN ({ph})
                     """
@@ -8359,7 +8383,7 @@ def write_investor_net_buy_top_html(
         try:
             hist = pd.read_sql_query(
                 f"""
-                SELECT ticker, date, close
+                SELECT ticker, date, {_adj("close")}
                 FROM krx_ohlcv
                 WHERE date >= %s AND date <= %s AND ticker IN ({ph})
                 """,
@@ -8754,6 +8778,7 @@ def write_investor_net_buy_top_html(
 
 
 def main():
+    print(f"· USE_ADJ_PRICE={USE_ADJ_PRICE} (과거 구간 OHLCV 수정주가 사용)")
     engine = _create_engine()
     ticker_list = _load_latest_ticker_list(engine)
 
