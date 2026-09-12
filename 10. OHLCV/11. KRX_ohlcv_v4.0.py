@@ -5000,6 +5000,28 @@ if PRICE_ADJ_SCAN:
                     _pa_con.commit()
                     _pa_adj_updated += len(_upd)
 
+        # naverPub 동기화용 CSV 내보내기 (VPS 는 DB 직결 대신 CSV 로 반영)
+        _np_dir = os.path.join(str(_pa_repo), "naverPub", "data")
+        os.makedirs(_np_dir, exist_ok=True)
+        _np_csv = os.path.join(_np_dir, "price_adjustment.csv")
+        _np_df = pd.read_sql_query(
+            """
+            SELECT ticker, effective_date, ratio, type, source, review
+            FROM krx_price_adjustment
+            ORDER BY ticker, effective_date
+            """,
+            con=engine,
+        )
+        if _np_df is not None:
+            if not _np_df.empty:
+                _np_df["ticker"] = _np_df["ticker"].astype(str).str.zfill(6)
+                _np_df["effective_date"] = pd.to_datetime(
+                    _np_df["effective_date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                _np_df["review"] = pd.to_numeric(_np_df["review"], errors="coerce").fillna(0).astype(int)
+            _np_df.to_csv(_np_csv, index=False, encoding="utf-8")
+            print(f"· naverPub 동기화용 CSV: {_np_csv} ({len(_np_df):,}행)")
+
     else:
         print("· DRY_RUN — DB 쓰기·_adj 채우기 생략")
 
