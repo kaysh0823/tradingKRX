@@ -180,6 +180,23 @@ CHART_PERIOD_DAYS = 252
 
 # --- 일봉/주봉 공용 설정 (주봉 래퍼가 덮어씀) ---
 OHLCV_TABLE = "krx_ohlcv"
+USE_ADJ_PRICE = True   # 일봉(krx_ohlcv) 조회 시 *_adj 컬럼 사용
+
+
+def _ohlcv_cols_sql() -> str:
+    """일봉 테이블일 때만 수정주가 별칭. 주봉(krx_ohlcv_week)은 이미 조정가라 원본 그대로."""
+    if USE_ADJ_PRICE and OHLCV_TABLE == "krx_ohlcv":
+        return (
+            "date, "
+            "COALESCE(open_adj, open)     AS open, "
+            "COALESCE(high_adj, high)     AS high, "
+            "COALESCE(low_adj, low)       AS low, "
+            "COALESCE(close_adj, close)   AS close, "
+            "COALESCE(volume_adj, volume) AS volume"
+        )
+    return "date, open, high, low, close, volume"
+
+
 # 이름=주봉 의미(1·2·4·13·26·52주), 값=일봉 기본 거래일
 WIN_1, WIN_2, WIN_4, WIN_13, WIN_26, WIN_52 = 5, 10, 20, 50, 120, 200
 RS_PERIODS = (10, 20, 50, 120, 200)
@@ -1003,7 +1020,7 @@ def load_single_ticker_ohlcv(ticker, ticker_list, engine):
         # KRX 통일 후 name/market/mcap 등 추가 → select * + insert(name) 충돌 방지
         ohlcv = pd.read_sql_query(
             f"""
-            SELECT date, open, high, low, close, volume
+            SELECT {_ohlcv_cols_sql()}
             FROM `{OHLCV_TABLE}`
             WHERE ticker = %s
             ORDER BY date
@@ -1231,6 +1248,8 @@ def calculate_volume_band_parallel(ohlcv_data, max_workers=6):
 # ---------------------------------------------------------------------------
 # [1] 패턴 레지스트리 골격
 # ---------------------------------------------------------------------------
+# 측정 기준: 2026-09-12 · 통합풀 RS(지수 포함) + 수정주가(close_adj)
+#   이전 측정(시장별 RS · 미조정 가격)과 값이 다르다.
 
 PATTERN_REGISTRY = {}   # code -> {"fn","group","name","params"}
 
@@ -1238,7 +1257,11 @@ PATTERN_REGISTRY = {}   # code -> {"fn","group","name","params"}
 DISABLED_PATTERNS = {
     "p13", "p14", "p17", "p27", "p34", "p43", "p61",
     "p25", "p26",   # p24 와 중복(Jaccard 0.72/0.36), 성과 동일 → p24 로 통합
-    "p41",          # 58 매물대(2023-01~2026-09, 78히트): h20Δ−0.016/h60Δ−0.037, 승률0.338(base0.383) → 폐기
+    "p41",          # 58 재측정(68히트): h60Δ −0.0715, 양구간 음수(−0.052/−0.100),
+                    #   승률 0.299 → 폐기 유지
+    "p42",          # 58 매물대 첫 측정(EVAL_VOLUME_PROFILE, 1,658히트):
+                    #   h60Δ +0.0009(사실상 0) · 승률 0.371(base 0.386) · 일관성 △
+                    #   베이스와 구별 불가 → 폐기
     "p53",          # p53: 58 구간분할(2023~24 / 2025~26) h60Δ = -0.062 / +0.095.
                     #      한 구간 의존, 표본 150/305, std 0.52~0.59 → 신뢰 불가
 }
@@ -1247,39 +1270,36 @@ DISABLED_PATTERNS = {
 #        선정 목록에는 넣지 않고 참고용으로만 계산한다.
 REFERENCE_PATTERNS = {"p71", "p81", "p93"}
 
-# 58 구간분할 검증 등급 (2023-01~2026-09)
-# A: 두 구간 모두 h60Δ ≥ +0.02
-# B: 두 구간 모두 양수지만 약함
-# C: 한 구간에만 의존 (△) — 재검토 대상
+# 58 구간분할 검증 (2026-09-12 · 통합풀 RS + 수정주가 기준)
+# A: 두 구간 모두 h60Δ ≥ +0.02 / B: 두 구간 양수이나 약함 / C: 한 구간 의존(△)
 PATTERN_GRADE = {
-    "p52": "A", "p51": "A", "p16": "A", "p29a": "A", "p33": "A", "p12": "A",
-    "p92": "B", "p31": "B", "p28": "B", "p23": "B", "p55": "B",
-    "p54": "B", "p32": "B", "p21": "B", "p11": "B", "p15": "B",
-    "p91": "C", "p36": "C", "p22": "C", "p24": "C", "p25": "C",
-    "p26": "C", "p35": "C",
+    "p11": "A", "p15": "A", "p16": "A", "p28": "A", "p32": "A",
+    "p51": "A", "p52": "A",
+    "p12": "B", "p21": "B", "p23": "B", "p24": "B", "p29a": "B",
+    "p31": "B", "p33": "B", "p36": "B", "p91": "B", "p92": "B",
+    "p22": "C", "p35": "C", "p54": "C", "p55": "C",
 }
+# 주: p33 은 2023~24 가 +0.0199 로 A 기준(0.02)에 0.0001 미달이다. 경계값.
 
-# 58 섹터중립 판정 (전체 기간, pattern_eval_sector_neutral.csv)
-# 잔존율 = h60Δ_섹터 ÷ h60Δ_시장
-#   종목: 잔존율 ≥ 0.7  — 섹터를 중립화해도 초과수익이 남음(종목 선택 알파)
-#   혼합: 0.3 ~ 0.7
-#   업종: < 0.3         — 초과수익이 대부분 업종 베타
-#   미판정: 시장Δ ≤ 0 이라 비율이 의미 없음 / 히트 0
-# 주의: 구간분할이 아닌 전체 기간 1회 측정이다. PATTERN_GRADE(구간분할)와 축이 다르다.
+# 58 섹터중립 (2026-09-12 전체기간). 잔존율 = h60Δ_섹터 ÷ h60Δ_시장
+#   종목 ≥0.7 / 혼합 0.3~0.7 / 업종 <0.3 / 미판정 = 시장Δ ≤ 0
+# 주의: p81(32.1)·p42(7.05)·p61(3.85)·p32(3.88) 등은 분모가 0에 가까워
+#       비율이 과장돼 있다. 부호와 대략적 크기만 참고할 것.
 PATTERN_SECTOR_TYPE = {
     # 종목형
-    "p91": "종목", "p52": "종목", "p51": "종목", "p36": "종목", "p16": "종목",
-    "p92": "종목", "p31": "종목", "p29a": "종목", "p33": "종목", "p12": "종목",
-    "p28": "종목", "p54": "종목", "p35": "종목", "p55": "종목", "p32": "종목",
-    "p15": "종목", "p93": "종목", "p81": "종목",
+    "p51": "종목", "p91": "종목", "p52": "종목", "p36": "종목", "p15": "종목",
+    "p31": "종목", "p16": "종목", "p26": "종목", "p92": "종목", "p32": "종목",
+    "p55": "종목", "p54": "종목", "p28": "종목", "p12": "종목", "p35": "종목",
+    "p29a": "종목", "p93": "종목", "p21": "종목", "p61": "종목", "p42": "종목",
+    "p81": "종목",
     # 혼합
-    "p26": "혼합", "p11": "혼합", "p21": "혼합",
+    "p24": "혼합", "p25": "혼합", "p33": "혼합",
     # 업종형
-    "p22": "업종", "p53": "업종", "p24": "업종", "p25": "업종", "p23": "업종",
-    "p71": "업종",
-    # 미판정
-    "p14": "미판정", "p34": "미판정", "p61": "미판정", "p43": "미판정",
-    "p13": "미판정", "p17": "미판정", "p27": "미판정",
+    "p53": "업종", "p23": "업종", "p11": "업종", "p22": "업종",
+    "p71": "업종", "p13": "업종",
+    # 미판정 (시장Δ ≤ 0 이라 비율 무의미)
+    "p34": "미판정", "p14": "미판정", "p17": "미판정",
+    "p43": "미판정", "p41": "미판정", "p27": "미판정",
 }
 
 def _sector_type(code: str) -> str:
@@ -3828,7 +3848,9 @@ def _energy_ratio_tradingkis_style(engine, tickers):
                     chunk = ut[i0 : i0 + _chunk]
                     _pc = ",".join(["%s"] * len(chunk))
                     q_ch = f"""
-                        SELECT ticker, date, close FROM `{OHLCV_TABLE}`
+                        SELECT ticker, date,
+                               {"COALESCE(close_adj, close) AS close" if USE_ADJ_PRICE and OHLCV_TABLE == "krx_ohlcv" else "close"}
+                        FROM `{OHLCV_TABLE}`
                         WHERE date IN (%s, %s) AND ticker IN ({_pc})
                     """
                     cdf = pd.read_sql_query(q_ch, con=engine, params=tuple([d0s, d1s] + chunk))
@@ -4737,6 +4759,7 @@ def run_main(do_summary=True, do_charts=False):
     # 성능 모니터링 시작
     print("=" * 80)
     print("🚀 최적화된 KRX 주식 선별 시스템 시작")
+    print(f"· USE_ADJ_PRICE={USE_ADJ_PRICE} / OHLCV_TABLE={OHLCV_TABLE}")
     print("=" * 80)
 
     start_time = time.time()
