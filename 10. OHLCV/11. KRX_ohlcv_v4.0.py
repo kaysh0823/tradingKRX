@@ -358,6 +358,7 @@ def sync_krx_ohlcv_from_reference_csv_dir(
                 print(f'  ⚠ 참조 CSV 컬럼 매핑 실패 또는 빈 파일: {fpath}')
                 continue
             ref_days_compared += 1
+            # 참조 CSV 정합: KRX 원본과 대조하는 검사이므로 원본 OHLC 를 읽는다(close_adj 금지).
             mycursor.execute(
                 'SELECT ticker, open, high, low, close, volume FROM krx_ohlcv WHERE `date` = %s',
                 (cur_d,),
@@ -511,6 +512,8 @@ OHLCV_REFETCH_DATES = None         # 예: ['20260508', '20260514']
 # ('YYYYMMDD','YYYYMMDD') 지정 시 해당 구간 전 거래일 재수집. None이면 미사용.
 OHLCV_REFETCH_RANGE = None      # 예: ('20220711', '20260901')
 WEEKLY_REBUILD = False  # True: 주봉 테이블 전량 삭제 후 일봉→W-FRI 재적재
+USE_ADJ_PRICE = True   # True 면 주봉·RS 가 close_adj 계열을 사용
+# False 로 되돌리면 즉시 원본 종가 기준으로 복귀한다(롤백 스위치)
 
 # 수정주가(액면분할·병합·무상증자) — investingmap price_adjustments.mjs 정본
 PRICE_ADJ_SCAN = True       # 수정주가 이벤트 탐지 실행 여부
@@ -932,6 +935,7 @@ def detect_price_adjustment(mycursor, day_df, day_str, tol=0.02, top=10):
     day_d = _as_plain_date(day_str)
     if day_d is None:
         return []
+    # KRX CSV 원본 등락률과 DB 원본 종가를 비교하는 정합 검사이므로 close_adj 를 쓰지 않는다.
     mycursor.execute(
         "SELECT ticker, close FROM krx_ohlcv "
         "WHERE date = (SELECT MAX(date) FROM krx_ohlcv WHERE date < %s)",
@@ -1011,6 +1015,7 @@ def build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=50):
     krx_ohlcv 일봉 → 주봉(금요일 기준 W-FRI) 리샘플 후 krx_ohlcv_week upsert.
     종목별 네이버 요청 없이 DB만 사용.
     WEEKLY_REBUILD=True 이면 적재 전 krx_ohlcv_week 전량 삭제.
+    USE_ADJ_PRICE=True 이면 수정주가로 리샘플하므로 과거 주봉이 바뀐다 — WEEKLY_REBUILD=True 로 전량 재구축할 것.
     """
     if WEEKLY_REBUILD:
         print('  · WEEKLY_REBUILD=True — krx_ohlcv_week 재구축(전량 삭제 후 재적재)')
@@ -1021,17 +1026,28 @@ def build_weekly_ohlcv_from_daily(mycursor, con, ticker_codes, batch_size=50):
         ON DUPLICATE KEY UPDATE
         open=new.open, high=new.high, low=new.low, close=new.close, volume=new.volume
     """
+    # USE_ADJ_PRICE: 별칭을 open/high/low/close/volume 으로 맞춰 하위 리샘플 로직은 그대로 둔다.
+    _daily_sel = (
+        """
+                SELECT `date`,
+                       COALESCE(open_adj, open)     AS open,
+                       COALESCE(high_adj, high)     AS high,
+                       COALESCE(low_adj, low)       AS low,
+                       COALESCE(close_adj, close)   AS close,
+                       COALESCE(volume_adj, volume) AS volume
+                FROM krx_ohlcv WHERE ticker=%s ORDER BY `date`
+        """
+        if USE_ADJ_PRICE
+        else """
+                SELECT `date`, open, high, low, close, volume
+                FROM krx_ohlcv WHERE ticker=%s ORDER BY `date`
+        """
+    )
     commit_counter = 0
     error_list = []
     for ticker in tqdm(ticker_codes, desc='주봉(일봉→리샘플)'):
         try:
-            mycursor.execute(
-                """
-                SELECT `date`, open, high, low, close, volume
-                FROM krx_ohlcv WHERE ticker=%s ORDER BY `date`
-                """,
-                (ticker,),
-            )
+            mycursor.execute(_daily_sel, (ticker,))
             rows = mycursor.fetchall()
             if not rows:
                 continue
@@ -1566,6 +1582,7 @@ print(f'기준 영업일(biz_day): {biz_day}')
 print('=' * 60)
 print('2. OHLCV 가져오기 시작')
 print('=' * 60)
+print(f'· USE_ADJ_PRICE={USE_ADJ_PRICE} (주봉·RS 가 수정주가 사용)')
 
 con = pymysql.connect(user=require_env('DB_USER'),
 passwd=require_env('DB_PASSWORD'),
@@ -1586,6 +1603,7 @@ ticker_codes = ticker_list['종목코드'].tolist()
 
 
 ### 일봉 — KRX MDCSTAT01501 일자 CSV (전종목 1요청/일). DB MAX(date) 자동 증분.
+# 일봉 수집·upsert 경로는 원본 저장이 목적이므로 close_adj 를 읽거나 쓰지 않는다.
 
 print(' - 일봉 데이터를 저장합니다. (KRX CSV MDCSTAT01501, DB 자동 증분)')
 
@@ -4767,6 +4785,7 @@ if PRICE_ADJ_SCAN:
         if not _ct:
             continue
         _ph = ",".join(["%s"] * len(_ct))
+        # 수정주가 탐지: mcap÷close 로 상장주식수 역산. close_adj 를 쓰면 이벤트를 다시 못 찾는다.
         _q = f"""
             SELECT ticker, date, open, high, low, close, volume, mcap
             FROM krx_ohlcv
@@ -5004,6 +5023,8 @@ if PRICE_ADJ_SCAN:
 # RS 정의 변경(2026-09-12): 시장별 → 전체 통합풀 원시수익률 백분위.
 # 지수 2종(IDX1001/IDX2001)이 구성원으로 포함된다.
 # 정의가 바뀌었으므로 전 기간 재산출이 필요하다 → RS_BACKFILL=True 로 1회 실행.
+# 2026-09-12: 수정주가(close_adj) 기반으로 전환. 정의 변경이므로 RS_BACKFILL=True 로
+#  전 기간 재산출이 필요하다.
 # 51 스크리닝 임계값·58 패턴 평가 결과는 기존 정의 기준이므로 재검증이 필요하다.
 # RS_BACKFILL=True: krx_ohlcv 전체 날짜를 벡터 로직으로 재계산·upsert (일회성 백필)
 # RS_BACKFILL=False: 미처리 날짜만 (기본)
@@ -5011,6 +5032,7 @@ RS_BACKFILL = False
 
 print('상대강도(RS) 산출 및 저장 시작')
 print(f"· RS_BACKFILL={RS_BACKFILL}")
+print(f"· USE_ADJ_PRICE={USE_ADJ_PRICE} (주봉·RS 가 수정주가 사용)")
 
 ## DB 연결
 con = pymysql.connect(user=require_env('DB_USER'),
@@ -5363,16 +5385,20 @@ def _lookback_start(chunk_min_date, n_days: int):
     return chunk_min_date
 
 
-def _save_rs_rows(rows: list) -> int:
+def _save_rs_rows(rows: list, *, auto_commit: bool = True) -> int:
+    """RS 행 배치 upsert. auto_commit=False 이면 호출측 트랜잭션에 맡긴다."""
     saved = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         try:
             mycursor.executemany(query_rs, batch)
-            con.commit()
+            if auto_commit:
+                con.commit()
             saved += len(batch)
         except Exception as e:
             print(f"⚠️ 배치 저장 오류 (offset={i}): {e}")
+            if not auto_commit:
+                raise
             for row in batch:
                 try:
                     mycursor.execute(query_rs, row)
@@ -5404,6 +5430,7 @@ else:
 
         total_dates_done = 0
         total_rows_saved = 0
+        total_rows_deleted = 0
 
         for yr in years:
             chunk = dates_to_process.loc[dates_to_process['_year'] == yr, 'date'].tolist()
@@ -5417,12 +5444,21 @@ else:
             )
 
             ohlcv_all = pd.read_sql(
-                """
+                (
+                    """
+                SELECT ticker, date, COALESCE(close_adj, close) AS close
+                FROM krx_ohlcv
+                WHERE date >= %s AND date <= %s
+                ORDER BY date, ticker;
+                    """
+                    if USE_ADJ_PRICE
+                    else """
                 SELECT ticker, date, close
                 FROM krx_ohlcv
                 WHERE date >= %s AND date <= %s
                 ORDER BY date, ticker;
-                """,
+                    """
+                ),
                 con=engine,
                 params=(load_start, chunk_max),
             )
@@ -5504,7 +5540,35 @@ else:
             )
 
             print(f"  · 저장 대상: {len(all_rows):,}행")
-            n_saved = _save_rs_rows(all_rows)
+            n_saved = 0
+            n_del = 0
+            if RS_BACKFILL:
+                # 청크 단위 트랜잭션: 삭제→삽입 실패 시 롤백해 구간 공백을 막는다.
+                try:
+                    mycursor.execute(
+                        "DELETE FROM krx_relative_strength WHERE date BETWEEN %s AND %s",
+                        (chunk_min, chunk_max),
+                    )
+                    n_del = int(mycursor.rowcount or 0)
+                    print(
+                        f"  · 기존 행 삭제: {n_del:,}행 "
+                        f"({chunk_min} ~ {chunk_max})"
+                    )
+                    n_saved = _save_rs_rows(all_rows, auto_commit=False)
+                    con.commit()
+                    total_rows_deleted += n_del
+                except Exception as e:
+                    try:
+                        con.rollback()
+                    except Exception:
+                        pass
+                    print(
+                        f"⚠️ 백필 청크 {yr} ({chunk_min}~{chunk_max}) 저장 실패 — "
+                        f"삭제·삽입을 롤백했습니다: {type(e).__name__}: {e}"
+                    )
+                    n_saved = 0
+            else:
+                n_saved = _save_rs_rows(all_rows)
             total_dates_done += len(chunk)
             total_rows_saved += n_saved
             print(f"  · {yr}년 완료: 날짜 {len(chunk)}일 / 저장 {n_saved:,}행")
@@ -5512,12 +5576,17 @@ else:
             del ohlcv_all, index_data, all_rows
 
         con.close()
-        print(
+        _sum = (
             f"\n=== 상대강도(RS) 산출 및 저장 완료 ===\n"
             f"처리 날짜 수: {total_dates_done:,}일\n"
             f"저장 행 수: {total_rows_saved:,}행"
-            + (" (백필 upsert)" if RS_BACKFILL else "")
         )
+        if RS_BACKFILL:
+            _sum += (
+                f" (백필 upsert)\n"
+                f"삭제 합계 {total_rows_deleted:,}행 / 저장 합계 {total_rows_saved:,}행"
+            )
+        print(_sum)
 
 # -----------------------------------------------------------------------------
 # 마켓분석/대시보드 출력 코드는 분리됨
