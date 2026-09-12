@@ -1007,7 +1007,6 @@ def plot_week_chart(
         ),
         hovermode="x unified",
         showlegend=True,
-        xaxis_rangeslider_visible=False,
         hoverlabel=dict(
             bgcolor="rgba(255, 255, 255, 0.95)",
             bordercolor="rgba(0, 0, 0, 0.3)",
@@ -1117,6 +1116,7 @@ def plot_week_chart(
             col=1,
         )
     fig.update_xaxes(type="date", col=1)
+    fig.update_xaxes(rangeslider_visible=False)
 
     _log_chart_xaxis(plot_df)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -1129,7 +1129,7 @@ def plot_week_chart(
             _ax = fig.layout[_key]
             print(
                 f"  row{_r} {_key}: range={_ax.range} matches={_ax.matches} "
-                f"type={_ax.type} autorange={_ax.autorange} domain={_ax.domain}"
+                f"type={_ax.type} rslider={_ax.rangeslider.visible} domain={_ax.domain}"
             )
         print("[axis] trace → 축 매핑")
         for _t in fig.data:
@@ -1142,6 +1142,7 @@ def plot_week_chart(
                 )
     except Exception as e:
         print(f"[axis] 진단 실패: {e}")
+
     fig.write_html(out_path, include_plotlyjs=CHART_PLOTLYJS, full_html=True)
     _log_chart_save(out_path, fig)
     if open_browser:
