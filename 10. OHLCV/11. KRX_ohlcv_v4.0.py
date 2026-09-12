@@ -512,6 +512,21 @@ OHLCV_REFETCH_DATES = None         # 예: ['20260508', '20260514']
 OHLCV_REFETCH_RANGE = None      # 예: ('20220711', '20260901')
 WEEKLY_REBUILD = False  # True: 주봉 테이블 전량 삭제 후 일봉→W-FRI 재적재
 
+# 수정주가(액면분할·병합·무상증자) — investingmap price_adjustments.mjs 정본
+PRICE_ADJ_SCAN = True       # 수정주가 이벤트 탐지 실행 여부
+PRICE_ADJ_DRY_RUN = False    # True 면 탐지·리포트만, DB 쓰기 없음
+PRICE_ADJ_FILL = True       # 이벤트 적재 후 _adj 컬럼 채우기 (DRY_RUN=False 일 때만)
+
+CLEAN_SHARE_RATIOS = (1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 20, 50)
+SHARE_RATIO_TOLERANCE = 0.04
+INVERSE_PRICE_GAP_TOLERANCE = 0.15
+INVERSE_PRICE_GAP_REVIEW_TOLERANCE = 0.35
+PRICE_REACTION_MIN_CR = 0.75   # C×R 하한. 미만이면 가격 미반응으로 기각
+POST_EVENT_SHARES_PERSIST_DAYS = 3
+BONUS_SAMEDAY_SHARES_MAX_DELTA = 0.12
+BONUS_CLOSE_RATIO_MAX = 0.78
+BONUS_LOOKAHEAD_MAX = 45
+
 
 def _purge_weekly_table(mycursor, con, table_name: str) -> int:
     """주봉 테이블 전량 삭제. 삭제 행 수 반환."""
@@ -907,6 +922,8 @@ def upsert_krx_ohlcv_day_df(mycursor, con, day_df, table_cols, batch_size=1000):
     return {'total': len(rows), 'inserted': inserted, 'updated': updated}
 
 
+# ※ 액면분할·병합·무상증자 탐지(krx_price_adjustment / open_adj~volume_adj)와는 역할이 다르다.
+#    아래 함수는 KRX CSV 등락률 역산값 vs DB 전일종가 불일치(소급 정정 의심)용이다.
 def detect_price_adjustment(mycursor, day_df, day_str, tol=0.02, top=10):
     """CSV 등락률로 역산한 전일종가 vs DB 전일종가 불일치 → 소급 조정 의심 종목."""
     d = day_df.dropna(subset=['close', 'chg_pct']).copy()
@@ -4373,7 +4390,621 @@ con.close()
 # con.close()
 
 
+# =============================================================================
+# 수정주가 이벤트 탐지 · krx_price_adjustment · open_adj~volume_adj
+# 정본: investingmap/functions/lib/price_adjustments.mjs
+# =============================================================================
+
+def _pa_shares(close, mcap):
+    """mcap÷close 역산 상장주식수. None/NaN/0 이하면 None."""
+    try:
+        c = float(close)
+        m = float(mcap)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(c) or not np.isfinite(m) or c <= 0 or m <= 0:
+        return None
+    return int(round(m / c))
+
+
+def _pa_match_clean_ratio(observed, tol=SHARE_RATIO_TOLERANCE):
+    """CLEAN_SHARE_RATIOS 와 역수 중 |obs-c|/c <= tol 인 최소오차 후보. 없으면 None."""
+    try:
+        obs = float(observed)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(obs) or obs <= 0:
+        return None
+    best = None
+    min_diff = float("inf")
+    for base in CLEAN_SHARE_RATIOS:
+        for candidate in (float(base), 1.0 / float(base)):
+            diff = abs(obs - candidate) / candidate
+            if diff <= tol and diff < min_diff:
+                min_diff = diff
+                best = candidate
+    return best
+
+
+def _pa_detect_same_day(prev, curr, ticker, source):
+    """인접일 주식수·종가 비율로 split/merge 탐지.
+
+    Returns
+    -------
+    (event_or_None, no_reaction)
+        no_reaction=True 이면 C×R < PRICE_REACTION_MIN_CR 로 기각.
+    """
+    if not prev or not curr or not ticker:
+        return None, False
+    prev_sh = prev.get("shares")
+    curr_sh = curr.get("shares")
+    prev_c = prev.get("close")
+    curr_c = curr.get("close")
+    try:
+        prev_sh = float(prev_sh) if prev_sh is not None else None
+        curr_sh = float(curr_sh) if curr_sh is not None else None
+        prev_c = float(prev_c) if prev_c is not None else None
+        curr_c = float(curr_c) if curr_c is not None else None
+    except (TypeError, ValueError):
+        return None, False
+    if (
+        prev_sh is None
+        or curr_sh is None
+        or prev_c is None
+        or curr_c is None
+        or not all(np.isfinite(x) for x in (prev_sh, curr_sh, prev_c, curr_c))
+        or prev_sh <= 0
+        or curr_sh <= 0
+        or prev_c <= 0
+        or curr_c <= 0
+    ):
+        return None, False
+
+    shares_ratio = curr_sh / prev_sh
+    close_ratio = curr_c / prev_c
+    clean = _pa_match_clean_ratio(shares_ratio)
+    if clean is None:
+        return None, False
+    if clean > 1 and close_ratio >= 1:
+        return None, False
+    if clean < 1 and close_ratio <= 1:
+        return None, False
+    if clean > 1 and close_ratio > (1.0 / clean) * 1.35:
+        return None, False
+    if clean < 1 and close_ratio < (1.0 / clean) * 0.65:
+        return None, False
+    gap = abs(close_ratio * clean - 1.0)
+    if gap > INVERSE_PRICE_GAP_REVIEW_TOLERANCE:
+        return None, False
+    cr = close_ratio * clean
+    if cr < PRICE_REACTION_MIN_CR:
+        return None, True
+    review = gap > INVERSE_PRICE_GAP_TOLERANCE
+    typ = "split" if clean >= 1 else "merge"
+    eff = curr.get("date")
+    if hasattr(eff, "strftime"):
+        eff_s = eff.strftime("%Y-%m-%d")
+    else:
+        eff_s = str(eff)[:10] if eff is not None else ""
+    if len(eff_s) < 10:
+        return None, False
+    note = (
+        f"shares {int(prev_sh)}→{int(curr_sh)}, "
+        f"close {int(round(prev_c))}→{int(round(curr_c))}"
+    )
+    if review:
+        note += f" [review: wide gap {gap * 100:.1f}%]"
+    return {
+        "ticker": str(ticker).zfill(6)[-6:],
+        "effective_date": eff_s,
+        "ratio": float(clean),
+        "type": typ,
+        "source": str(source),
+        "review": bool(review),
+        "note": note,
+    }, False
+
+
+def _pa_shares_persist(rows, idx, post_shares, days=POST_EVENT_SHARES_PERSIST_DAYS, tol=SHARE_RATIO_TOLERANCE):
+    """idx 다음 days 개 행의 주식수가 post_shares 대비 tol 이내."""
+    try:
+        post = float(post_shares)
+    except (TypeError, ValueError):
+        return False
+    if not rows or not np.isfinite(post) or post <= 0 or days <= 0:
+        return False
+    for d in range(1, int(days) + 1):
+        if idx + d >= len(rows):
+            return False
+        sh = rows[idx + d].get("shares")
+        try:
+            sh = float(sh) if sh is not None else None
+        except (TypeError, ValueError):
+            return False
+        if sh is None or not np.isfinite(sh) or sh <= 0:
+            return False
+        if abs(sh - post) / post > tol:
+            return False
+    return True
+
+
+def _pa_detect_bonus_lagged(ticker, rows, source):
+    """무상증자: 권리락일 가격 하락 + 5~45일 뒤 상장주식수 반영.
+
+    Returns
+    -------
+    (events, n_dup_dropped, n_no_reaction)
+        events 는 (ticker, _listed_date) 당 gap 최소 1건만.
+    """
+    events = []
+    n_no_reaction = 0
+    if not rows or len(rows) < 3 or not ticker:
+        return events, 0, 0
+    for i in range(1, len(rows)):
+        prev, curr = rows[i - 1], rows[i]
+        try:
+            prev_c = float(prev.get("close"))
+            curr_c = float(curr.get("close"))
+            prev_sh = float(prev.get("shares"))
+            curr_sh = float(curr.get("shares"))
+        except (TypeError, ValueError):
+            continue
+        if not all(np.isfinite(x) and x > 0 for x in (prev_c, curr_c, prev_sh, curr_sh)):
+            continue
+        same_day_ratio = curr_sh / prev_sh
+        if abs(same_day_ratio - 1.0) > BONUS_SAMEDAY_SHARES_MAX_DELTA:
+            continue
+        close_ratio = curr_c / prev_c
+        if close_ratio > BONUS_CLOSE_RATIO_MAX:
+            continue
+        clean_from_price = _pa_match_clean_ratio(1.0 / close_ratio, 0.18)
+        max_k = min(len(rows), i + BONUS_LOOKAHEAD_MAX)
+        for k in range(i + 1, max_k):
+            later_sh = rows[k].get("shares")
+            try:
+                later_sh = float(later_sh) if later_sh is not None else None
+            except (TypeError, ValueError):
+                continue
+            if later_sh is None or not np.isfinite(later_sh) or later_sh <= 0:
+                continue
+            obs1 = later_sh / prev_sh
+            obs2 = later_sh / curr_sh
+            clean = _pa_match_clean_ratio(obs1, 0.08)
+            if clean is None:
+                clean = _pa_match_clean_ratio(obs2, 0.08)
+            if clean is None and clean_from_price is not None and clean_from_price > 1:
+                obs = max(obs1, obs2)
+                if clean_from_price * 0.75 <= obs <= clean_from_price * 1.25:
+                    clean = clean_from_price
+            if clean is None or clean <= 1:
+                continue
+            gap = abs(close_ratio * clean - 1.0)
+            if gap > INVERSE_PRICE_GAP_REVIEW_TOLERANCE:
+                continue
+            if close_ratio * clean < PRICE_REACTION_MIN_CR:
+                n_no_reaction += 1
+                continue
+            if not _pa_shares_persist(rows, k, later_sh, 3, 0.08):
+                continue
+            eff = curr.get("date")
+            if hasattr(eff, "strftime"):
+                eff_s = eff.strftime("%Y-%m-%d")
+            else:
+                eff_s = str(eff)[:10] if eff is not None else ""
+            if len(eff_s) < 10:
+                continue
+            review = gap > INVERSE_PRICE_GAP_TOLERANCE
+            later_d = rows[k].get("date")
+            if hasattr(later_d, "strftime"):
+                later_s = later_d.strftime("%Y-%m-%d")
+            else:
+                later_s = str(later_d)[:10] if later_d is not None else ""
+            if len(later_s) < 10:
+                continue
+            review_tag = f" [review: wide gap {gap * 100:.1f}%]" if review else ""
+            events.append(
+                {
+                    "ticker": str(ticker).zfill(6)[-6:],
+                    "effective_date": eff_s,
+                    "ratio": float(clean),
+                    "type": "bonus",
+                    "source": str(source),
+                    "review": bool(review),
+                    "note": (
+                        f"bonus ex-date close {int(round(prev_c))}→{int(round(curr_c))} "
+                        f"(C={close_ratio:.3f}), new shares listed {later_s} "
+                        f"{int(prev_sh)}→{int(later_sh)} "
+                        f"(observed={later_sh / prev_sh:.3f}, clean={clean})"
+                        f"{review_tag}"
+                    ),
+                    "_listed_date": later_s,
+                    "_gap": float(gap),
+                }
+            )
+            break
+    # 같은 신주상장일(k)을 가리키는 권리락 후보가 여러 개면 gap 최소(동률이면 늦은 권리락) 1건만
+    n_before = len(events)
+    by_listed: dict[tuple[str, str], list] = {}
+    for ev in events:
+        key = (str(ev["ticker"]), str(ev.get("_listed_date") or ""))
+        by_listed.setdefault(key, []).append(ev)
+    kept = []
+    for group in by_listed.values():
+        best = min(
+            group,
+            key=lambda e: (
+                float(e.get("_gap", 999.0)),
+                -int(str(e.get("effective_date") or "0").replace("-", "")[:8] or "0"),
+            ),
+        )
+        kept.append(best)
+    kept.sort(key=lambda e: e["effective_date"])
+    n_dropped = n_before - len(kept)
+    return kept, n_dropped, n_no_reaction
+
+
+def _pa_detect_for_ticker(ticker, rows, source="auto-scan"):
+    """종목 시계열에서 split/merge/bonus 이벤트 목록(effective_date 오름차순).
+
+    Returns
+    -------
+    (events, n_bonus_dup_dropped, n_no_reaction)
+    """
+    events = []
+    seen = set()
+    n_bonus_dup = 0
+    n_no_reaction = 0
+    if not rows or len(rows) < 2:
+        return events, 0, 0
+    for i in range(1, len(rows)):
+        ev, no_react = _pa_detect_same_day(rows[i - 1], rows[i], ticker, source)
+        if no_react:
+            n_no_reaction += 1
+        if not ev:
+            continue
+        post_sh = rows[i].get("shares")
+        if not _pa_shares_persist(rows, i, post_sh):
+            continue
+        events.append(ev)
+        seen.add(ev["effective_date"])
+    bonus_events, n_bonus_dup, n_br = _pa_detect_bonus_lagged(ticker, rows, source)
+    n_no_reaction += int(n_br)
+    for bev in bonus_events:
+        if bev["effective_date"] not in seen:
+            events.append(bev)
+            seen.add(bev["effective_date"])
+    events.sort(key=lambda e: e["effective_date"])
+    return events, n_bonus_dup, n_no_reaction
+
+
+def _pa_ensure_schema(mycursor, con):
+    """krx_price_adjustment 테이블 + krx_ohlcv *_adj 컬럼."""
+    mycursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS krx_price_adjustment (
+            ticker         VARCHAR(10)  NOT NULL,
+            effective_date DATE         NOT NULL,
+            ratio          DOUBLE       NOT NULL,
+            type           VARCHAR(16)  NOT NULL,
+            source         VARCHAR(24)  NOT NULL,
+            review         TINYINT(1)   NOT NULL DEFAULT 0,
+            note           VARCHAR(512) NULL,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ticker, effective_date),
+            INDEX idx_kpa_ticker (ticker)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    con.commit()
+    extras = [
+        ("open_adj", "DOUBLE NULL"),
+        ("high_adj", "DOUBLE NULL"),
+        ("low_adj", "DOUBLE NULL"),
+        ("close_adj", "DOUBLE NULL"),
+        ("volume_adj", "DOUBLE NULL"),
+    ]
+    mycursor.execute(
+        """
+        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'krx_ohlcv'
+        """
+    )
+    have = {r[0] for r in mycursor.fetchall()}
+    for col, typ in extras:
+        if col not in have:
+            try:
+                mycursor.execute(f"ALTER TABLE krx_ohlcv ADD COLUMN `{col}` {typ}")
+                con.commit()
+                print(f"  · krx_ohlcv.{col} 컬럼 추가")
+            except Exception as e:
+                print(f"  ⚠️ krx_ohlcv.{col} 추가 실패(무시): {e}")
+                con.rollback()
+
+
+def _pa_cum_ratio(bar_date, adjustments):
+    """effective_date > bar_date 인 이벤트의 ratio 누적곱."""
+    if not adjustments:
+        return 1.0
+    t = str(bar_date)[:10]
+    cum = 1.0
+    for adj in adjustments:
+        eff = str(adj["effective_date"])[:10]
+        if t < eff:
+            cum *= float(adj["ratio"])
+    return cum
+
+
+if PRICE_ADJ_SCAN:
+    print("\n" + "=" * 80)
+    print("수정주가 이벤트 탐지 시작")
+    print(f"· PRICE_ADJ_DRY_RUN={PRICE_ADJ_DRY_RUN}  PRICE_ADJ_FILL={PRICE_ADJ_FILL}")
+
+    _pa_con = pymysql.connect(
+        user=require_env("DB_USER"),
+        passwd=require_env("DB_PASSWORD"),
+        host="127.0.0.1",
+        db="kor_stock_db",
+        charset="utf8",
+    )
+    _pa_cur = _pa_con.cursor()
+    _pa_ensure_schema(_pa_cur, _pa_con)
+
+    _pa_tickers = pd.read_sql_query(
+        "SELECT DISTINCT ticker FROM krx_ohlcv ORDER BY ticker",
+        con=engine,
+    )
+    _pa_tk_list = (
+        _pa_tickers["ticker"].astype(str).tolist() if _pa_tickers is not None and not _pa_tickers.empty else []
+    )
+    print(f"· 스캔 종목: {len(_pa_tk_list):,}개")
+
+    _pa_all_events: list[dict] = []
+    _pa_bonus_dup_dropped = 0
+    _pa_no_reaction = 0
+    _pa_chunk = 400
+    for _i0 in tqdm(range(0, len(_pa_tk_list), _pa_chunk), desc="수정주가 탐지"):
+        _ct = _pa_tk_list[_i0 : _i0 + _pa_chunk]
+        if not _ct:
+            continue
+        _ph = ",".join(["%s"] * len(_ct))
+        _q = f"""
+            SELECT ticker, date, open, high, low, close, volume, mcap
+            FROM krx_ohlcv
+            WHERE ticker IN ({_ph})
+            ORDER BY ticker, date
+        """
+        try:
+            _odf = pd.read_sql_query(_q, con=engine, params=tuple(_ct))
+        except Exception as e:
+            print(f"  ⚠️ OHLCV 청크 조회 실패: {type(e).__name__}: {e}")
+            continue
+        if _odf is None or _odf.empty:
+            continue
+        _odf["ticker"] = _odf["ticker"].astype(str)
+        _odf["date"] = pd.to_datetime(_odf["date"], errors="coerce")
+        for _c in ("open", "high", "low", "close", "volume", "mcap"):
+            if _c in _odf.columns:
+                _odf[_c] = pd.to_numeric(_odf[_c], errors="coerce")
+        for _tk, _g in _odf.groupby("ticker", sort=False):
+            _g = _g.dropna(subset=["date"]).sort_values("date")
+            _rows = []
+            for _, _r in _g.iterrows():
+                _cl = _r.get("close")
+                _mc = _r.get("mcap")
+                _rows.append(
+                    {
+                        "date": pd.Timestamp(_r["date"]).date(),
+                        "open": _r.get("open"),
+                        "high": _r.get("high"),
+                        "low": _r.get("low"),
+                        "close": _cl,
+                        "volume": _r.get("volume"),
+                        "mcap": _mc,
+                        "shares": _pa_shares(_cl, _mc),
+                    }
+                )
+            _evs, _n_bd, _n_nr = _pa_detect_for_ticker(str(_tk), _rows, source="auto-scan")
+            _pa_all_events.extend(_evs)
+            _pa_bonus_dup_dropped += int(_n_bd)
+            _pa_no_reaction += int(_n_nr)
+
+    # CSV·DB용: 내부 키 제거
+    for _e in _pa_all_events:
+        _e.pop("_listed_date", None)
+        _e.pop("_gap", None)
+
+    _n_ev = len(_pa_all_events)
+    _n_tk_hit = len({e["ticker"] for e in _pa_all_events})
+    _n_review = sum(1 for e in _pa_all_events if e.get("review"))
+    _by_type: dict[str, int] = {}
+    _by_year: dict[str, int] = {}
+    for _e in _pa_all_events:
+        _by_type[_e["type"]] = _by_type.get(_e["type"], 0) + 1
+        _yy = str(_e["effective_date"])[:4]
+        _by_year[_yy] = _by_year.get(_yy, 0) + 1
+
+    print(f"· 총 이벤트: {_n_ev:,}건 / 영향 종목 {_n_tk_hit:,} / review {_n_review:,}")
+    print(f"· type별: {_by_type}")
+    print(f"· 연도별: {dict(sorted(_by_year.items()))}")
+    print(f"· bonus 중복 제거: {_pa_bonus_dup_dropped:,}건 (같은 신주상장일 중복)")
+    print(
+        f"· 가격 미반응 기각: {_pa_no_reaction:,}건 "
+        f"(C×R < {PRICE_REACTION_MIN_CR} — 자사주 소각·유상증자 등)"
+    )
+
+    _pa_repo = _find_repo_root()
+    _pa_out_dir = os.path.join(str(_pa_repo), "50. Picking", "results")
+    os.makedirs(_pa_out_dir, exist_ok=True)
+    _pa_csv = os.path.join(_pa_out_dir, "price_adjustment_scan.csv")
+    _pa_rep = pd.DataFrame(
+        [
+            {
+                "ticker": e["ticker"],
+                "effective_date": e["effective_date"],
+                "ratio": e["ratio"],
+                "type": e["type"],
+                "review": int(bool(e.get("review"))),
+                "note": e.get("note") or "",
+            }
+            for e in _pa_all_events
+        ]
+    )
+    _pa_rep.to_csv(_pa_csv, index=False, encoding="utf-8-sig")
+    print(f"· 스캔 CSV: {_pa_csv}")
+    if len(_pa_rep):
+        print(_pa_rep.head(20).to_string(index=False))
+    else:
+        print("· (이벤트 없음)")
+
+    _pa_adj_updated = 0
+    if not PRICE_ADJ_DRY_RUN:
+        _ups = """
+            INSERT INTO krx_price_adjustment
+                (ticker, effective_date, ratio, type, source, review, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s) AS new
+            ON DUPLICATE KEY UPDATE
+                ratio=new.ratio,
+                type=new.type,
+                source=new.source,
+                review=new.review,
+                note=new.note
+        """
+        _batch = [
+            (
+                e["ticker"],
+                e["effective_date"],
+                float(e["ratio"]),
+                e["type"],
+                e["source"],
+                1 if e.get("review") else 0,
+                e.get("note"),
+            )
+            for e in _pa_all_events
+        ]
+        for _j in range(0, len(_batch), 1000):
+            _pa_cur.executemany(_ups, _batch[_j : _j + 1000])
+            _pa_con.commit()
+        print(f"· krx_price_adjustment upsert: {len(_batch):,}건")
+
+        if PRICE_ADJ_FILL:
+            print("· _adj 초기화(원본 복사, close_adj IS NULL) — 연도 단위")
+            _yrs = pd.read_sql_query(
+                "SELECT DISTINCT YEAR(date) AS y FROM krx_ohlcv ORDER BY y",
+                con=engine,
+            )
+            _yr_list = [int(y) for y in _yrs["y"].tolist() if pd.notna(y)] if _yrs is not None else []
+            for _y in tqdm(_yr_list, desc="_adj 초기화"):
+                _pa_cur.execute(
+                    """
+                    UPDATE krx_ohlcv
+                    SET open_adj=open, high_adj=high, low_adj=low,
+                        close_adj=close, volume_adj=volume
+                    WHERE YEAR(date)=%s AND close_adj IS NULL
+                    """,
+                    (_y,),
+                )
+                _pa_con.commit()
+                print(f"  · {_y}: 영향 행 {_pa_cur.rowcount:,}")
+
+            _ev_df = pd.read_sql_query(
+                """
+                SELECT ticker, effective_date, ratio
+                FROM krx_price_adjustment
+                ORDER BY ticker, effective_date
+                """,
+                con=engine,
+            )
+            if _ev_df is not None and not _ev_df.empty:
+                _ev_df["ticker"] = _ev_df["ticker"].astype(str)
+                _ev_df["effective_date"] = pd.to_datetime(
+                    _ev_df["effective_date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                _hit_tks = sorted(_ev_df["ticker"].unique().tolist())
+                print(f"· 이벤트 종목 _adj 소급 재계산: {len(_hit_tks):,}종목")
+                for _tk in tqdm(_hit_tks, desc="_adj 소급"):
+                    _adjs = (
+                        _ev_df.loc[_ev_df["ticker"] == _tk, ["effective_date", "ratio"]]
+                        .to_dict("records")
+                    )
+                    _bars = pd.read_sql_query(
+                        """
+                        SELECT date, open, high, low, close, volume
+                        FROM krx_ohlcv
+                        WHERE ticker=%s
+                        ORDER BY date
+                        """,
+                        con=engine,
+                        params=(_tk,),
+                    )
+                    if _bars is None or _bars.empty:
+                        continue
+                    _upd = []
+                    for _, _br in _bars.iterrows():
+                        _bd = pd.to_datetime(_br["date"], errors="coerce")
+                        if pd.isna(_bd):
+                            continue
+                        _bds = _bd.strftime("%Y-%m-%d")
+                        _cum = _pa_cum_ratio(_bds, _adjs)
+                        if abs(_cum - 1.0) < 1e-12:
+                            continue
+                        def _rw(v, div=True):
+                            try:
+                                x = float(v)
+                            except (TypeError, ValueError):
+                                return None
+                            if not np.isfinite(x):
+                                return None
+                            return int(round(x / _cum)) if div else int(round(x * _cum))
+
+                        _upd.append(
+                            (
+                                _rw(_br.get("open")),
+                                _rw(_br.get("high")),
+                                _rw(_br.get("low")),
+                                _rw(_br.get("close")),
+                                _rw(_br.get("volume"), div=False),
+                                _tk,
+                                _bd.date() if hasattr(_bd, "date") else _bds,
+                            )
+                        )
+                    if not _upd:
+                        continue
+                    _pa_cur.executemany(
+                        """
+                        UPDATE krx_ohlcv
+                        SET open_adj=%s, high_adj=%s, low_adj=%s,
+                            close_adj=%s, volume_adj=%s
+                        WHERE ticker=%s AND date=%s
+                        """,
+                        _upd,
+                    )
+                    _pa_con.commit()
+                    _pa_adj_updated += len(_upd)
+
+    else:
+        print("· DRY_RUN — DB 쓰기·_adj 채우기 생략")
+
+    print(
+        f"\n=== 수정주가 탐지 요약 ===\n"
+        f"스캔 종목: {len(_pa_tk_list):,}\n"
+        f"이벤트: {_n_ev:,} (split={_by_type.get('split', 0)}, "
+        f"merge={_by_type.get('merge', 0)}, bonus={_by_type.get('bonus', 0)})\n"
+        f"영향 종목: {_n_tk_hit:,} / review: {_n_review:,}\n"
+        f"bonus 중복 제거: {_pa_bonus_dup_dropped:,}건 (같은 신주상장일 중복)\n"
+        f"가격 미반응 기각: {_pa_no_reaction:,}건 "
+        f"(C×R < {PRICE_REACTION_MIN_CR} — 자사주 소각·유상증자 등)\n"
+        f"_adj 갱신 행 수: {_pa_adj_updated:,}\n"
+        f"소비 측(RS·21·51·58)은 아직 원본 close 를 읽는다. 전환은 별도 작업이다."
+    )
+    _pa_cur.close()
+    _pa_con.close()
+
+
 ### 상대강도(RS) 산출 및 저장
+# RS 정의 변경(2026-09-12): 시장별 → 전체 통합풀 원시수익률 백분위.
+# 지수 2종(IDX1001/IDX2001)이 구성원으로 포함된다.
+# 정의가 바뀌었으므로 전 기간 재산출이 필요하다 → RS_BACKFILL=True 로 1회 실행.
+# 51 스크리닝 임계값·58 패턴 평가 결과는 기존 정의 기준이므로 재검증이 필요하다.
 # RS_BACKFILL=True: krx_ohlcv 전체 날짜를 벡터 로직으로 재계산·upsert (일회성 백필)
 # RS_BACKFILL=False: 미처리 날짜만 (기본)
 RS_BACKFILL = False
@@ -4572,6 +5203,7 @@ def _period_returns(close_df: pd.DataFrame, period: int) -> pd.DataFrame:
 
 
 def _index_period_returns(index_close: pd.Series, period: int) -> pd.Series:
+    # 구 시장상대 RS 전용, 현재 미사용
     past = index_close.shift(period)
     ret = (index_close / past - 1.0) * 100.0
     valid = index_close.notna() & past.notna() & (past > 0)
@@ -4591,32 +5223,49 @@ def _percentile_rank_rs(momentum: pd.DataFrame) -> pd.DataFrame:
     return ranks
 
 
-def compute_market_rs_rows(
-    close_wide: pd.DataFrame,
-    index_close: pd.Series,
-    process_dates: list,
-    market_type: str,
-    periods: list,
+def compute_universe_rs_rows(
+    close_kospi,
+    close_kosdaq,
+    kospi_index_close,
+    kosdaq_index_close,
+    market_of,
+    process_dates,
+    periods,
 ) -> list:
-    """시장 단위 벡터 RS 계산 → DB insert 튜플 리스트.
+    """전체 통합풀 벡터 RS 계산 → DB insert 튜플 리스트.
+
+    코스피·코스닥 종목 + 지수 2종(IDX1001/IDX2001)을 한 풀에서
+    원시 N일 수익률 백분위로 산출한다(지수 차감 없음).
 
     저장 컬럼: rs_10d·rs_20d·rs_50d·rs_120d·rs_200d (전부 유지).
     소비 측 평균은 indicators_core.rs_avg(cols=RS_AVG_COLS_D)
-    = mean(rs_20d, rs_50d, rs_120d, rs_200d) — rs_10 제외.
-
-    Talent(전일종가 +10%) 산출은 본 파일에 없음.
-    필요 시 indicators_core.talent_up_count / talent_score 사용.
+    = 0.4·rs_200+0.3·rs_120+0.2·rs_50+0.1·rs_20 — rs_10 제외.
 
     단기 거래정지(≤20거래일)는 ffill로 과거종가를 보간해 모멘텀 왜곡을 막되,
     당일 원본 종가가 NaN인 종목은 순위·저장에서 제외합니다.
     """
-    if close_wide.empty or len(process_dates) == 0 or index_close.empty:
+    frames = []
+    if close_kospi is not None and isinstance(close_kospi, pd.DataFrame) and not close_kospi.empty:
+        frames.append(close_kospi)
+    if close_kosdaq is not None and isinstance(close_kosdaq, pd.DataFrame) and not close_kosdaq.empty:
+        frames.append(close_kosdaq)
+    if not frames or len(process_dates) == 0:
         return []
 
-    idx_dates = set(index_close.dropna().index)
-    proc = [d for d in process_dates if d in close_wide.index and d in idx_dates]
+    close_wide = pd.concat(frames, axis=1).sort_index()
+    close_wide = close_wide.loc[:, ~close_wide.columns.duplicated()].copy()
+
+    _kpi = kospi_index_close if isinstance(kospi_index_close, pd.Series) else pd.Series(dtype=float)
+    _kqi = kosdaq_index_close if isinstance(kosdaq_index_close, pd.Series) else pd.Series(dtype=float)
+    close_wide["IDX1001"] = _kpi.reindex(close_wide.index) if not _kpi.empty else np.nan
+    close_wide["IDX2001"] = _kqi.reindex(close_wide.index) if not _kqi.empty else np.nan
+
+    proc = [d for d in process_dates if d in close_wide.index]
     if not proc:
         return []
+
+    n_stk = sum(1 for c in close_wide.columns if c not in ("IDX1001", "IDX2001"))
+    print(f"  · 통합풀 RS: 종목 {n_stk:,} + 지수 2 = {n_stk + 2:,}구성원 / {len(proc)}일")
 
     # 당일 실제 거래 여부: ffill 전 원본 기준 (거래 없는 종목은 순위 제외)
     close_raw = close_wide
@@ -4629,13 +5278,11 @@ def compute_market_rs_rows(
     for period in periods:
         past = close_filled.shift(period)
         past_ok = past.notna() & (past > 0)
-        stock_ret = _period_returns(close_filled, period)
-        idx_ret = _index_period_returns(index_close, period)
-        rel = stock_ret.sub(idx_ret, axis=0)
-        rel = rel.where(past_ok, 0.0)
+        ret = _period_returns(close_filled, period)
+        ret = ret.where(past_ok)  # 0.0 채우기 금지, NaN 유지
         # 당일 원본 종가 없는 종목은 무조건 제외 (ffill로 채워진 당일 값 사용 금지)
-        rel = rel.where(close_raw.notna())
-        rs = _percentile_rank_rs(rel.loc[proc])
+        ret = ret.where(close_raw.notna())
+        rs = _percentile_rank_rs(ret.loc[proc])
         rs_long[period] = rs.where(valid_mask).stack().dropna()
 
     if not rs_long or rs_long[periods[0]].empty:
@@ -4644,13 +5291,57 @@ def compute_market_rs_rows(
     merged = pd.DataFrame(rs_long)
     merged = merged.reset_index()
     merged.columns = ["date", "ticker"] + list(periods)
+    _na = {p: int(merged[p].isna().sum()) for p in periods}
+    print(f"  · 기간별 결측(이력부족): {_na}")
 
-    rows = [
-        (ticker, d, market_type, float(r10), float(r20), float(r50), float(r120), float(r200))
-        for d, ticker, r10, r20, r50, r120, r200 in merged[
-            ["date", "ticker", 10, 20, 50, 120, 200]
-        ].itertuples(index=False, name=None)
-    ]
+    latest = proc[-1]
+    def _fmt_idx_rs_avg(ticker: str) -> str:
+        sub = merged.loc[merged["ticker"].astype(str) == ticker]
+        if sub.empty:
+            return "—"
+        row = sub.loc[sub["date"] == latest]
+        if row.empty:
+            row = sub.iloc[[-1]]
+        try:
+            r20 = float(row[20].iloc[0])
+            r50 = float(row[50].iloc[0])
+            r120 = float(row[120].iloc[0])
+            r200 = float(row[200].iloc[0])
+            if not all(np.isfinite(x) for x in (r20, r50, r120, r200)):
+                return "—"
+            avg = 0.4 * r200 + 0.3 * r120 + 0.2 * r50 + 0.1 * r20
+            return f"{avg:.1f}"
+        except Exception:
+            return "—"
+
+    print(
+        f"  · 지수 RS(최신일): 코스피 {_fmt_idx_rs_avg('IDX1001')} / 코스닥 {_fmt_idx_rs_avg('IDX2001')}"
+    )
+
+    def _market_type(ticker: str) -> str:
+        t = str(ticker)
+        if t in ("IDX1001", "IDX2001"):
+            return "INDEX"
+        return str((market_of or {}).get(t, "") or "")
+
+    def _nn(v):
+        """NaN/inf/변환불가 → None (MySQL NULL). 정상 실수는 float."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if np.isfinite(f) else None
+
+    rows = []
+    for d, ticker, r10, r20, r50, r120, r200 in merged[
+        ["date", "ticker", 10, 20, 50, 120, 200]
+    ].itertuples(index=False, name=None):
+        v10, v20, v50, v120, v200 = _nn(r10), _nn(r20), _nn(r50), _nn(r120), _nn(r200)
+        if v10 is None and v20 is None and v50 is None and v120 is None and v200 is None:
+            continue
+        rows.append(
+            (str(ticker), d, _market_type(str(ticker)), v10, v20, v50, v120, v200)
+        )
     return rows
 
 
@@ -4782,28 +5473,35 @@ else:
                 kosdaq_index_close = pd.Series(dtype=float)
 
             all_rows = []
+            market_of = {str(t): "KOSPI" for t in kospi_tickers}
+            market_of.update({str(t): "KOSDAQ" for t in kosdaq_tickers})
+
+            close_kospi = pd.DataFrame()
+            close_kosdaq = pd.DataFrame()
             if kospi_tickers:
-                kospi_ohlcv = ohlcv_all[ohlcv_all['ticker'].isin(kospi_tickers)]
+                kospi_ohlcv = ohlcv_all[ohlcv_all["ticker"].isin(kospi_tickers)]
                 if len(kospi_ohlcv) > 0:
                     close_kospi = kospi_ohlcv.pivot(
-                        index='date', columns='ticker', values='close'
+                        index="date", columns="ticker", values="close"
                     ).sort_index()
-                    all_rows.extend(
-                        compute_market_rs_rows(
-                            close_kospi, kospi_index_close, chunk, 'KOSPI', periods
-                        )
-                    )
             if kosdaq_tickers:
-                kosdaq_ohlcv = ohlcv_all[ohlcv_all['ticker'].isin(kosdaq_tickers)]
+                kosdaq_ohlcv = ohlcv_all[ohlcv_all["ticker"].isin(kosdaq_tickers)]
                 if len(kosdaq_ohlcv) > 0:
                     close_kosdaq = kosdaq_ohlcv.pivot(
-                        index='date', columns='ticker', values='close'
+                        index="date", columns="ticker", values="close"
                     ).sort_index()
-                    all_rows.extend(
-                        compute_market_rs_rows(
-                            close_kosdaq, kosdaq_index_close, chunk, 'KOSDAQ', periods
-                        )
-                    )
+
+            all_rows.extend(
+                compute_universe_rs_rows(
+                    close_kospi,
+                    close_kosdaq,
+                    kospi_index_close,
+                    kosdaq_index_close,
+                    market_of,
+                    chunk,
+                    periods,
+                )
+            )
 
             print(f"  · 저장 대상: {len(all_rows):,}행")
             n_saved = _save_rs_rows(all_rows)

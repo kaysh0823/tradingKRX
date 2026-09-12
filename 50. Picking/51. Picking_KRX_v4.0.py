@@ -1259,6 +1259,34 @@ PATTERN_GRADE = {
     "p26": "C", "p35": "C",
 }
 
+# 58 섹터중립 판정 (전체 기간, pattern_eval_sector_neutral.csv)
+# 잔존율 = h60Δ_섹터 ÷ h60Δ_시장
+#   종목: 잔존율 ≥ 0.7  — 섹터를 중립화해도 초과수익이 남음(종목 선택 알파)
+#   혼합: 0.3 ~ 0.7
+#   업종: < 0.3         — 초과수익이 대부분 업종 베타
+#   미판정: 시장Δ ≤ 0 이라 비율이 의미 없음 / 히트 0
+# 주의: 구간분할이 아닌 전체 기간 1회 측정이다. PATTERN_GRADE(구간분할)와 축이 다르다.
+PATTERN_SECTOR_TYPE = {
+    # 종목형
+    "p91": "종목", "p52": "종목", "p51": "종목", "p36": "종목", "p16": "종목",
+    "p92": "종목", "p31": "종목", "p29a": "종목", "p33": "종목", "p12": "종목",
+    "p28": "종목", "p54": "종목", "p35": "종목", "p55": "종목", "p32": "종목",
+    "p15": "종목", "p93": "종목", "p81": "종목",
+    # 혼합
+    "p26": "혼합", "p11": "혼합", "p21": "혼합",
+    # 업종형
+    "p22": "업종", "p53": "업종", "p24": "업종", "p25": "업종", "p23": "업종",
+    "p71": "업종",
+    # 미판정
+    "p14": "미판정", "p34": "미판정", "p61": "미판정", "p43": "미판정",
+    "p13": "미판정", "p17": "미판정", "p27": "미판정",
+}
+
+def _sector_type(code: str) -> str:
+    """p29b 는 58에서 p29a 로 통합 측정되므로 같은 태그를 쓴다."""
+    c = "p29a" if str(code) in ("p29", "p29b") else str(code)
+    return PATTERN_SECTOR_TYPE.get(c, "")
+
 def pattern(code, group, name, **params):
     def deco(fn):
         PATTERN_REGISTRY[code] = {
@@ -2336,16 +2364,34 @@ def screen_all(indicators_data, rs_df=None, **ctx):
     print("=" * 80)
     print(f"📊 패턴별 선정 건수 (합계 {sum(_cnt.values())} / 발동 {len(_hit)}개 패턴)")
     for _k in sorted(_cnt):
+        _st = _sector_type(_k)
+        _suffix = f"·{_st}" if _st and _st != "미판정" else ""
         if _k in DISABLED_PATTERNS:
-            print(f"   · {_k}: - [폐기]")
+            print(f"   · {_k}: - [폐기{_suffix}]")
         elif _k in REFERENCE_PATTERNS:
-            print(f"   · {_k}: {_cnt[_k]}건 [참고]")
+            print(f"   · {_k}: {_cnt[_k]}건 [참고{_suffix}]")
         else:
             _g = PATTERN_GRADE.get(_k)
             if _g:
-                print(f"   · {_k}: {_cnt[_k]}건 [{_g}]")
+                print(f"   · {_k}: {_cnt[_k]}건 [{_g}{_suffix}]")
+            elif _st and _st != "미판정":
+                print(f"   · {_k}: {_cnt[_k]}건 [{_st}]")
             else:
                 print(f"   · {_k}: {_cnt[_k]}건")
+    _sec_n = {"종목": 0, "혼합": 0, "업종": 0, "미분류": 0}
+    for _k, _n in _cnt.items():
+        if _k in DISABLED_PATTERNS or _k in REFERENCE_PATTERNS:
+            continue
+        _st = _sector_type(_k)
+        if _st in ("종목", "혼합", "업종"):
+            _sec_n[_st] += _n
+        else:
+            _sec_n["미분류"] += _n
+    if sum(_sec_n.values()) > 0:
+        print(
+            f"   ▶ 섹터성격 구성: 종목 {_sec_n['종목']}건 / 혼합 {_sec_n['혼합']}건"
+            f" / 업종 {_sec_n['업종']}건 / 미분류 {_sec_n['미분류']}건"
+        )
     print("=" * 80)
 
     return {
@@ -4098,9 +4144,13 @@ def export_screening_summary_html(
                 scr = f"{code} {SCREENING_SUMMARY_LABELS.get(code, '')}".strip()
                 er = energy_map.get(tkz, np.nan)
                 erdisp = f"{er:.2f}" if np.isfinite(er) else ""
+                _st_disp = _sector_type(code)
+                if _st_disp == "미판정":
+                    _st_disp = ""
                 rows.append(
                     {
                         "스크리닝명": scr,
+                        "섹터성격": _st_disp,
                         "ticker": tk,
                         "종목명": name,
                         "섹터": sec_disp,
@@ -4126,6 +4176,7 @@ def export_screening_summary_html(
                         "사모OSC": "",
                         "외국인OSC": "",
                         "_sort_sn": scr or "",
+                        "_sort_st": _st_disp or "",
                         "_sort_tk": tkz,
                         "_sort_nm": str(name) if name is not None else "",
                         "_sort_sec": sec_disp or "",
@@ -4161,6 +4212,9 @@ def export_screening_summary_html(
             pb = float(last["pb"]) if "pb" in last.index and pd.notna(last.get("pb")) else np.nan
             label = SCREENING_SUMMARY_LABELS.get(code, "")
             scr_name = f"{code} {label}".strip() if label else code
+            _st_disp = _sector_type(code)
+            if _st_disp == "미판정":
+                _st_disp = ""
             er = energy_map.get(tkz, np.nan)
             s5 = "O" if np.isfinite(close) and np.isfinite(sma5) and close > sma5 else "X"
             s10 = "O" if np.isfinite(close) and np.isfinite(sma10) and close > sma10 else "X"
@@ -4208,6 +4262,7 @@ def export_screening_summary_html(
             rows.append(
                 {
                     "스크리닝명": scr_name,
+                    "섹터성격": _st_disp,
                     "ticker": tk,
                     "종목명": name,
                     "섹터": sec_disp,
@@ -4233,6 +4288,7 @@ def export_screening_summary_html(
                     "사모OSC": private_osc,
                     "외국인OSC": frgn_osc,
                     "_sort_sn": scr_name or "",
+                    "_sort_st": _st_disp or "",
                     "_sort_tk": tkz,
                     "_sort_nm": str(name) if name is not None else "",
                     "_sort_sec": sec_disp or "",
@@ -4263,6 +4319,7 @@ def export_screening_summary_html(
         n_rows = len(sum_df)
         disp_cols = [
             "스크리닝명",
+            "섹터성격",
             "ticker",
             "종목명",
             "섹터",
@@ -4290,6 +4347,7 @@ def export_screening_summary_html(
         ]
         sort_cols = [
             "_sort_sn",
+            "_sort_st",
             "_sort_tk",
             "_sort_nm",
             "_sort_sec",
@@ -4321,6 +4379,7 @@ def export_screening_summary_html(
             "str",
             "str",
             "str",
+            "str",
             "num",
             "str",
             "str",
@@ -4344,6 +4403,7 @@ def export_screening_summary_html(
         ]
         th_labels = [
             "스크리닝명",
+            "섹터성격",
             "ticker",
             "종목명",
             "섹터",
@@ -4380,14 +4440,14 @@ def export_screening_summary_html(
             return f' data-sort-type="str" data-sort="{esc}"'
 
         th_titles = {
-            11: "최근 120거래일 중 종가가 시가 대비 +10% 이상 상승한 날의 비중(%)",
-            13: "전체 보통주 시가총액 합 대비 해당 종목 시가총액 비중(%)",
-            14: "전체 보통주 당일 거래대금 합 대비 해당 종목 거래대금 비중(%)",
-            20: "기관(연기금+투신+사모) 순매수금액 OSC. 기관합계(7050)가 아님.",
-            21: "국민연금등(6000) 순매수금액 OSC",
-            22: "투신(3000) 순매수금액 OSC",
-            23: "사모(3100) 순매수금액 OSC",
-            24: "외국인(9000) 순매수금액 OSC",
+            12: "최근 120거래일 중 종가가 시가 대비 +10% 이상 상승한 날의 비중(%)",
+            14: "전체 보통주 시가총액 합 대비 해당 종목 시가총액 비중(%)",
+            15: "전체 보통주 당일 거래대금 합 대비 해당 종목 거래대금 비중(%)",
+            21: "기관(연기금+투신+사모) 순매수금액 OSC. 기관합계(7050)가 아님.",
+            22: "국민연금등(6000) 순매수금액 OSC",
+            23: "투신(3000) 순매수금액 OSC",
+            24: "사모(3100) 순매수금액 OSC",
+            25: "외국인(9000) 순매수금액 OSC",
         }
         ths = "".join(
             f'<th class="sortable" data-col="{i}" title="{html_module.escape(th_titles.get(i, "클릭: 정렬"))}">'
@@ -4489,7 +4549,9 @@ def export_screening_summary_html(
 표시: 시총 3,000억 이상 (스크리닝 유니버스와 동일).
 기관OSC는 연기금+투신+사모 순매수금액 OSC(누적 {INVESTOR_OSC_CUM_DAYS}일)이며 기관합계(7050)가 아닙니다.
 외국인OSC는 9000 순매수금액 OSC입니다.
-외국인 지분율(%) = KRX 12023 외국인보유량 기준.</p>
+외국인 지분율(%) = KRX 12023 외국인보유량 기준.
+섹터성격: 58 섹터중립 측정(전체 기간) 기준. 종목=업종을 중립화해도 초과수익이 남는 패턴,
+업종=초과수익이 대부분 업종 베타인 패턴, 혼합=중간. 선정 여부에는 영향을 주지 않는다.</p>
 {sector_tilt_html}
 <table id="summaryTable" class="s">
 <thead><tr>{ths}</tr></thead>
@@ -4510,18 +4572,19 @@ table.s th.sortable {{ cursor:pointer; user-select:none; }}
 table.s th.sortable:hover {{ background:#dde8f2; }}
 table.s th.sort-asc::after {{ content:" \\25B2"; font-size:0.65em; opacity:0.85; }}
 table.s th.sort-desc::after {{ content:" \\25BC"; font-size:0.65em; opacity:0.85; }}
-table.s td:nth-child(6),
-table.s td:nth-child(10),
+table.s td:nth-child(7),
 table.s td:nth-child(11),
 table.s td:nth-child(12),
 table.s td:nth-child(13),
 table.s td:nth-child(14),
 table.s td:nth-child(15),
-table.s td:nth-child(19) {{ text-align:right; }}
-table.s td:nth-child(7), table.s td:nth-child(8), table.s td:nth-child(9),
-table.s td:nth-child(16), table.s td:nth-child(17), table.s td:nth-child(18),
-table.s td:nth-child(20), table.s td:nth-child(21), table.s td:nth-child(22),
-table.s td:nth-child(23), table.s td:nth-child(24), table.s td:nth-child(25) {{ text-align:center; }}
+table.s td:nth-child(16),
+table.s td:nth-child(20) {{ text-align:right; }}
+table.s td:nth-child(2),
+table.s td:nth-child(8), table.s td:nth-child(9), table.s td:nth-child(10),
+table.s td:nth-child(17), table.s td:nth-child(18), table.s td:nth-child(19),
+table.s td:nth-child(21), table.s td:nth-child(22), table.s td:nth-child(23),
+table.s td:nth-child(24), table.s td:nth-child(25), table.s td:nth-child(26) {{ text-align:center; }}
 table.s tbody tr:nth-child(even) {{ background:#fafafa; }}
 </style></head><body>
 {body}
