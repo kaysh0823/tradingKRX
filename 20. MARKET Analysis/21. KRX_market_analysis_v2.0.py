@@ -195,6 +195,7 @@ BBW_LOOKBACK = 125
 BBW_PB_MIN = 0.8            # %b 하한
 BBW_PB_TV_RANK_MAX = 100    # 거래대금 시장순위 상한
 WRITE_ENERGY_REPORT = False   # 에너지배율.html 생성 여부
+RANGE5_XMAX = 0.5   # 10페이지 x축 상한. ATR3 대비 레인지가 크므로 0.3보다 넓게
 
 RUN_DATE = date.today()  # 실행 시작 시점 고정 — 자정 넘김 대비
 RUN_DATE_STR = RUN_DATE.strftime("%Y-%m-%d")
@@ -2249,6 +2250,69 @@ def write_rs_high_list_html(
     df["last_close"] = pd.to_numeric(df.get("last_close"), errors="coerce")
     df["last_volume"] = pd.to_numeric(df.get("last_volume"), errors="coerce")
 
+    # 전 종목(코스피+코스닥) 통합 순위 — 표시 필터 적용 전
+    df["rs_rank"] = pd.to_numeric(df["_rs_avg"], errors="coerce").rank(
+        ascending=False, method="min"
+    )
+    df["mcap_rank"] = pd.to_numeric(df["mcap"], errors="coerce").rank(
+        ascending=False, method="min"
+    )
+    _tv = (
+        pd.to_numeric(df["last_close"], errors="coerce")
+        * pd.to_numeric(df["last_volume"], errors="coerce")
+    )
+    df["tv_rank"] = _tv.rank(ascending=False, method="min")
+
+    # 전일 RS순위 (동일 통합 모수, 필터 미적용)
+    df["rs_rank_prev"] = np.nan
+    try:
+        _rs_dates = pd.read_sql_query(
+            "SELECT DISTINCT date FROM krx_relative_strength ORDER BY date DESC LIMIT 2",
+            con=engine,
+        )
+        _rs_dl = [
+            pd.Timestamp(x).normalize()
+            for x in pd.to_datetime(_rs_dates["date"], errors="coerce").tolist()
+            if pd.notna(x)
+        ]
+        if len(_rs_dl) < 2:
+            print("경고: 전일 RS순위 산출 불가 (krx_relative_strength 이력 부족)")
+        else:
+            _prev_rs_d = _rs_dl[1].strftime("%Y-%m-%d")
+            _prev_rs = pd.read_sql_query(
+                """
+                SELECT ticker, rs_20d, rs_50d, rs_120d, rs_200d, market_type
+                FROM krx_relative_strength
+                WHERE date = %s
+                """,
+                con=engine,
+                params=(_prev_rs_d,),
+            )
+            if _prev_rs is None or _prev_rs.empty:
+                print("경고: 전일 RS순위 산출 불가 (해당 일자 데이터 없음)")
+            else:
+                _prev_rs["market_type"] = _prev_rs["market_type"].astype(str).str.upper()
+                _prev_rs = _prev_rs[_prev_rs["market_type"] != "INDEX"].copy()
+                for _c in ("rs_20d", "rs_50d", "rs_120d", "rs_200d"):
+                    if _c in _prev_rs.columns:
+                        _prev_rs[_c] = pd.to_numeric(_prev_rs[_c], errors="coerce")
+                _prev_rs["_rs_avg"] = rs_avg(
+                    frame=_prev_rs, cols=("rs_20d", "rs_50d", "rs_120d", "rs_200d")
+                )
+                _prev_rs["rs_rank_prev"] = pd.to_numeric(
+                    _prev_rs["_rs_avg"], errors="coerce"
+                ).rank(ascending=False, method="min")
+                _prev_rs_map = (
+                    _prev_rs.assign(_tk=_prev_rs["ticker"].astype(str))
+                    .set_index("_tk")["rs_rank_prev"]
+                    .to_dict()
+                )
+                df["rs_rank_prev"] = pd.to_numeric(
+                    df["ticker"].astype(str).map(_prev_rs_map), errors="coerce"
+                )
+    except Exception as _e_rs_prev:
+        print(f"경고: 전일 RS순위 산출 실패 ({type(_e_rs_prev).__name__}: {_e_rs_prev})")
+
     _d3: list[pd.Timestamp | None] = [None, None, None]
     try:
         _drows = pd.read_sql_query(
@@ -2427,9 +2491,9 @@ def write_rs_high_list_html(
         tv_rank_map = {str(r["ticker"]): float(pd.to_numeric(r["tv_rank"], errors="coerce")) for _, r in rk.iterrows()}
     except Exception:
         tv_rank_map = {}
-    df["tv_rank"] = pd.to_numeric(df["ticker"].map(tv_rank_map), errors="coerce")
+    # df["tv_rank"] 는 위에서 전 종목 통합(종가×거래량)으로 이미 산출.
+    # Talent 표용 시장 내 순위 맵만 유지한다.
     prev_tv_map_rs = _krx_tv_rank_prev_by_ticker(engine)
-    df["tv_rank_prev"] = pd.to_numeric(df["ticker"].astype(str).map(prev_tv_map_rs), errors="coerce")
 
     # 3개 리포트 교집합 종목 볼드 표시용
     _highlight_set = set([str(x) for x in (highlight_tickers or set())])
@@ -2652,25 +2716,36 @@ def write_rs_high_list_html(
             if _is_hi:
                 _name_inner = f"<strong>{_name_inner}</strong>"
             _name_cell = _krx_colored_html(_name_inner, _chg)
+            _rsr = row.get("rs_rank")
+            _rsr_txt = "" if pd.isna(_rsr) else f"{int(float(_rsr)):,}"
+            _rsr_pr = row.get("rs_rank_prev")
+            _rsr_pr_txt = ""
+            try:
+                if _rsr_pr is not None and not (
+                    isinstance(_rsr_pr, float) and (np.isnan(_rsr_pr) or not np.isfinite(_rsr_pr))
+                ):
+                    _rsr_pr_txt = f"{int(float(_rsr_pr)):,}"
+            except Exception:
+                _rsr_pr_txt = ""
+            _rc_txt, _rc_sv, _rc_col = _krx_fmt_rank_change_cell(
+                row.get("rs_rank"), row.get("rs_rank_prev")
+            )
+            _mcr = row.get("mcap_rank")
+            _mcr_txt = "" if pd.isna(_mcr) else f"{int(float(_mcr)):,}"
             _tv_rank = row.get("tv_rank")
             _tv_rank_txt = ""
             try:
-                if _tv_rank is not None and not (isinstance(_tv_rank, float) and (np.isnan(_tv_rank) or not np.isfinite(_tv_rank))):
+                if _tv_rank is not None and not (
+                    isinstance(_tv_rank, float) and (np.isnan(_tv_rank) or not np.isfinite(_tv_rank))
+                ):
                     _tv_rank_txt = f"{int(float(_tv_rank)):,}"
             except Exception:
                 _tv_rank_txt = ""
-            _tv_pr = row.get("tv_rank_prev")
-            _tv_pr_txt = ""
-            try:
-                if _tv_pr is not None and not (isinstance(_tv_pr, float) and (np.isnan(_tv_pr) or not np.isfinite(_tv_pr))):
-                    _tv_pr_txt = f"{int(float(_tv_pr)):,}"
-            except Exception:
-                _tv_pr_txt = ""
-            _rc_txt, _rc_sv, _rc_col = _krx_fmt_rank_change_cell(rank, _tv_pr)
             rows.append(
                 f"<tr style=\"background-color:{bg};\">"
                 f"<td style='text-align:center'{_html_sort_num_attr(rank)}>{rank}</td>"
-                f"<td style='text-align:right'{_html_sort_num_attr(_tv_pr)}>{_tv_pr_txt}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(_rsr)}>{_rsr_txt}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(_rsr_pr)}>{_rsr_pr_txt}</td>"
                 f"<td style='text-align:right;color:{_rc_col}'{_html_sort_num_attr(_rc_sv)}>{html.escape(_rc_txt)}</td>"
                 f"<td>{_ticker_cell}</td>"
                 f"<td>{_name_cell}</td>"
@@ -2679,10 +2754,12 @@ def write_rs_high_list_html(
                 f"{_krx_chg_pct_td(row.get('chg_pct'))}"
                 f"{_krx_chg_pct_td(row.get('chg_pct_5d'))}"
                 f"<td style='text-align:right'{_html_sort_num_attr(row.get('_rs_avg'))}>{_fmt_rs(row.get('_rs_avg'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_10d'))}>{_fmt_rs(row.get('rs_10d'))}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_20d'))}>{_fmt_rs(row.get('rs_20d'))}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_50d'))}>{_fmt_rs(row.get('rs_50d'))}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_120d'))}>{_fmt_rs(row.get('rs_120d'))}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(row.get('rs_200d'))}>{_fmt_rs(row.get('rs_200d'))}</td>"
+                f"<td style='text-align:right'{_html_sort_num_attr(_mcr)}>{_mcr_txt}</td>"
                 f"<td style='text-align:right'{_html_sort_num_attr(_tv_rank)}>{_tv_rank_txt}</td>"
                 f"<td style='text-align:center'>{'' if pd.isna(row.get('신고가여부')) else row.get('신고가여부', '')}</td>"
                 "</tr>"
@@ -2690,11 +2767,11 @@ def write_rs_high_list_html(
         return (
             "<table class='krx-sortable' border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-size:12px;width:100%;'>"
             "<thead><tr>"
-            "<th>순위</th><th>전일 순위</th><th>순위 변동</th><th>종목코드</th><th>종목명</th><th>섹터</th><th>테마</th>"
+            "<th>순위</th><th>RS순위</th><th>전일 RS순위</th><th>순위 변동</th>"
+            "<th>종목코드</th><th>종목명</th><th>섹터</th><th>테마</th>"
             "<th>당일 상승률(%)</th><th>5일 상승률(%)</th>"
-            "<th>RSavg</th><th>RS20d</th><th>RS50d</th><th>RS120d</th><th>RS200d</th>"
-            "<th>거래대금 순위</th>"
-            "<th>신고가여부</th>"
+            "<th>RSavg</th><th>RS10d</th><th>RS20d</th><th>RS50d</th><th>RS120d</th><th>RS200d</th>"
+            "<th>시총순위</th><th>거래대금 순위</th><th>신고가여부</th>"
             "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table>"
@@ -3251,6 +3328,11 @@ def write_rs_high_list_html(
     RS: 코스피·코스닥 전 종목과 두 지수를 한 모수로 둔 원시 N일 수익률 백분위입니다
     (2026-09-12 정의 변경). 이전의 시장별·지수차감 방식과 값이 다릅니다.
     rs_avg = 0.4·rs_200 + 0.3·rs_120 + 0.2·rs_50 + 0.1·rs_20, 결측 구간은 가중치 재정규화.<br/>
+    RS10d 는 rs_avg 계산에 포함되지 않는 참고값입니다(10거래일 기준).<br/>
+    <strong>RS순위·전일 RS순위·시총순위·거래대금 순위</strong>는 모두 코스피·코스닥을 합친
+    전 종목 기준이며 표시 필터 적용 전에 매깁니다. 따라서 표의 '순위'(행번호)와는 다릅니다.<br/>
+    <strong>순위 변동</strong> = 전일 RS순위 − 당일 RS순위 (양수면 RS 순위 상승).
+    거래대금은 최신일 종가×거래량 기준입니다.<br/>
     조건: {_rs_cut_note} 순위: 시장별 <strong>rs_avg</strong> 내림차순.<br/>
     <strong>표시: 시총 3,000억 이상</strong> (계산 모수는 시장 전체 보통주·전역제외).<br/>
     테마는 <code>krx_theme_stock</code> 기준입니다.<br/>
@@ -4412,6 +4494,13 @@ MARKET_DASH_PAGE_DESCS: dict[int, str] = {
     7: "ADR: 최근 20거래일 상승 종목 수 합 ÷ 같은 기간 하락 종목 수 합에 100을 곱한 값입니다. 일별 값은 들쭉날쭉하므로 ADR의 10일 SMA로 추세를 보조합니다. 약 100 근처는 균형, 120~125 이상은 단기 과열, 70~75 이하는 침체(과매도) 권역으로 자주 해석합니다.",
     8: "모멘텀 속도: 지수 종가 기준 ROC(기간 변화율 %) ÷ 기간으로 나눈 하루 평균 변화율(%/일)입니다. 20·50일 선을 겹쳐 중기 추세 속도를 비교합니다. 0선 위는 상승 모멘텀, 아래는 하락 모멘텀입니다.",
     9: "ATR3/종가 vs 시가총액: 코스피(위)·코스닥(아래) 산점도입니다. x축 [0, 0.3], 0.3 초과 종목은 주석으로만 표시합니다. 분위선·평균은 전 종목 기준이며 RS Top20·거래대금 Top20을 강조합니다.",
+    10: (
+        "5일 레인지/종가 vs 시가총액: 최근 5거래일 고가 최대 − 저가 최소를 당일 종가로 나눈 "
+        "값입니다. ATR3/종가(9페이지)가 일중 변동폭의 평균이라면 이 값은 5일 동안 실제로 "
+        "움직인 전체 폭이므로, 방향성 있는 추세 이동과 좁은 박스권을 구분하는 데 쓰입니다. "
+        f"x축 [0, {RANGE5_XMAX}], 초과 종목은 주석으로만 표시합니다. 분위선·평균은 전 종목 "
+        "기준이며 RS Top20·거래대금 Top20을 강조합니다."
+    ),
 }
 
 _MARKET_DASH_BTN_LABELS: dict[int, str] = {
@@ -4424,6 +4513,7 @@ _MARKET_DASH_BTN_LABELS: dict[int, str] = {
     7: "7페이지: ADR",
     8: "8페이지: 모멘텀 속도",
     9: "9페이지: ATR3/종가 vs 시가총액",
+    10: "10페이지: 5일 레인지/종가 vs 시가총액",
 }
 
 
@@ -6558,12 +6648,12 @@ def run_market_dashboard(
             pass
 
         if not quiet:
-            print("완료: 대시보드 차트 생성(ATR3/종가 산점도는 이어 9페이지로 추가)")
+            print("완료: 대시보드 차트 생성(ATR3/종가·5일 레인지 산점도는 이어 9·10페이지로 추가)")
 
     except Exception as e:
         print(f"실패: 코스피/코스닥 지수+Advance Decline Line+변동성 대시보드 생성 ({type(e).__name__}: {e})")
 
-    # 거래대금 HTML + 대시보드 ATR 산점도(9페이지) 조립
+    # 거래대금 HTML + 대시보드 ATR·5일 레인지 산점도(9·10페이지) 조립
     try:
         import talib
 
@@ -6688,6 +6778,14 @@ def run_market_dashboard(
             except Exception:
                 _talent_120 = np.nan
 
+            range5_over_close = np.nan
+            if len(g) >= 5:
+                _h5 = pd.to_numeric(g["high"], errors="coerce").iloc[-5:].max()
+                _l5 = pd.to_numeric(g["low"], errors="coerce").iloc[-5:].min()
+                _c0 = float(cl_s.iloc[-1])
+                if np.isfinite(_h5) and np.isfinite(_l5) and np.isfinite(_c0) and _c0 > 0:
+                    range5_over_close = float(_h5 - _l5) / _c0
+
             if len(g) < 5:
                 return pd.Series(
                     {
@@ -6696,6 +6794,7 @@ def run_market_dashboard(
                         "volume": float(pd.to_numeric(g["volume"], errors="coerce").iloc[-1]) if len(g) else np.nan,
                         "atr14": np.nan,
                         "atr_over_close": np.nan,
+                        "range5_over_close": np.nan,
                         "chg_pct": chg_pct,
                         "chg_pct_5d": chg_pct_5d,
                         "chg_pct_3d": chg_pct_5d,
@@ -6718,6 +6817,7 @@ def run_market_dashboard(
                     "volume": vol,
                     "atr14": last_atr,
                     "atr_over_close": ratio,
+                    "range5_over_close": range5_over_close,
                     "chg_pct": chg_pct,
                     "chg_pct_5d": chg_pct_5d,
                     "chg_pct_3d": chg_pct_5d,
@@ -6730,7 +6830,7 @@ def run_market_dashboard(
             )
 
         _log("\n" + "=" * 80)
-        _log("거래대금 HTML · 대시보드 ATR 산점도(9페이지) 생성")
+        _log("거래대금 HTML · 대시보드 ATR·5일 레인지 산점도(9·10페이지) 생성")
         _log("=" * 80)
         _highlight_set = set([str(x) for x in (highlight_tickers or set())])
         _top100_tickers_all: set[str] = set()
@@ -6915,42 +7015,54 @@ def run_market_dashboard(
         except Exception:
             pass
 
-        def _mj_atr_stats_mask(df: pd.DataFrame) -> pd.Series:
-            """분위선·평균용: 유한 ATR3/종가 + 시총>0 (상한 컷 없음)."""
-            ac = pd.to_numeric(df["atr_over_close"], errors="coerce")
+        def _mj_atr_stats_mask(df: pd.DataFrame, col: str = "atr_over_close") -> pd.Series:
+            """분위선·평균용: 유한 값 + 시총>0 (상한 컷 없음)."""
+            ac = pd.to_numeric(df[col], errors="coerce")
             return np.isfinite(ac) & (df["mcap"].fillna(0) > 0)
 
-        def _mj_atr_plot_mask(df: pd.DataFrame) -> pd.Series:
-            """산점도 표시용: ATR3/종가 ≤ 0.3 만."""
-            ac = pd.to_numeric(df["atr_over_close"], errors="coerce")
-            return np.isfinite(ac) & (df["mcap"].fillna(0) > 0) & (ac <= 0.3)
+        def _mj_atr_plot_mask(df: pd.DataFrame, col: str = "atr_over_close", xmax: float = 0.3) -> pd.Series:
+            """산점도 표시용: 값 ≤ xmax 만."""
+            ac = pd.to_numeric(df[col], errors="coerce")
+            return np.isfinite(ac) & (df["mcap"].fillna(0) > 0) & (ac <= xmax)
 
-        def _mj_atr_overflow_annotation(df: pd.DataFrame) -> str:
-            """ATR3/종가 0.3 초과 종목 주석 텍스트."""
-            ac = pd.to_numeric(df["atr_over_close"], errors="coerce")
-            m = np.isfinite(ac) & (df["mcap"].fillna(0) > 0) & (ac > 0.3)
+        def _mj_atr_overflow_annotation(
+            df: pd.DataFrame,
+            col: str = "atr_over_close",
+            xmax: float = 0.3,
+            label: str = "ATR3/종가",
+        ) -> str:
+            """값 xmax 초과 종목 주석 텍스트."""
+            ac = pd.to_numeric(df[col], errors="coerce")
+            m = np.isfinite(ac) & (df["mcap"].fillna(0) > 0) & (ac > xmax)
             if not m.any():
                 return ""
-            sub = df.loc[m, ["name", "atr_over_close"]].copy()
-            sub["atr_over_close"] = pd.to_numeric(sub["atr_over_close"], errors="coerce")
-            sub = sub.sort_values("atr_over_close", ascending=False)
+            sub = df.loc[m, ["name", col]].copy()
+            sub[col] = pd.to_numeric(sub[col], errors="coerce")
+            sub = sub.sort_values(col, ascending=False)
             parts = []
             for _, r in sub.head(25).iterrows():
                 nm = str(r.get("name") or "")
-                v = float(r["atr_over_close"])
+                v = float(r[col])
                 parts.append(f"{nm}({v:.3f})")
             extra = len(sub) - len(parts)
             tail = f" 외 {extra}종" if extra > 0 else ""
-            return "ATR3/종가 0.3 초과: " + ", ".join(parts) + tail
+            return f"{label} {xmax} 초과: " + ", ".join(parts) + tail
 
-        def _mj_scatter_panel_traces(df: pd.DataFrame, base_color: str, *, show_highlight_legend: bool) -> list:
+        def _mj_scatter_panel_traces(
+            df: pd.DataFrame,
+            base_color: str,
+            *,
+            show_highlight_legend: bool,
+            col: str = "atr_over_close",
+            xmax: float = 0.3,
+        ) -> list:
             """기본 점 + RS Top20 + 거래대금 Top20(중복 시 거래대금 우선) + 종목명 라벨."""
-            d = df[_mj_atr_plot_mask(df)].copy()
+            d = df[_mj_atr_plot_mask(df, col=col, xmax=xmax)].copy()
             if d.empty:
                 return []
             d["mcap"] = d["mcap"].astype(float)
             d["ticker"] = d["ticker"].astype(str)
-            d["atr_over_close"] = pd.to_numeric(d["atr_over_close"], errors="coerce")
+            d[col] = pd.to_numeric(d[col], errors="coerce")
             tv_rank = pd.to_numeric(d.get("tv_rank"), errors="coerce")
             rs_rank = pd.to_numeric(d.get("rs_rank"), errors="coerce")
             tv_mask = tv_rank.notna() & (tv_rank <= 20)
@@ -6963,7 +7075,7 @@ def run_market_dashboard(
                     [
                         frame["ticker"],
                         frame["name"],
-                        frame["atr_over_close"],
+                        frame[col],
                         frame["mcap"].astype(float) / KRX_MONEY_UNIT,
                     ],
                     axis=-1,
@@ -6979,7 +7091,7 @@ def run_market_dashboard(
                 b = d.loc[base_mask]
                 out.append(
                     go.Scatter(
-                        x=b["atr_over_close"],
+                        x=b[col],
                         y=b["mcap"],
                         mode="markers",
                         marker=dict(size=6, opacity=0.28, color=base_color),
@@ -6997,7 +7109,7 @@ def run_market_dashboard(
                 positions = ["top center", "bottom center", "middle left", "middle right"]
                 textpos = [positions[i % len(positions)] for i in range(len(frame))]
                 return go.Scatter(
-                    x=frame["atr_over_close"],
+                    x=frame[col],
                     y=frame["mcap"],
                     mode="markers+text",
                     marker=dict(size=9, opacity=0.92, color=color, line=dict(width=1, color="#fff")),
@@ -7041,12 +7153,12 @@ def run_market_dashboard(
             span = (hi - lo) * pad_ratio
             return lo - span, hi + span
 
-        def _mj_atr_ref_line_traces(df: pd.DataFrame, legend_prefix: str) -> list:
-            """ATR3/종가 분포용 P25/P50/P75·평균 수직선. 범례는 짧은 이름만, 수치는 hover."""
-            d = df[_mj_atr_stats_mask(df)].copy()
+        def _mj_atr_ref_line_traces(df: pd.DataFrame, legend_prefix: str, col: str = "atr_over_close") -> list:
+            """값 분포용 P25/P50/P75·평균 수직선. 범례는 짧은 이름만, 수치는 hover."""
+            d = df[_mj_atr_stats_mask(df, col=col)].copy()
             if d.empty:
                 return []
-            vals = pd.to_numeric(d["atr_over_close"], errors="coerce")
+            vals = pd.to_numeric(d[col], errors="coerce")
             vals = vals[np.isfinite(vals)].to_numpy(dtype=float)
             if len(vals) == 0:
                 return []
@@ -7068,7 +7180,7 @@ def run_market_dashboard(
                 (mean_v, "dot", "#2e7d32", 2.0, "mean", mean_v),
             ]
             out = []
-            for xv, dash, col, lw, label, stat_v in specs:
+            for xv, dash, line_color, lw, label, stat_v in specs:
                 x_pts = np.full(n_y, xv, dtype=float)
                 ht = (
                     f"<b>{pre} · {label}</b><br>"
@@ -7081,7 +7193,7 @@ def run_market_dashboard(
                         y=y_pts,
                         mode="lines",
                         name=f"{pre} {label}",
-                        line=dict(color=col, dash=dash, width=lw),
+                        line=dict(color=line_color, dash=dash, width=lw),
                         hovertemplate=ht,
                         showlegend=True,
                     )
@@ -7666,7 +7778,7 @@ def run_market_dashboard(
         out_energy = os.path.join(out_dir, "에너지배율.html")
         out_ad = os.path.join(out_dir, "market_AD_line.html")
 
-        # ATR3/종가 vs 시총 산점도 → 대시보드 9페이지(2×1 세로)로 최종 조립
+        # ATR3/종가·5일 레인지 vs 시총 산점도 → 대시보드 9·10페이지(2×1 세로)로 최종 조립
         _dash_atr_path = None
         _figs = dash_state.get("figs") or {}
         fig_vol = _figs.get("vol")
@@ -7722,9 +7834,67 @@ def run_market_dashboard(
             )
             return sub
 
+        def _build_range5_scatter_fig():
+            sub = make_subplots(
+                rows=2,
+                cols=1,
+                subplot_titles=(
+                    "코스피: 5일 레인지/종가 vs 시가총액(로그)",
+                    "코스닥: 5일 레인지/종가 vs 시가총액(로그)",
+                ),
+                vertical_spacing=0.10,
+            )
+            for tr in _mj_scatter_panel_traces(
+                df_k, "#1f77b4", show_highlight_legend=True, col="range5_over_close", xmax=RANGE5_XMAX
+            ):
+                sub.add_trace(tr, row=1, col=1)
+            for tr in _mj_atr_ref_line_traces(df_k, "코스피", col="range5_over_close"):
+                sub.add_trace(tr, row=1, col=1)
+            for tr in _mj_scatter_panel_traces(
+                df_q, "#9467bd", show_highlight_legend=False, col="range5_over_close", xmax=RANGE5_XMAX
+            ):
+                sub.add_trace(tr, row=2, col=1)
+            for tr in _mj_atr_ref_line_traces(df_q, "코스닥", col="range5_over_close"):
+                sub.add_trace(tr, row=2, col=1)
+            sub.update_xaxes(title_text="5일 레인지/종가", range=[0, RANGE5_XMAX], row=1, col=1)
+            sub.update_yaxes(type="log", title_text="시가총액 (원)", row=1, col=1)
+            sub.update_xaxes(title_text="5일 레인지/종가", range=[0, RANGE5_XMAX], row=2, col=1)
+            sub.update_yaxes(type="log", title_text="시가총액 (원)", row=2, col=1)
+            for _row, _df in ((1, df_k), (2, df_q)):
+                _note = _mj_atr_overflow_annotation(
+                    _df, col="range5_over_close", xmax=RANGE5_XMAX, label="5일 레인지/종가"
+                )
+                if _note:
+                    sub.add_annotation(
+                        text=_note,
+                        xref=f"x{_row} domain" if _row > 1 else "x domain",
+                        yref=f"y{_row} domain" if _row > 1 else "y domain",
+                        x=0.01,
+                        y=0.02,
+                        xanchor="left",
+                        yanchor="bottom",
+                        showarrow=False,
+                        align="left",
+                        font=dict(size=10, color="#B71C1C"),
+                        bgcolor="rgba(255,255,255,0.85)",
+                        bordercolor="#E57373",
+                        borderwidth=1,
+                        borderpad=4,
+                    )
+            sub.update_layout(
+                height=1960,
+                template="plotly_white",
+                title_text="Page 10: 5일 레인지/종가 vs 시가총액",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+                margin=dict(t=100, l=55, r=45, b=45),
+                hovermode="closest",
+            )
+            return sub
+
         if fig_vol is not None and _figs.get("page1") is not None:
             try:
                 fig_atr = _build_atr_scatter_fig()
+                fig_r5 = _build_range5_scatter_fig()
                 _out = dash_state.get("path") or out_ad
                 div1 = pio.to_html(_figs["page1"], full_html=False, include_plotlyjs="cdn")
                 div2 = pio.to_html(_figs["page2"], full_html=False, include_plotlyjs=False)
@@ -7735,10 +7905,11 @@ def run_market_dashboard(
                 div7 = pio.to_html(_figs["page9"], full_html=False, include_plotlyjs=False)
                 div8 = pio.to_html(_figs["page10"], full_html=False, include_plotlyjs=False)
                 div9 = pio.to_html(fig_atr, full_html=False, include_plotlyjs=False)
-                dash_divs = [div1, div2, div3, div4, div5, div6, div7, div8, div9]
+                div10 = pio.to_html(fig_r5, full_html=False, include_plotlyjs=False)
+                dash_divs = [div1, div2, div3, div4, div5, div6, div7, div8, div9, div10]
                 _write_krx_market_dashboard_html(_out, dash_divs)
                 _dash_atr_path = _out
-                _log(f"  → 대시보드 9페이지(ATR3/종가 산점도) 반영: {_dash_atr_path}")
+                _log(f"  → 대시보드 10페이지(ATR3/종가·5일 레인지 산점도) 반영: {_dash_atr_path}")
             except Exception as _e_dash:
                 _log(f"경고: 대시보드 ATR 산점도 페이지 조립 실패 ({type(_e_dash).__name__}: {_e_dash})")
                 _dash_atr_path = None
@@ -7995,7 +8166,7 @@ def run_market_dashboard(
                 pass
 
             if _dash_atr_path:
-                print(f"완료: 코스피/코스닥 지표 대시보드(9페이지, ATR3/종가 산점도 포함): {_dash_atr_path}")
+                print(f"완료: 코스피/코스닥 지표 대시보드(10페이지, ATR3/종가·5일 레인지 산점도 포함): {_dash_atr_path}")
             print(f"완료: 거래대금 HTML 저장: {out_tv}")
             if WRITE_ENERGY_REPORT:
                 print(f"완료: 에너지배율 HTML 저장: {out_energy}")
@@ -8030,7 +8201,7 @@ def _announce_krx_reports_from_disk(len_rs: int, len_bo: int) -> None:
         except Exception:
             pass
 
-    print("완료: 코스피/코스닥 지표 대시보드(9페이지 · 1·2·3·9페이지는 다단 구성)")
+    print("완료: 코스피/코스닥 지표 대시보드(10페이지 · 1·2·3·9·10페이지는 다단 구성)")
     _open_if_file(p_ad)
     if os.path.isfile(p_tv):
         print(f"완료: 거래대금 HTML 저장: {p_tv}")
