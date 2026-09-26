@@ -2767,7 +2767,7 @@ def _insert_current_price_after_name(df, ohlcv_df=None):
 def _build_full_momentum_ma_merge(current_momentum_df, ohlcv_df, rank_col='평균_모멘텀'):
     """
     유니버스 전체 티커에 대해 모멘텀 + MA/ATR/주간 부가열을 병합합니다(순위·매수후보용).
-    `above_sma_50`은 매수후보(상위 N·MA50) 필터에 사용됩니다.
+    `above_sma_50`은 표시용 'MA50위' 컬럼에만 쓰입니다(필터 아님).
     `rank_col` 기준 모멘텀이 없는 종목도 행에 남깁니다(정렬 시 맨 뒤). 매수 후보 상위 N은 `_build_action_list`에서 유효 모멘텀만으로 순위를 다시 매깁니다.
     """
     if current_momentum_df is None or current_momentum_df.empty:
@@ -2809,8 +2809,8 @@ def _build_full_momentum_ma_merge(current_momentum_df, ohlcv_df, rank_col='평�
 def _build_action_list(current_momentum_df, ohlcv_df, top_n=20, momentum_basis='t0'):
     """
     momentum_basis: 't0' → `평균_모멘텀`·`N일_상승률`로 순위·표시.
-                    't3' → `평균_모멘텀_T3`·`N일_상승률_T3`(동일 MA50 필터).
-                    't5' → `평균_모멘텀_T5`·`N일_상승률_T5`(동일 MA50 필터).
+                    't3' → `평균_모멘텀_T3`·`N일_상승률_T3`(MA50 필터 없음).
+                    't5' → `평균_모멘텀_T5`·`N일_상승률_T5`(MA50 필터 없음).
     """
     mb = str(momentum_basis).lower()
     if mb == 't5':
@@ -2828,10 +2828,7 @@ def _build_action_list(current_momentum_df, ohlcv_df, top_n=20, momentum_basis='
     m_elig = m_elig.sort_values(rank_col, ascending=False).reset_index(drop=True)
     m_elig.insert(0, '순위', np.arange(1, len(m_elig) + 1, dtype=int))
 
-    cond_top = m_elig['순위'] <= int(top_n)
-    cond_ma50 = m_elig.get('above_sma_50', False) == True
-
-    strong = m_elig[cond_top & cond_ma50].copy()
+    strong = m_elig[m_elig['순위'] <= int(top_n)].copy()
 
     cols = _action_list_column_order(m_elig, momentum_basis=momentum_basis)
     strong = strong[[c for c in cols if c in strong.columns]].copy() if not strong.empty else pd.DataFrame(columns=cols)
@@ -2843,7 +2840,7 @@ def _save_etf_dashboard_html(current_momentum_df, prev_momentum_df=None, ohlcv_d
                             period_info=None, open_web=True, out_filename='etf_dashboard.html'):
     """
     대시보드형 1페이지 HTML 생성.
-    - 요약: T-0·T-3·T-5 각각 포트폴리오 상위7·매수 후보(평균 모멘텀 기준 상위·MA50 필터)
+    - 요약: T-0·T-3·T-5 각각 포트폴리오 상위7·매수 후보(평균 모멘텀 기준 상위 N)
     - 교차표 + 히트맵: 종목×기간(5/10/20/50/120) + MA5·10·20/주간변동
     - 전주 변화: 신규/급상승/이탈
     - 상세: (필요시) 기존 상위표를 간략 아코디언으로 제공
@@ -3119,7 +3116,7 @@ def _save_etf_dashboard_html(current_momentum_df, prev_momentum_df=None, ohlcv_d
     </div>
     <div class="section">
       <h3>매수 후보 (Action List)</h3>
-      <div class="meta"><strong>평균_모멘텀</strong> 상위 20 중 종가≥MA50. 당일·3일·주간·N일 등락률·가중평균 모멘텀 열은 코스피(1001)와 비교해 색 표시.</div>
+      <div class="meta"><strong>평균_모멘텀</strong> 상위 20. 당일·3일·주간·N일 등락률·가중평균 모멘텀 열은 코스피(1001)와 비교해 색 표시.</div>
       {_df_html(strong_t0, pct_cols=_pct_action_t0, compare_kospi_map=action_kospi_cmp)}
     </div>
 
@@ -3131,7 +3128,7 @@ def _save_etf_dashboard_html(current_momentum_df, prev_momentum_df=None, ohlcv_d
     </div>
     <div class="section">
       <h3>매수 후보 (Action List)</h3>
-      <div class="meta"><strong>평균_모멘텀_T3</strong> 상위 20 중 종가≥MA50. T-3 모멘텀 열은 코스피와 정의가 달라 비교 색은 주간·당일·3일 등에만 적용됩니다.</div>
+      <div class="meta"><strong>평균_모멘텀_T3</strong> 상위 20. T-3 모멘텀 열은 코스피와 정의가 달라 비교 색은 주간·당일·3일 등에만 적용됩니다.</div>
       {_df_html(strong_t3, pct_cols=_pct_action_t3, compare_kospi_map=action_kospi_cmp)}
     </div>
 
@@ -3143,7 +3140,7 @@ def _save_etf_dashboard_html(current_momentum_df, prev_momentum_df=None, ohlcv_d
     </div>
     <div class="section">
       <h3>매수 후보 (Action List)</h3>
-      <div class="meta"><strong>평균_모멘텀_T5</strong> 상위 20 중 종가≥MA50. 당일·3일·주간·ATR은 기준일 기준. T-5 모멘텀 열은 코스피와 정의가 달라 비교 색은 해당 열에 적용되지 않을 수 있습니다.</div>
+      <div class="meta"><strong>평균_모멘텀_T5</strong> 상위 20. 당일·3일·주간·ATR은 기준일 기준. T-5 모멘텀 열은 코스피와 정의가 달라 비교 색은 해당 열에 적용되지 않을 수 있습니다.</div>
       {_df_html(strong_t5, pct_cols=_pct_action_t5, compare_kospi_map=action_kospi_cmp)}
     </div>
   </div>
@@ -6109,15 +6106,15 @@ def save_etf_code_name_returns_html(
                     universe_buy_html = (
                         '<div class="section-part" style="font-size:1.1rem;font-weight:700;margin:4px 0 10px;color:#1a365d;border-bottom:2px solid #cbd5e0;padding-bottom:6px;">T-0 기준 모멘텀</div>'
                         '<h2 class="sec-title">매수 후보</h2>'
-                        '<div class="sec-sub">평균_모멘텀 상위 20 중 종가≥MA50.</div>'
+                        '<div class="sec-sub">평균_모멘텀 상위 20.</div>'
                         + _html_sector_buy_candidate_like(strong_u_t0)
                         + '<div class="section-part" style="font-size:1.1rem;font-weight:700;margin:18px 0 10px;color:#1a365d;border-bottom:2px solid #cbd5e0;padding-bottom:6px;">T-3 기준 모멘텀</div>'
                         '<h2 class="sec-title">매수 후보</h2>'
-                        '<div class="sec-sub">평균_모멘텀_T3 상위 20 중 종가≥MA50.</div>'
+                        '<div class="sec-sub">평균_모멘텀_T3 상위 20.</div>'
                         + _html_sector_buy_candidate_like(strong_u_t3)
                         + '<div class="section-part" style="font-size:1.1rem;font-weight:700;margin:18px 0 10px;color:#1a365d;border-bottom:2px solid #cbd5e0;padding-bottom:6px;">T-5 기준 모멘텀</div>'
                         '<h2 class="sec-title">매수 후보</h2>'
-                        '<div class="sec-sub">평균_모멘텀_T5 상위 20 중 종가≥MA50.</div>'
+                        '<div class="sec-sub">평균_모멘텀_T5 상위 20.</div>'
                         + _html_sector_buy_candidate_like(strong_u_t5)
                         + '<div style="height:18px;"></div>'
                     )
@@ -6268,14 +6265,14 @@ def save_etf_code_name_returns_html(
         scope_note = (
             f'{heading_label} 목록에 포함된 종목만 대상으로 산출합니다. '
             '매수일·평가일·수익률·상위 7 선정 방식은 ETF 모멘텀 대시보드 요약과 동일하며, '
-            '매수 후보는 해당 목록 내에서 평균 모멘텀 상위 20 중 종가≥MA50입니다.'
+            '매수 후보는 해당 목록 내 평균 모멘텀 상위 20입니다. MA50위 컬럼은 참고용입니다.'
         )
         _append_momentum_block(
             't0',
             'T-0 기준 모멘텀',
             f'매수일: {purchase_w} · 평가일: {eval_w_str} · 선정: 매수일 시점 최신 종가(T-0) 기준 '
             f'`N일_상승률`·`평균_모멘텀`으로 상위 7. {scope_note}',
-            f'평균_모멘텀 상위 20 중 종가≥MA50. {scope_note}',
+            f'평균_모멘텀 상위 20. {scope_note}',
             _pct_action_t0,
         )
         _append_momentum_block(
@@ -6283,7 +6280,7 @@ def save_etf_code_name_returns_html(
             'T-3 기준 모멘텀',
             f'매수일: {purchase_w} · 평가일: {eval_w_str} · 선정: 매수일 시점 OHLCV에서 T-3 종가 기준 '
             f'`N일_상승률_T3`·`평균_모멘텀_T3`로 상위 7. {scope_note}',
-            f'평균_모멘텀_T3 상위 20 중 종가≥MA50. {scope_note}',
+            f'평균_모멘텀_T3 상위 20. {scope_note}',
             _pct_action_t3,
         )
         _append_momentum_block(
@@ -6291,7 +6288,7 @@ def save_etf_code_name_returns_html(
             'T-5 기준 모멘텀',
             f'매수일: {purchase_w} · 평가일: {eval_w_str} · 선정: 매수일 시점 OHLCV에서 T-5 종가 기준 '
             f'`N일_상승률_T5`·`평균_모멘텀_T5`로 상위 7. {scope_note}',
-            f'평균_모멘텀_T5 상위 20 중 종가≥MA50. {scope_note}',
+            f'평균_모멘텀_T5 상위 20. {scope_note}',
             _pct_action_t5,
         )
         bits.append('</div>')

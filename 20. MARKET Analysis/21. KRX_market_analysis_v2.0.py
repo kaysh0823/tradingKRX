@@ -1343,11 +1343,30 @@ def _krx_sector_stats_html(
     top_n: int = SECTOR_STATS_TOP_N,
 ) -> str:
     """종목 집합의 대분류·세부 섹터 분포 HTML 블록."""
+    if tickers is None:
+        return ""
+    if isinstance(tickers, pd.Series):
+        tickers = tickers.dropna().tolist()
+    elif isinstance(tickers, pd.Index):
+        tickers = tickers.tolist()
+    elif hasattr(tickers, "tolist"):  # numpy array 등
+        tickers = tickers.tolist()
+    else:
+        tickers = list(tickers)
     if not tickers:
         return ""
     seen: list[str] = []
     seen_set: set[str] = set()
     for t in tickers:
+        if t is None:
+            continue
+        try:
+            if isinstance(t, float) and (np.isnan(t) or not np.isfinite(t)):
+                continue
+            if pd.isna(t):
+                continue
+        except (TypeError, ValueError):
+            pass
         k = str(t).zfill(6)
         if k in seen_set:
             continue
